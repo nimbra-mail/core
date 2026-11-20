@@ -408,6 +408,14 @@ impl Client {
             View::Updates => category(request, "CATEGORY_UPDATES"),
             View::Promotions => category(request, "CATEGORY_PROMOTIONS"),
             View::Social => category(request, "CATEGORY_SOCIAL"),
+            // Gmail's own search syntax; the client library URL-encodes it.
+            View::Search => match label_id
+                .map(str::trim)
+                .filter(|q| !q.is_empty() && q.len() <= 500)
+            {
+                Some(query) => request.query("q", query),
+                None => bail!("Type something to search for."),
+            },
             View::Label(_) => match label_id.filter(|id| is_label_id(id)) {
                 Some(id) => request.query("labelIds", id),
                 None => bail!("unknown label"),
@@ -510,9 +518,23 @@ impl Client {
                 sender: sender_name(m.header("From")),
                 address: address_of(m.header("From")),
                 message_id: m.header("Message-ID").trim().to_string(),
+                others: [m.header("To"), m.header("Cc")]
+                    .iter()
+                    .flat_map(|list| list.split(','))
+                    .map(address_of)
+                    .filter(|address| is_address(address))
+                    .collect(),
                 snippet: decode_entities(&m.snippet),
                 timestamp_ms: m.timestamp_ms(),
                 blocks: m.payload.as_ref().map(body_blocks).unwrap_or_default(),
+                html: m
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| find_part(payload, "text/html"))
+                    .and_then(decode_part)
+                    // Very large bodies stay in the native reader only.
+                    .filter(|bytes| bytes.len() <= 2 * 1024 * 1024)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             })
             .collect())
     }
@@ -535,6 +557,7 @@ impl Client {
             Change::Star => labels(&["STARRED"], &[]),
             Change::Unstar => labels(&[], &["STARRED"]),
             Change::MarkRead => labels(&[], &["UNREAD"]),
+            Change::MarkUnread => labels(&["UNREAD"], &[]),
             Change::Trash => ("trash", None),
             Change::Untrash => ("untrash", None),
         };
@@ -553,6 +576,18 @@ impl Client {
             body["threadId"] = reply.thread_id.clone().into();
         }
         self.send::<serde_json::Value>(ureq::post(&format!("{API}/messages/send")), Some(body))?;
+        Ok(())
+    }
+
+    /// Adds one of the user's labels to a thread.
+    pub fn add_label(&self, id: &str, label_id: &str) -> Result<()> {
+        if !is_id(id) || !is_label_id(label_id) {
+            bail!("unexpected id");
+        }
+        self.send::<serde_json::Value>(
+            ureq::post(&format!("{API}/threads/{id}/modify")),
+            Some(serde_json::json!({ "addLabelIds": [label_id] })),
+        )?;
         Ok(())
     }
 
@@ -729,6 +764,8 @@ pub enum View {
     Social,
     /// One of the user's own labels, by position in the fetched label list.
     Label(usize),
+    /// Results of a search; the query travels alongside.
+    Search,
     Starred,
     Snoozed,
     Drafts,
@@ -745,6 +782,7 @@ pub enum Change {
     Star,
     Unstar,
     MarkRead,
+    MarkUnread,
 }
 
 impl Change {
@@ -757,7 +795,7 @@ impl Change {
             Change::Untrash => Some(Change::Trash),
             Change::Star => Some(Change::Unstar),
             Change::Unstar => Some(Change::Star),
-            Change::MarkRead => None,
+            Change::MarkRead | Change::MarkUnread => None,
         }
     }
 }
@@ -784,10 +822,14 @@ pub struct Message {
     pub address: String,
     /// The RFC 5322 Message-ID header, for threading a reply.
     pub message_id: String,
+    /// Everyone else the message was addressed to (To and Cc), for reply-all.
+    pub others: Vec<String>,
     pub sender: String,
     pub snippet: String,
     pub timestamp_ms: i64,
     pub blocks: Vec<crate::rich::Block>,
+    /// The original HTML body, if the message has one, for "Show original".
+    pub html: Option<String>,
 }
 
 #[derive(Deserialize)]
