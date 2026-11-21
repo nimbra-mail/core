@@ -80,7 +80,10 @@ impl View {
             View::Drafts => has("DRAFT"),
             View::Sent => has("SENT"),
             View::Label(_) => has(label_id?),
-            View::Snoozed | View::Done | View::Search => return None,
+            View::Important => has("IMPORTANT"),
+            View::Spam => has("SPAM"),
+            View::Trash => has("TRASH"),
+            View::Snoozed | View::Done | View::Search | View::AllMail => return None,
         })
     }
 }
@@ -392,16 +395,34 @@ impl Client {
         request: ureq::Request,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
-        let request = request
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.access_token()?));
-        let result = match body {
-            Some(body) => request.send_json(body),
-            None => request.call(),
-        };
-        self.finish(result)?
-            .into_json()
-            .context("reading Gmail's reply")
+        // Gmail limits how many requests a user may make per minute. When it says so,
+        // wait a little and try again (three times, waiting longer each time).
+        let mut wait = Duration::from_millis(1500);
+        let mut attempt = 0;
+        loop {
+            let call = request
+                .clone()
+                .timeout(HTTP_TIMEOUT)
+                .set("Authorization", &format!("Bearer {}", self.access_token()?));
+            let result = match &body {
+                Some(body) => call.send_json(body.clone()),
+                None => call.call(),
+            };
+            if let Err(ureq::Error::Status(code @ (403 | 429), response)) = result {
+                let text = response.into_string().unwrap_or_default();
+                if attempt < 3 && is_rate_limited(code, &text) {
+                    std::thread::sleep(wait);
+                    wait *= 2;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(api_error(code, &text));
+            }
+            return self
+                .finish(result)?
+                .into_json()
+                .context("reading Gmail's reply");
+        }
     }
 
     /// Uploads a whole RFC 5322 message with its JSON metadata in one multipart request
@@ -441,22 +462,7 @@ impl Client {
                 Err(SignedOut.into())
             }
             Err(ureq::Error::Status(code, response)) => {
-                #[derive(Deserialize)]
-                struct ApiError {
-                    error: ApiErrorBody,
-                }
-                #[derive(Deserialize)]
-                struct ApiErrorBody {
-                    message: String,
-                }
-                let message = response
-                    .into_json::<ApiError>()
-                    .map(|e| e.error.message)
-                    .unwrap_or_default();
-                bail!(
-                    "Gmail error {code}: {}",
-                    message.chars().take(160).collect::<String>()
-                )
+                Err(api_error(code, &response.into_string().unwrap_or_default()))
             }
             Err(_) => bail!("Could not reach Gmail. Check your connection."),
         }
@@ -580,22 +586,33 @@ impl Client {
     }
 
     /// The newest threads of a mailbox, with enough detail for the list.
-    pub fn threads(
+    /// One page of a mailbox, and the token for the next page if there is one.
+    pub fn threads_page(
         &self,
         view: View,
         label_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<Summary>> {
+        page: Option<&str>,
+    ) -> Result<(Vec<Summary>, Option<String>)> {
         #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase")]
         struct Listing {
             #[serde(default)]
             threads: Vec<ThreadRef>,
+            next_page_token: Option<String>,
         }
         #[derive(Deserialize)]
         struct ThreadRef {
             id: String,
         }
-        let request = ureq::get(&format!("{API}/threads")).query("maxResults", &limit.to_string());
+        let mut request =
+            ureq::get(&format!("{API}/threads")).query("maxResults", &limit.to_string());
+        if let Some(page) = page {
+            if page.len() > 512 || !page.chars().all(|c| c.is_ascii_graphic()) {
+                bail!("unexpected page token");
+            }
+            request = request.query("pageToken", page);
+        }
         let request = match view {
             View::Inbox => request.query("labelIds", "INBOX"),
             View::Primary => category(request, "CATEGORY_PERSONAL"),
@@ -623,8 +640,17 @@ impl Client {
                 "q",
                 "-in:inbox -in:sent -in:drafts -in:chats -in:spam -in:trash",
             ),
+            View::AllMail => request,
+            View::Important => request.query("labelIds", "IMPORTANT"),
+            View::Spam => request
+                .query("labelIds", "SPAM")
+                .query("includeSpamTrash", "true"),
+            View::Trash => request
+                .query("labelIds", "TRASH")
+                .query("includeSpamTrash", "true"),
         };
         let listing: Listing = self.send(request, None)?;
+        let next = listing.next_page_token.clone();
         // In Sent and Drafts the interesting person is the recipient, not you.
         let recipient = matches!(view, View::Sent | View::Drafts);
         let ids: Vec<String> = listing.threads.into_iter().map(|t| t.id).collect();
@@ -647,7 +673,8 @@ impl Client {
                 });
             }
         });
-        summaries.into_iter().flatten().collect()
+        let summaries: Result<Vec<Summary>> = summaries.into_iter().flatten().collect();
+        Ok((summaries?, next))
     }
 
     pub fn summary(&self, id: &str, recipient: bool) -> Result<Summary> {
@@ -1053,6 +1080,53 @@ impl Client {
             )?;
         }
         Ok(())
+    }
+
+    /// Takes one of the user's labels off a thread.
+    pub fn remove_label(&self, id: &str, label_id: &str) -> Result<()> {
+        self.relabel(id, &[], &[label_id])
+    }
+
+    /// Adds and removes labels in one change (a move: add the label, leave the inbox).
+    pub fn relabel(&self, id: &str, add: &[&str], remove: &[&str]) -> Result<()> {
+        let system = ["INBOX", "SPAM", "TRASH", "UNREAD", "STARRED", "IMPORTANT"];
+        let ok = |l: &&str| system.contains(l) || is_label_id(l);
+        if !is_id(id) || !add.iter().all(ok) || !remove.iter().all(ok) {
+            bail!("unexpected id");
+        }
+        self.send::<serde_json::Value>(
+            ureq::post(&format!("{API}/threads/{id}/modify")),
+            Some(serde_json::json!({ "addLabelIds": add, "removeLabelIds": remove })),
+        )?;
+        Ok(())
+    }
+
+    /// Creates a label (shown in Gmail's label list) and returns it.
+    pub fn create_label(&self, name: &str) -> Result<Label> {
+        #[derive(Deserialize)]
+        struct Created {
+            id: String,
+            name: String,
+        }
+        let name = clean_header(name);
+        if name.is_empty() || name.chars().count() > 100 {
+            bail!("A label name needs 1 to 100 characters.");
+        }
+        let created: Created = self.send(
+            ureq::post(&format!("{API}/labels")),
+            Some(serde_json::json!({
+                "name": name,
+                "labelListVisibility": "labelShow",
+                "messageListVisibility": "show",
+            })),
+        )?;
+        if !is_label_id(&created.id) {
+            bail!("unexpected label id");
+        }
+        Ok(Label {
+            id: created.id,
+            name: created.name,
+        })
     }
 
     /// Adds one of the user's labels to a thread.
@@ -1464,6 +1538,40 @@ impl Outgoing {
     }
 }
 
+/// Gmail's "slow down" answers: too many requests, or the per-minute quota used up.
+fn is_rate_limited(code: u16, body: &str) -> bool {
+    code == 429
+        || [
+            "rateLimitExceeded",
+            "userRateLimitExceeded",
+            "Quota exceeded",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+}
+
+/// A readable error from Gmail's error body.
+fn api_error(code: u16, body: &str) -> anyhow::Error {
+    #[derive(Deserialize)]
+    struct ApiError {
+        error: ApiErrorBody,
+    }
+    #[derive(Deserialize)]
+    struct ApiErrorBody {
+        message: String,
+    }
+    if is_rate_limited(code, body) {
+        return anyhow!("Gmail is busy right now (too many requests). Try again in a minute.");
+    }
+    let message = serde_json::from_str::<ApiError>(body)
+        .map(|e| e.error.message)
+        .unwrap_or_default();
+    anyhow!(
+        "Gmail error {code}: {}",
+        message.chars().take(160).collect::<String>()
+    )
+}
+
 /// Collapses a typed header value to one line without control characters.
 fn clean_header(value: &str) -> String {
     value
@@ -1689,6 +1797,11 @@ pub enum View {
     Drafts,
     Sent,
     Done,
+    /// Everything except Spam and Trash.
+    AllMail,
+    Important,
+    Spam,
+    Trash,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2109,6 +2222,28 @@ mod tests {
         assert_eq!(View::Label(0).holds(&archived, None), None);
         assert_eq!(View::Done.holds(&archived, None), None);
         assert_eq!(View::Search.holds(&archived, None), None);
+    }
+
+    #[test]
+    fn rate_limits_are_recognised() {
+        assert!(is_rate_limited(429, ""));
+        assert!(is_rate_limited(
+            403,
+            r#"{"error":{"message":"Quota exceeded for quota metric"}}"#
+        ));
+        assert!(!is_rate_limited(
+            403,
+            r#"{"error":{"message":"Insufficient Permission"}}"#
+        ));
+        assert!(
+            api_error(403, "Quota exceeded")
+                .to_string()
+                .contains("busy")
+        );
+        assert_eq!(
+            api_error(404, r#"{"error":{"message":"Not Found"}}"#).to_string(),
+            "Gmail error 404: Not Found"
+        );
     }
 
     #[test]
