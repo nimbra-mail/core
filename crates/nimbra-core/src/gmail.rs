@@ -148,22 +148,41 @@ impl Config {
 
 // ------------------------------------------------------------------ keychain
 
-fn keychain() -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).context("opening the system keychain")
+/// Account ids: empty for the first account (stored as it always was), or a short random
+/// hex id for each account added after it.
+pub fn is_account_id(id: &str) -> bool {
+    id.len() <= 16 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub fn stored_refresh_token() -> Option<String> {
-    keychain().ok()?.get_password().ok()
+/// A new id for an account being added.
+pub fn new_account_id() -> Result<String> {
+    random_hex(6)
 }
 
-fn store_refresh_token(token: &str) -> Result<()> {
-    keychain()?
+fn keychain(account: &str) -> Result<keyring::Entry> {
+    if !is_account_id(account) {
+        bail!("unexpected account id");
+    }
+    let user = if account.is_empty() {
+        KEYCHAIN_USER.to_string()
+    } else {
+        format!("{KEYCHAIN_USER}-{account}")
+    };
+    keyring::Entry::new(KEYCHAIN_SERVICE, &user).context("opening the system keychain")
+}
+
+pub fn stored_refresh_token(account: &str) -> Option<String> {
+    keychain(account).ok()?.get_password().ok()
+}
+
+fn store_refresh_token(account: &str, token: &str) -> Result<()> {
+    keychain(account)?
         .set_password(token)
         .context("saving the sign-in to the system keychain")
 }
 
-pub fn forget_refresh_token() {
-    if let Ok(entry) = keychain() {
+pub fn forget_refresh_token(account: &str) {
+    if let Ok(entry) = keychain(account) {
         let _ = entry.delete_credential();
     }
 }
@@ -252,7 +271,7 @@ impl SignIn {
 
     /// Blocks until the browser comes back (or the timeout passes), exchanges the code and
     /// stores the refresh token in the keychain.
-    pub fn finish(self, config: &Config) -> Result<Client> {
+    pub fn finish(self, config: &Config, account: &str) -> Result<Client> {
         let code = self.wait_for_code()?;
         let tokens = token_request(&[
             ("grant_type", "authorization_code"),
@@ -265,8 +284,8 @@ impl SignIn {
         let refresh = tokens
             .refresh_token
             .ok_or_else(|| anyhow!("Google did not return a long-lived sign-in"))?;
-        store_refresh_token(&refresh)?;
-        let client = Client::new(config.clone(), refresh);
+        store_refresh_token(account, &refresh)?;
+        let client = Client::new(config.clone(), refresh, account.to_string());
         client.remember(tokens.access_token, tokens.expires_in);
         Ok(client)
     }
@@ -364,14 +383,17 @@ pub struct Client {
     config: Config,
     refresh_token: String,
     access: Mutex<Option<(String, Instant)>>,
+    /// Which account's keychain entry holds the refresh token.
+    account: String,
 }
 
 impl Client {
-    pub fn new(config: Config, refresh_token: String) -> Self {
+    pub fn new(config: Config, refresh_token: String, account: String) -> Self {
         Self {
             config,
             refresh_token,
             access: Mutex::new(None),
+            account,
         }
     }
 
@@ -395,7 +417,7 @@ impl Client {
         ])
         .inspect_err(|e| {
             if e.is::<SignedOut>() {
-                forget_refresh_token();
+                forget_refresh_token(&self.account);
             }
         })?;
         self.remember(tokens.access_token.clone(), tokens.expires_in);

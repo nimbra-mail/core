@@ -19,6 +19,17 @@ pub struct Settings {
     pub load_images: bool,
     /// Light, dark, or follow the system.
     pub theme: ThemeChoice,
+    /// The Gmail accounts signed in on this Mac (ids and addresses; the sign-ins themselves
+    /// are in the keychain).
+    pub accounts: Vec<AccountRef>,
+    /// The account shown.
+    pub active: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccountRef {
+    pub id: String,
+    pub email: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,6 +48,8 @@ impl Default for Settings {
             original_view: true,
             load_images: true,
             theme: ThemeChoice::System,
+            accounts: Vec::new(),
+            active: String::new(),
         }
     }
 }

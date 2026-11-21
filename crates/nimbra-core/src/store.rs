@@ -30,9 +30,10 @@ pub struct Store {
 impl Store {
     /// Opens the store, creating the key (in the keychain) and the folder on first use.
     /// Blocking: may wait on the keychain. Call from a background thread.
-    pub fn open() -> Result<Self> {
-        let dir = default_dir()?;
-        Self::open_at(dir, &load_or_create_key()?)
+    /// `account` is the account id ("" for the first account, as stored before accounts).
+    pub fn open(account: &str) -> Result<Self> {
+        let dir = default_dir(account)?;
+        Self::open_at(dir, &load_or_create_key(account)?)
     }
 
     fn open_at(dir: PathBuf, key: &[u8; 32]) -> Result<Self> {
@@ -116,27 +117,53 @@ impl Store {
 }
 
 /// Signing out: removes the stored mail and the key that protects it.
-pub fn wipe() {
-    if let Ok(dir) = default_dir() {
+pub fn wipe(account: &str) {
+    if let Ok(dir) = default_dir(account) {
         let _ = std::fs::remove_dir_all(dir);
     }
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
+    if let Ok(user) = key_user(account)
+        && let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &user)
+    {
         let _ = entry.delete_credential();
     }
 }
 
-fn default_dir() -> Result<PathBuf> {
+/// The keychain entry of an account's store key.
+fn key_user(account: &str) -> Result<String> {
+    if !crate::gmail::is_account_id(account) {
+        bail!("unexpected account id");
+    }
+    Ok(if account.is_empty() {
+        KEYCHAIN_USER.to_string()
+    } else {
+        format!("{KEYCHAIN_USER}-{account}")
+    })
+}
+
+fn default_dir(account: &str) -> Result<PathBuf> {
+    if !crate::gmail::is_account_id(account) {
+        bail!("unexpected account id");
+    }
+    let folder = if account.is_empty() {
+        "store".to_string()
+    } else {
+        format!("store-{account}")
+    };
+    Ok(base_dir()?.join(folder))
+}
+
+fn base_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("no home folder"))?;
     let base = if cfg!(target_os = "macos") {
         PathBuf::from(home).join("Library/Application Support/Nimbra")
     } else {
         PathBuf::from(home).join(".local/share/nimbra")
     };
-    Ok(base.join("store"))
+    Ok(base)
 }
 
-fn load_or_create_key() -> Result<[u8; 32]> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)
+fn load_or_create_key(account: &str) -> Result<[u8; 32]> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &key_user(account)?)
         .context("opening the system keychain")?;
     if let Ok(saved) = entry.get_password()
         && let Ok(bytes) = STANDARD.decode(saved.trim())
@@ -150,7 +177,7 @@ fn load_or_create_key() -> Result<[u8; 32]> {
         .set_password(&STANDARD.encode(key))
         .context("saving the mail store key to the keychain")?;
     // A new key cannot read anything written with the old one.
-    if let Ok(dir) = default_dir() {
+    if let Ok(dir) = default_dir(account) {
         let _ = std::fs::remove_dir_all(dir);
     }
     Ok(key)
