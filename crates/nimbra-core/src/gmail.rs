@@ -452,10 +452,14 @@ impl Client {
                 }
                 return Err(api_error(code, &text));
             }
-            return self
+            // Gmail answers "204 No Content" (an empty body) when a filtered list has
+            // nothing in it, such as no unread mail. That is an empty object, not an error.
+            let text = self
                 .finish(result)?
-                .into_json()
-                .context("reading Gmail's reply");
+                .into_string()
+                .context("reading Gmail's reply")?;
+            let text = if text.trim().is_empty() { "{}" } else { text.as_str() };
+            return serde_json::from_str(text).context("reading Gmail's reply");
         }
     }
 
