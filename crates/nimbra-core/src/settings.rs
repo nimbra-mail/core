@@ -28,6 +28,50 @@ pub struct Settings {
     pub collapsed: Vec<String>,
     /// The last few searches, newest first.
     pub recent_searches: Vec<String>,
+    /// When an opened thread counts as read.
+    pub mark_read: MarkRead,
+    /// How often to check Gmail for new mail, in seconds.
+    pub check_every: u32,
+    /// How long a sent message can still be taken back, in seconds (0: sent at once).
+    pub undo_send: u32,
+    /// Replies and forwards include the original message (folded behind •••).
+    pub quote_replies: bool,
+    /// New-mail notifications play a sound.
+    pub notify_sound: bool,
+    /// The Dock icon shows the inbox's unread count.
+    pub dock_badge: bool,
+    /// The size of text in the reader.
+    pub reader_text: TextSize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkRead {
+    /// As soon as it is opened.
+    Open,
+    /// After it has been open for two seconds.
+    Delay,
+    /// Only with Mark as read (or U).
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextSize {
+    Small,
+    Default,
+    Large,
+}
+
+impl TextSize {
+    /// Body text size and line height in the reader, in points.
+    pub fn metrics(self) -> (f32, f32) {
+        match self {
+            TextSize::Small => (13.5, 23.),
+            TextSize::Default => (15., 26.),
+            TextSize::Large => (17., 29.),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -56,6 +100,13 @@ impl Default for Settings {
             active: String::new(),
             collapsed: Vec::new(),
             recent_searches: Vec::new(),
+            mark_read: MarkRead::Open,
+            check_every: 30,
+            undo_send: 6,
+            quote_replies: true,
+            notify_sound: true,
+            dock_badge: true,
+            reader_text: TextSize::Default,
         }
     }
 }
