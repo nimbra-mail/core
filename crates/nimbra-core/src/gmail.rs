@@ -458,7 +458,11 @@ impl Client {
                 .finish(result)?
                 .into_string()
                 .context("reading Gmail's reply")?;
-            let text = if text.trim().is_empty() { "{}" } else { text.as_str() };
+            let text = if text.trim().is_empty() {
+                "{}"
+            } else {
+                text.as_str()
+            };
             return serde_json::from_str(text).context("reading Gmail's reply");
         }
     }
