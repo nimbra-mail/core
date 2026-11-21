@@ -31,6 +31,8 @@ pub const ATTACHMENT_LIMIT: u64 = 25 * 1024 * 1024;
 const COUNT_CAP: u32 = 10_000;
 /// Read, archive and label. No send, no permanent delete.
 const SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
+/// Asked for only when the user first deletes something permanently: full mail access.
+const FULL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify https://mail.google.com/";
 const KEYCHAIN_SERVICE: &str = "nimbra";
 const KEYCHAIN_USER: &str = "gmail-refresh-token";
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -112,6 +114,18 @@ impl std::fmt::Display for Offline {
 }
 
 impl std::error::Error for Offline {}
+
+/// Permanent deletion needs a permission this sign-in does not have yet.
+#[derive(Debug)]
+pub struct NeedsFullAccess;
+
+impl std::fmt::Display for NeedsFullAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Deleting permanently needs one more permission from Google.")
+    }
+}
+
+impl std::error::Error for NeedsFullAccess {}
 
 // ------------------------------------------------------------------ config
 
@@ -236,7 +250,8 @@ pub struct SignIn {
 
 impl SignIn {
     /// Starts listening and returns the URL to open in the user's browser.
-    pub fn start(config: &Config) -> Result<(Self, String)> {
+    /// `full` also asks for permanent deletion (see `FULL_SCOPE`).
+    pub fn start(config: &Config, full: bool) -> Result<(Self, String)> {
         // Loopback only, on a port picked by the OS.
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("opening a local port for sign-in")?;
@@ -250,7 +265,8 @@ impl SignIn {
                 ("client_id", config.client_id.as_str()),
                 ("redirect_uri", redirect_uri.as_str()),
                 ("response_type", "code"),
-                ("scope", SCOPE),
+                ("scope", if full { FULL_SCOPE } else { SCOPE }),
+                ("include_granted_scopes", "true"),
                 ("code_challenge", pkce_challenge(&verifier).as_str()),
                 ("code_challenge_method", "S256"),
                 ("state", state.as_str()),
@@ -1129,6 +1145,41 @@ impl Client {
                 Some(body),
             )?;
         }
+        Ok(())
+    }
+
+    /// Deletes a thread for good (it does not go to Trash). Needs full mail access.
+    pub fn delete_thread(&self, id: &str) -> Result<()> {
+        if !is_id(id) {
+            bail!("unexpected thread id");
+        }
+        match self.send::<serde_json::Value>(ureq::delete(&format!("{API}/threads/{id}")), None) {
+            Err(error) if error.to_string().to_lowercase().contains("insufficient") => {
+                Err(NeedsFullAccess.into())
+            }
+            other => other.map(|_| ()),
+        }
+    }
+
+    /// Renames one of the user's labels.
+    pub fn rename_label(&self, id: &str, name: &str) -> Result<()> {
+        let name = clean_header(name);
+        if !is_label_id(id) || name.is_empty() || name.chars().count() > 100 {
+            bail!("A label name needs 1 to 100 characters.");
+        }
+        self.send::<serde_json::Value>(
+            ureq::request("PATCH", &format!("{API}/labels/{id}")),
+            Some(serde_json::json!({ "name": name })),
+        )?;
+        Ok(())
+    }
+
+    /// Deletes one of the user's labels. The mail it was on stays where it is.
+    pub fn delete_label(&self, id: &str) -> Result<()> {
+        if !is_label_id(id) {
+            bail!("unexpected label id");
+        }
+        self.send::<serde_json::Value>(ureq::delete(&format!("{API}/labels/{id}")), None)?;
         Ok(())
     }
 
@@ -2411,7 +2462,7 @@ mod tests {
             client_id: "id.apps.googleusercontent.com".into(),
             client_secret: "secret".into(),
         };
-        let (sign_in, url) = SignIn::start(&config).unwrap();
+        let (sign_in, url) = SignIn::start(&config, false).unwrap();
         let url = url::Url::parse(&url).unwrap();
         let get = |k: &str| {
             url.query_pairs()
@@ -2425,6 +2476,10 @@ mod tests {
         assert_eq!(get("code_challenge"), pkce_challenge(&sign_in.verifier));
         assert_eq!(get("state"), sign_in.state);
         assert!(!url.as_str().contains("secret"));
+        // Full mail access (permanent delete) is only asked for when it is needed.
+        assert_eq!(get("scope"), SCOPE);
+        let (_, full) = SignIn::start(&config, true).unwrap();
+        assert!(full.contains("mail.google.com"));
     }
 
     #[test]
@@ -2433,7 +2488,7 @@ mod tests {
             client_id: "id".into(),
             client_secret: "secret".into(),
         };
-        let (sign_in, _) = SignIn::start(&config).unwrap();
+        let (sign_in, _) = SignIn::start(&config, false).unwrap();
         let port = sign_in.listener.local_addr().unwrap().port();
         let state = sign_in.state.clone();
         let waiter = std::thread::spawn(move || sign_in.wait_for_code());
