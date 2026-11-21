@@ -597,7 +597,7 @@ impl Client {
             .into_iter()
             .find(|entry| entry.message.thread_id == thread_id)
             .map(|entry| entry.id)
-            .filter(|id| is_label_id(id))
+            .filter(|id| is_draft_id(id))
             .ok_or_else(|| anyhow!("That draft is no longer in Gmail."))?;
         let full: Full = self.send(
             ureq::get(&format!("{API}/drafts/{id}")).query("format", "full"),
@@ -636,7 +636,7 @@ impl Client {
             message["threadId"] = reply.thread_id.clone().into();
         }
         let request = match id {
-            Some(id) if is_label_id(id) => ureq::put(&format!("{API}/drafts/{id}")),
+            Some(id) if is_draft_id(id) => ureq::put(&format!("{API}/drafts/{id}")),
             Some(_) => bail!("unexpected draft id"),
             None => ureq::post(&format!("{API}/drafts")),
         };
@@ -811,6 +811,16 @@ impl Client {
 
 fn category(request: ureq::Request, label: &str) -> ureq::Request {
     request.query("labelIds", "INBOX").query("labelIds", label)
+}
+
+/// Draft ids go into request paths. Gmail's look like `r-1234…` or `r:1234…`, so they need
+/// `:` as well; anything that could change the path or query is still refused.
+fn is_draft_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_:".contains(c))
 }
 
 /// Label ids go into request queries, so only accept the characters Gmail uses.
@@ -1345,6 +1355,13 @@ mod tests {
         assert!(!is_id("abc?x=1"));
         assert!(is_label_id("Label_12") && is_label_id("CATEGORY_UPDATES"));
         assert!(!is_label_id("a b") && !is_label_id("x&q=1") && !is_label_id(""));
+        assert!(is_draft_id("r-8765432109876543210") && is_draft_id("r:8765432109876543210"));
+        assert!(
+            !is_draft_id("r/../x")
+                && !is_draft_id("r?x=1")
+                && !is_draft_id("a b")
+                && !is_draft_id("")
+        );
         assert_eq!(Change::Trash.inverse(), Some(Change::Untrash));
         assert_eq!(Change::MarkRead.inverse(), None);
     }
