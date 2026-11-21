@@ -23,6 +23,10 @@ use sha2::{Digest, Sha256};
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+/// Media upload endpoint, for messages with attachments.
+const UPLOAD: &str = "https://gmail.googleapis.com/upload/gmail/v1/users/me";
+/// Gmail refuses messages over 25 MB of attachments.
+pub const ATTACHMENT_LIMIT: u64 = 25 * 1024 * 1024;
 /// Sidebar unread counts stop here (20 pages of thread ids).
 const COUNT_CAP: u32 = 10_000;
 /// Read, archive and label. No send, no permanent delete.
@@ -395,8 +399,43 @@ impl Client {
             Some(body) => request.send_json(body),
             None => request.call(),
         };
+        self.finish(result)?
+            .into_json()
+            .context("reading Gmail's reply")
+    }
+
+    /// Uploads a whole RFC 5322 message with its JSON metadata in one multipart request
+    /// (Gmail's media upload, needed for messages with attachments).
+    fn upload<T: serde::de::DeserializeOwned>(
+        &self,
+        request: ureq::Request,
+        metadata: serde_json::Value,
+        raw: &[u8],
+    ) -> Result<T> {
+        let boundary = format!("nimbra-{}", random_hex(12)?);
+        let mut body = format!(
+            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Type: message/rfc822\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(raw);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = request
+            .query("uploadType", "multipart")
+            .timeout(Duration::from_secs(180))
+            .set("Authorization", &format!("Bearer {}", self.access_token()?))
+            .set(
+                "Content-Type",
+                &format!("multipart/related; boundary={boundary}"),
+            );
+        self.finish(request.send_bytes(&body))?
+            .into_json()
+            .context("reading Gmail's reply")
+    }
+
+    /// Turns a ureq result into the response or a readable error.
+    fn finish(&self, result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response> {
         match result {
-            Ok(response) => response.into_json().context("reading Gmail's reply"),
+            Ok(response) => Ok(response),
             Err(ureq::Error::Status(401, _)) => {
                 *self.access.lock().unwrap() = None;
                 Err(SignedOut.into())
@@ -835,10 +874,6 @@ impl Client {
         struct EntryMessage {
             thread_id: String,
         }
-        #[derive(Deserialize)]
-        struct Full {
-            message: RawMessage,
-        }
         let listing: Listing = self.send(
             ureq::get(&format!("{API}/drafts")).query("maxResults", "100"),
             None,
@@ -850,6 +885,19 @@ impl Client {
             .map(|entry| entry.id)
             .filter(|id| is_draft_id(id))
             .ok_or_else(|| anyhow!("That draft is no longer in Gmail."))?;
+        self.draft(&id, thread_id)
+    }
+
+    /// One draft, read in full.
+    pub fn draft(&self, id: &str, thread_id: &str) -> Result<Draft> {
+        #[derive(Deserialize)]
+        struct Full {
+            message: RawMessage,
+        }
+        if !is_draft_id(id) {
+            bail!("unexpected draft id");
+        }
+        let id = id.to_string();
         let full: Full = self.send(
             ureq::get(&format!("{API}/drafts/{id}")).query("format", "full"),
             None,
@@ -861,6 +909,13 @@ impl Client {
         Ok(Draft {
             id,
             to: message.header("To").trim().to_string(),
+            cc: message.header("Cc").trim().to_string(),
+            bcc: message.header("Bcc").trim().to_string(),
+            attachments: message
+                .payload
+                .as_ref()
+                .map(|p| attachments(p, &message.id))
+                .unwrap_or_default(),
             subject: message.header("Subject").trim().to_string(),
             body,
             quoted,
@@ -878,21 +933,55 @@ impl Client {
         struct Saved {
             id: String,
         }
-        let mut message =
-            serde_json::json!({ "raw": URL_SAFE_NO_PAD.encode(outgoing.to_rfc822(true)?) });
-        if let Some(reply) = &outgoing.reply {
-            if !is_id(&reply.thread_id) {
-                bail!("unexpected thread id");
-            }
-            message["threadId"] = reply.thread_id.clone().into();
-        }
-        let request = match id {
-            Some(id) if is_draft_id(id) => ureq::put(&format!("{API}/drafts/{id}")),
-            Some(_) => bail!("unexpected draft id"),
-            None => ureq::post(&format!("{API}/drafts")),
+        let extra = self.kept_files(outgoing)?;
+        let raw = outgoing.to_rfc822(true, &extra)?;
+        let thread_id = match &outgoing.reply {
+            Some(reply) if !is_id(&reply.thread_id) => bail!("unexpected thread id"),
+            Some(reply) => Some(reply.thread_id.clone()),
+            None => None,
         };
-        let saved: Saved = self.send(request, Some(serde_json::json!({ "message": message })))?;
+        let id = match id {
+            Some(id) if is_draft_id(id) => Some(id),
+            Some(_) => bail!("unexpected draft id"),
+            None => None,
+        };
+        let saved: Saved = if raw.len() > 1_000_000 {
+            let mut message = serde_json::json!({});
+            if let Some(thread_id) = &thread_id {
+                message["threadId"] = thread_id.clone().into();
+            }
+            let request = match id {
+                Some(id) => ureq::put(&format!("{UPLOAD}/drafts/{id}")),
+                None => ureq::post(&format!("{UPLOAD}/drafts")),
+            };
+            self.upload(request, serde_json::json!({ "message": message }), &raw)?
+        } else {
+            let mut message = serde_json::json!({ "raw": URL_SAFE_NO_PAD.encode(&raw) });
+            if let Some(thread_id) = &thread_id {
+                message["threadId"] = thread_id.clone().into();
+            }
+            let request = match id {
+                Some(id) => ureq::put(&format!("{API}/drafts/{id}")),
+                None => ureq::post(&format!("{API}/drafts")),
+            };
+            self.send(request, Some(serde_json::json!({ "message": message })))?
+        };
         Ok(saved.id)
+    }
+
+    /// Downloads the attachments a draft already had, to put them back when it is saved.
+    fn kept_files(&self, outgoing: &Outgoing) -> Result<Vec<OutgoingFile>> {
+        outgoing
+            .kept
+            .iter()
+            .map(|att| {
+                Ok(OutgoingFile {
+                    name: att.name.clone(),
+                    mime: att.mime.clone(),
+                    bytes: self.download(&att.message_id, &att.attachment_id)?,
+                })
+            })
+            .collect()
     }
 
     /// Sends an edited draft: saves the edits over it, then asks Gmail to send that draft,
@@ -900,6 +989,14 @@ impl Client {
     pub fn send_draft(&self, id: &str, outgoing: &Outgoing) -> Result<()> {
         outgoing.recipients()?;
         let id = self.save_draft(Some(id), outgoing)?;
+        self.send_saved_draft(&id)
+    }
+
+    /// Sends a draft exactly as it is saved in Gmail (scheduled sends).
+    pub fn send_saved_draft(&self, id: &str) -> Result<()> {
+        if !is_draft_id(id) {
+            bail!("unexpected draft id");
+        }
         self.send::<serde_json::Value>(
             ureq::post(&format!("{API}/drafts/send")),
             Some(serde_json::json!({ "id": id })),
@@ -907,17 +1004,47 @@ impl Client {
         Ok(())
     }
 
-    /// Sends a plain-text message. Runs only when the user presses Send.
-    pub fn send_message(&self, outgoing: &Outgoing) -> Result<()> {
-        let raw = URL_SAFE_NO_PAD.encode(outgoing.to_rfc822(false)?);
-        let mut body = serde_json::json!({ "raw": raw });
-        if let Some(reply) = &outgoing.reply {
-            if !is_id(&reply.thread_id) {
-                bail!("unexpected thread id");
-            }
-            body["threadId"] = reply.thread_id.clone().into();
+    /// Deletes a draft (one the composer saved on its own and the user then discarded).
+    pub fn delete_draft(&self, id: &str) -> Result<()> {
+        if !is_draft_id(id) {
+            bail!("unexpected draft id");
         }
-        self.send::<serde_json::Value>(ureq::post(&format!("{API}/messages/send")), Some(body))?;
+        let request = ureq::delete(&format!("{API}/drafts/{id}"))
+            .timeout(HTTP_TIMEOUT)
+            .set("Authorization", &format!("Bearer {}", self.access_token()?));
+        self.finish(request.call())?;
+        Ok(())
+    }
+
+    /// Sends a message. Runs only when the user presses Send (or its undo window ends).
+    pub fn send_message(&self, outgoing: &Outgoing) -> Result<()> {
+        let extra = self.kept_files(outgoing)?;
+        let raw = outgoing.to_rfc822(false, &extra)?;
+        let thread_id = match &outgoing.reply {
+            Some(reply) if !is_id(&reply.thread_id) => bail!("unexpected thread id"),
+            Some(reply) => Some(reply.thread_id.clone()),
+            None => None,
+        };
+        if raw.len() > 1_000_000 {
+            let mut metadata = serde_json::json!({});
+            if let Some(thread_id) = thread_id {
+                metadata["threadId"] = thread_id.into();
+            }
+            self.upload::<serde_json::Value>(
+                ureq::post(&format!("{UPLOAD}/messages/send")),
+                metadata,
+                &raw,
+            )?;
+        } else {
+            let mut body = serde_json::json!({ "raw": URL_SAFE_NO_PAD.encode(&raw) });
+            if let Some(thread_id) = thread_id {
+                body["threadId"] = thread_id.into();
+            }
+            self.send::<serde_json::Value>(
+                ureq::post(&format!("{API}/messages/send")),
+                Some(body),
+            )?;
+        }
         Ok(())
     }
 
@@ -1060,6 +1187,10 @@ fn is_label_id(id: &str) -> bool {
 pub struct Draft {
     pub id: String,
     pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    /// Files already attached to the draft.
+    pub attachments: Vec<Attachment>,
     pub subject: String,
     /// The part the user wrote (including any signature).
     pub body: String,
@@ -1089,11 +1220,106 @@ fn split_quote(text: &str) -> (String, Option<String>) {
 }
 
 /// A message the user wrote.
+#[derive(Clone, Default)]
 pub struct Outgoing {
     pub to: String,
+    pub cc: String,
+    pub bcc: String,
     pub subject: String,
     pub body: String,
+    /// The same message as HTML, when it was written with formatting.
+    pub html: Option<String>,
+    /// Files picked in the composer.
+    pub files: Vec<OutgoingFile>,
+    /// Attachments already on the draft being edited; downloaded again when it is saved.
+    pub kept: Vec<Attachment>,
     pub reply: Option<ReplyTo>,
+}
+
+/// A file to attach, read into memory.
+#[derive(Clone)]
+pub struct OutgoingFile {
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Every address in a To, Cc or Bcc field, each validated.
+pub fn addresses(list: &str) -> Result<Vec<String>> {
+    let addresses: Vec<String> = list
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(address_of)
+        .collect();
+    for address in &addresses {
+        if !is_address(address) {
+            bail!("“{}” is not a valid email address.", sanitize(address));
+        }
+    }
+    Ok(addresses)
+}
+
+/// A content type for a file name, from its extension.
+pub fn mime_for(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "svg" => "image/svg+xml",
+        "txt" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "zip" => "application/zip",
+        "json" => "application/json",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "key" => "application/x-iwork-keynote-sffkey",
+        "pages" => "application/x-iwork-pages-sffpages",
+        "numbers" => "application/x-iwork-numbers-sffnumbers",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "ics" => "text/calendar",
+        _ => "application/octet-stream",
+    }
+}
+
+fn random_hex(bytes: usize) -> Result<String> {
+    let mut buffer = vec![0u8; bytes];
+    getrandom::getrandom(&mut buffer).map_err(|e| anyhow!("no secure random source: {e}"))?;
+    Ok(buffer.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Appends `data` base64-encoded in 76-character lines.
+fn push_base64(message: &mut String, data: &[u8]) {
+    use base64::engine::general_purpose::STANDARD;
+    let encoded = STANDARD.encode(data);
+    for line in encoded.as_bytes().chunks(76) {
+        message.push_str(std::str::from_utf8(line).unwrap_or_default());
+        message.push_str("\r\n");
+    }
+}
+
+/// RFC 2231 file name parameter value: percent-encoded UTF-8.
+fn encode_filename(name: &str) -> String {
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, serde::Serialize, Deserialize)]
@@ -1104,39 +1330,54 @@ pub struct ReplyTo {
 }
 
 impl Outgoing {
-    /// The recipients, validated. Rejects anything that is not a plain address, which also
-    /// rules out smuggling extra headers in through the To field.
-    pub fn recipients(&self) -> Result<Vec<String>> {
-        let recipients: Vec<String> = self
-            .to
-            .split([',', ';'])
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(address_of)
-            .collect();
-        if recipients.is_empty() {
+    /// To, Cc and Bcc, validated. Rejects anything that is not a plain address, which also
+    /// rules out smuggling extra headers in through these fields.
+    pub fn recipients(&self) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+        let (to, cc, bcc) = (
+            addresses(&self.to)?,
+            addresses(&self.cc)?,
+            addresses(&self.bcc)?,
+        );
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
             bail!("Add at least one recipient.");
         }
-        for address in &recipients {
-            if !is_address(address) {
-                bail!("“{}” is not a valid email address.", sanitize(address));
-            }
-        }
-        Ok(recipients)
+        Ok((to, cc, bcc))
     }
 
-    /// Builds the RFC 5322 message. Gmail fills in From and Date.
-    /// A draft may still have no (or an unfinished) recipient; a message being sent may not.
-    fn to_rfc822(&self, draft: bool) -> Result<Vec<u8>> {
+    /// Total size of the attached files.
+    pub fn attachment_size(&self) -> u64 {
+        self.files.iter().map(|f| f.bytes.len() as u64).sum::<u64>()
+            + self.kept.iter().map(|a| a.size).sum::<u64>()
+    }
+
+    /// Builds the RFC 5322 message, with `extra` files (the kept ones, downloaded).
+    /// Gmail fills in From and Date. A draft may still have no (or unfinished)
+    /// recipients; a message being sent may not.
+    fn to_rfc822(&self, draft: bool, extra: &[OutgoingFile]) -> Result<Vec<u8>> {
         use base64::engine::general_purpose::STANDARD;
-        let recipients = match self.recipients() {
-            Ok(recipients) => recipients,
-            Err(_) if draft => Vec::new(),
+        let (to, cc, bcc) = match self.recipients() {
+            Ok(lists) => lists,
+            Err(_) if draft => {
+                let valid = |list: &str| -> Vec<String> {
+                    list.split([',', ';'])
+                        .map(|p| address_of(p.trim()))
+                        .filter(|a| is_address(a))
+                        .collect()
+                };
+                (valid(&self.to), valid(&self.cc), valid(&self.bcc))
+            }
             Err(error) => return Err(error),
         };
+        let files: Vec<&OutgoingFile> = self.files.iter().chain(extra).collect();
+        let size: u64 = files.iter().map(|f| f.bytes.len() as u64).sum();
+        if size > ATTACHMENT_LIMIT {
+            bail!("Attachments are over Gmail’s 25 MB limit.");
+        }
         let mut message = String::new();
-        if !recipients.is_empty() {
-            message.push_str(&format!("To: {}\r\n", recipients.join(", ")));
+        for (name, list) in [("To", &to), ("Cc", &cc), ("Bcc", &bcc)] {
+            if !list.is_empty() {
+                message.push_str(&format!("{name}: {}\r\n", list.join(", ")));
+            }
         }
         // Encoded-word form keeps the header ASCII and free of line breaks whatever was typed.
         message.push_str(&format!(
@@ -1150,12 +1391,65 @@ impl Outgoing {
             message.push_str(&format!("References: {}\r\n", reply.message_id));
         }
         message.push_str("MIME-Version: 1.0\r\n");
-        message.push_str("Content-Type: text/plain; charset=UTF-8\r\n");
-        message.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
-        let encoded = STANDARD.encode(self.body.replace("\r\n", "\n").replace('\n', "\r\n"));
-        for line in encoded.as_bytes().chunks(76) {
-            message.push_str(std::str::from_utf8(line).unwrap_or_default());
-            message.push_str("\r\n");
+        let text = self.body.replace("\r\n", "\n").replace('\n', "\r\n");
+        let body_part = |message: &mut String| -> Result<()> {
+            match &self.html {
+                Some(html) => {
+                    let boundary = format!("alt-{}", random_hex(12)?);
+                    message.push_str(&format!(
+                        "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n"
+                    ));
+                    message.push_str(&format!("--{boundary}\r\n"));
+                    message.push_str("Content-Type: text/plain; charset=UTF-8\r\n");
+                    message.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+                    push_base64(message, text.as_bytes());
+                    message.push_str(&format!("--{boundary}\r\n"));
+                    message.push_str("Content-Type: text/html; charset=UTF-8\r\n");
+                    message.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+                    push_base64(message, html.as_bytes());
+                    message.push_str(&format!("--{boundary}--\r\n"));
+                }
+                None => {
+                    message.push_str("Content-Type: text/plain; charset=UTF-8\r\n");
+                    message.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+                    push_base64(message, text.as_bytes());
+                }
+            }
+            Ok(())
+        };
+        if files.is_empty() {
+            body_part(&mut message)?;
+        } else {
+            let boundary = format!("mixed-{}", random_hex(12)?);
+            message.push_str(&format!(
+                "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
+            ));
+            message.push_str(&format!("--{boundary}\r\n"));
+            body_part(&mut message)?;
+            for file in files {
+                let name = safe_file_name(&file.name);
+                // A content type that came from outside is only kept if it looks like one.
+                let mime = if file.mime.len() < 100
+                    && file.mime.contains('/')
+                    && file
+                        .mime
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
+                {
+                    file.mime.as_str()
+                } else {
+                    "application/octet-stream"
+                };
+                let encoded = encode_filename(&name);
+                message.push_str(&format!("--{boundary}\r\n"));
+                message.push_str(&format!("Content-Type: {mime}; name*=UTF-8''{encoded}\r\n"));
+                message.push_str(&format!(
+                    "Content-Disposition: attachment; filename*=UTF-8''{encoded}\r\n"
+                ));
+                message.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+                push_base64(&mut message, &file.bytes);
+            }
+            message.push_str(&format!("--{boundary}--\r\n"));
         }
         Ok(message.into_bytes())
     }
@@ -1682,8 +1976,31 @@ mod tests {
             to: to.into(),
             subject: subject.into(),
             body: "Hello\nthere".into(),
-            reply: None,
+            ..Outgoing::default()
         }
+    }
+
+    #[test]
+    fn attachments_and_bcc_build_a_mixed_message() {
+        let mut mail = outgoing("ana@example.com", "Files");
+        mail.bcc = "hidden@example.com".into();
+        mail.files.push(OutgoingFile {
+            name: "Plan \"Q4\".pdf".into(),
+            mime: "application/pdf\r\nX-Evil: 1".into(),
+            bytes: vec![1, 2, 3],
+        });
+        let text = String::from_utf8(mail.to_rfc822(false, &[]).unwrap()).unwrap();
+        assert!(text.contains("Bcc: hidden@example.com\r\n"));
+        assert!(text.contains("Content-Type: multipart/mixed; boundary=\"mixed-"));
+        // The odd content type is replaced and the file name is percent-encoded.
+        assert!(
+            text.contains(
+                "Content-Type: application/octet-stream; name*=UTF-8''Plan%20%22Q4%22.pdf"
+            )
+        );
+        assert!(!text.contains("X-Evil"));
+        mail.files[0].bytes = vec![0; (ATTACHMENT_LIMIT + 1) as usize];
+        assert!(mail.to_rfc822(false, &[]).is_err());
     }
 
     #[test]
@@ -1701,8 +2018,8 @@ mod tests {
     #[test]
     fn a_draft_may_lack_a_recipient_but_a_sent_message_may_not() {
         let draft = outgoing("", "Idea");
-        assert!(draft.to_rfc822(false).is_err());
-        let text = String::from_utf8(draft.to_rfc822(true).unwrap()).unwrap();
+        assert!(draft.to_rfc822(false, &[]).is_err());
+        let text = String::from_utf8(draft.to_rfc822(true, &[]).unwrap()).unwrap();
         assert!(!text.contains("To:") && text.contains("Subject: =?UTF-8?B?"));
     }
 
@@ -1711,7 +2028,12 @@ mod tests {
         let ok = outgoing("Ana <ana@example.com>, bob@example.org; ", "x")
             .recipients()
             .unwrap();
-        assert_eq!(ok, ["ana@example.com", "bob@example.org"]);
+        assert_eq!(ok.0, ["ana@example.com", "bob@example.org"]);
+        let mut mail = outgoing("", "x");
+        mail.cc = "cc@example.com".into();
+        assert_eq!(mail.recipients().unwrap().1, ["cc@example.com"]);
+        mail.bcc = "a@b.co\r\nX-Evil: 1".into();
+        assert!(mail.recipients().is_err());
         for bad in [
             "",
             "not-an-address",
@@ -1735,7 +2057,7 @@ mod tests {
             thread_id: "18c2f0a9b7d3e4f1".into(),
             message_id: "<abc@mail.example.com>".into(),
         });
-        let text = String::from_utf8(mail.to_rfc822(false).unwrap()).unwrap();
+        let text = String::from_utf8(mail.to_rfc822(false, &[]).unwrap()).unwrap();
         let (headers, body) = text.split_once("\r\n\r\n").unwrap();
         // The typed line break never becomes a real header line.
         assert!(
@@ -1751,7 +2073,7 @@ mod tests {
         assert_eq!(String::from_utf8(decoded).unwrap(), "Hello\r\nthere");
 
         mail.reply.as_mut().unwrap().message_id = "<a>\r\nBcc: evil@x.co".into();
-        let text = String::from_utf8(mail.to_rfc822(false).unwrap()).unwrap();
+        let text = String::from_utf8(mail.to_rfc822(false, &[]).unwrap()).unwrap();
         assert!(!text.contains("In-Reply-To") && !text.to_lowercase().contains("bcc"));
     }
 
