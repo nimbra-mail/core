@@ -34,6 +34,53 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Cap on how much of one message is rendered.
 const MAX_BODY_CHARS: usize = 20_000;
 
+/// How many pages of the change feed to read before giving up and fetching afresh.
+const HISTORY_PAGES: usize = 10;
+
+/// The change feed cannot be used from the given point (too old, or too much changed).
+#[derive(Debug)]
+pub struct HistoryExpired;
+
+impl std::fmt::Display for HistoryExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("mailbox history is too old to sync from")
+    }
+}
+
+impl std::error::Error for HistoryExpired {}
+
+/// What changed since a point in the change feed.
+#[derive(Default, Debug)]
+pub struct Changes {
+    /// The point to sync from next time.
+    pub latest: String,
+    /// Threads with any change: new or deleted messages, or labels added or removed.
+    pub threads: Vec<String>,
+    /// Threads that received a new unread message in the inbox (for notifications).
+    pub new_unread_inbox: Vec<String>,
+}
+
+impl View {
+    /// Whether a thread with these labels belongs in this mailbox. `None` for mailboxes
+    /// that are a search rather than a label (Done, Snoozed, search results), which are
+    /// always fetched afresh.
+    pub fn holds(&self, labels: &[String], label_id: Option<&str>) -> Option<bool> {
+        let has = |l: &str| labels.iter().any(|x| x == l);
+        Some(match self {
+            View::Inbox => has("INBOX"),
+            View::Primary => has("INBOX") && has("CATEGORY_PERSONAL"),
+            View::Updates => has("INBOX") && has("CATEGORY_UPDATES"),
+            View::Promotions => has("INBOX") && has("CATEGORY_PROMOTIONS"),
+            View::Social => has("INBOX") && has("CATEGORY_SOCIAL"),
+            View::Starred => has("STARRED"),
+            View::Drafts => has("DRAFT"),
+            View::Sent => has("SENT"),
+            View::Label(_) => has(label_id?),
+            View::Snoozed | View::Done | View::Search => return None,
+        })
+    }
+}
+
 /// Returned when Google no longer accepts the stored sign-in (revoked, or the weekly
 /// expiry of an app in Testing mode). The app reacts by asking the user to sign in again.
 #[derive(Debug)]
@@ -376,15 +423,119 @@ impl Client {
         }
     }
 
-    pub fn email_address(&self) -> Result<String> {
+    /// The account's address and its current history id (the point to sync from).
+    pub fn profile(&self) -> Result<(String, String)> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Profile {
             email_address: String,
+            history_id: String,
         }
-        Ok(self
-            .send::<Profile>(ureq::get(&format!("{API}/profile")), None)?
-            .email_address)
+        let profile: Profile = self.send(ureq::get(&format!("{API}/profile")), None)?;
+        Ok((profile.email_address, profile.history_id))
+    }
+
+    /// Everything that changed in the mailbox since `start` (a history id), in Gmail's own
+    /// change feed. Fails with [`HistoryExpired`] when that point is too old to sync from
+    /// (Gmail keeps about a week) or too much has changed, so the caller fetches afresh.
+    pub fn history(&self, start: &str) -> Result<Changes> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase")]
+        struct Page {
+            #[serde(default)]
+            history: Vec<Record>,
+            next_page_token: Option<String>,
+            history_id: Option<String>,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase")]
+        struct Record {
+            #[serde(default)]
+            messages: Vec<Ref>,
+            #[serde(default)]
+            messages_added: Vec<Wrapped>,
+            #[serde(default)]
+            messages_deleted: Vec<Wrapped>,
+            #[serde(default)]
+            labels_added: Vec<Wrapped>,
+            #[serde(default)]
+            labels_removed: Vec<Wrapped>,
+        }
+        #[derive(Deserialize)]
+        struct Wrapped {
+            message: Ref,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Ref {
+            #[serde(default)]
+            thread_id: String,
+            #[serde(default)]
+            label_ids: Vec<String>,
+        }
+        if !start.chars().all(|c| c.is_ascii_digit()) || start.is_empty() {
+            bail!(HistoryExpired);
+        }
+        let mut changes = Changes::default();
+        let mut token: Option<String> = None;
+        for _ in 0..HISTORY_PAGES {
+            let mut request = ureq::get(&format!("{API}/history"))
+                .query("startHistoryId", start)
+                .query("maxResults", "500");
+            if let Some(token) = &token {
+                request = request.query("pageToken", token);
+            }
+            let page: Page = match self.send(request, None) {
+                Ok(page) => page,
+                Err(error) if error.to_string().starts_with("Gmail error 404") => {
+                    return Err(HistoryExpired.into());
+                }
+                Err(error) => return Err(error),
+            };
+            for record in page.history {
+                for added in &record.messages_added {
+                    let labels = &added.message.label_ids;
+                    let has = |l: &str| labels.iter().any(|x| x == l);
+                    if has("INBOX") && has("UNREAD") && !has("SENT") && !has("DRAFT") {
+                        changes
+                            .new_unread_inbox
+                            .push(added.message.thread_id.clone());
+                    }
+                }
+                let touched = record.messages.iter().chain(
+                    [
+                        &record.messages_added,
+                        &record.messages_deleted,
+                        &record.labels_added,
+                        &record.labels_removed,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|w| &w.message),
+                );
+                for message in touched {
+                    let id = &message.thread_id;
+                    if is_id(id) && !changes.threads.contains(id) {
+                        changes.threads.push(id.clone());
+                    }
+                }
+            }
+            if let Some(latest) = page.history_id {
+                changes.latest = latest;
+            }
+            match page.next_page_token {
+                Some(next) => token = Some(next),
+                None => {
+                    changes.new_unread_inbox.dedup();
+                    if changes.latest.is_empty() {
+                        changes.latest = start.to_string();
+                    }
+                    return Ok(changes);
+                }
+            }
+        }
+        // Too much has changed to apply piece by piece.
+        Err(HistoryExpired.into())
     }
 
     /// The newest threads of a mailbox, with enough detail for the list.
@@ -501,6 +652,15 @@ impl Client {
                 .messages
                 .iter()
                 .any(|m| m.label_ids.iter().any(|l| l == "STARRED")),
+            labels: {
+                let mut labels: Vec<String> = Vec::new();
+                for label in thread.messages.iter().flat_map(|m| &m.label_ids) {
+                    if !labels.contains(label) {
+                        labels.push(label.clone());
+                    }
+                }
+                labels
+            },
         })
     }
 
@@ -751,33 +911,6 @@ impl Client {
                 _ => return Ok(count),
             }
         }
-    }
-
-    /// The ids of the newest unread threads in the inbox, for the new-mail check.
-    pub fn unread_inbox_ids(&self) -> Result<Vec<String>> {
-        #[derive(Deserialize, Default)]
-        struct Listing {
-            #[serde(default)]
-            threads: Vec<Entry>,
-        }
-        #[derive(Deserialize)]
-        struct Entry {
-            id: String,
-        }
-        let listing: Listing = self.send(
-            ureq::get(&format!("{API}/threads"))
-                .query("labelIds", "INBOX")
-                .query("labelIds", "UNREAD")
-                .query("maxResults", "25")
-                .query("fields", "threads/id"),
-            None,
-        )?;
-        Ok(listing
-            .threads
-            .into_iter()
-            .map(|t| t.id)
-            .filter(|id| is_id(id))
-            .collect())
     }
 
     /// The labels the user created, by name.
@@ -1053,6 +1186,8 @@ pub struct Summary {
     pub message_count: usize,
     pub unread: bool,
     pub starred: bool,
+    /// Every label on any message in the thread, to tell which mailboxes it belongs to.
+    pub labels: Vec<String>,
 }
 
 pub struct Message {
@@ -1345,6 +1480,22 @@ mod tests {
         mail.reply.as_mut().unwrap().message_id = "<a>\r\nBcc: evil@x.co".into();
         let text = String::from_utf8(mail.to_rfc822(false).unwrap()).unwrap();
         assert!(!text.contains("In-Reply-To") && !text.to_lowercase().contains("bcc"));
+    }
+
+    #[test]
+    fn mailboxes_hold_the_right_threads() {
+        let labels = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let inbox_promo = labels(&["INBOX", "UNREAD", "CATEGORY_PROMOTIONS"]);
+        assert_eq!(View::Inbox.holds(&inbox_promo, None), Some(true));
+        assert_eq!(View::Promotions.holds(&inbox_promo, None), Some(true));
+        assert_eq!(View::Primary.holds(&inbox_promo, None), Some(false));
+        assert_eq!(View::Sent.holds(&inbox_promo, None), Some(false));
+        let archived = labels(&["Label_7"]);
+        assert_eq!(View::Inbox.holds(&archived, None), Some(false));
+        assert_eq!(View::Label(0).holds(&archived, Some("Label_7")), Some(true));
+        assert_eq!(View::Label(0).holds(&archived, None), None);
+        assert_eq!(View::Done.holds(&archived, None), None);
+        assert_eq!(View::Search.holds(&archived, None), None);
     }
 
     #[test]
