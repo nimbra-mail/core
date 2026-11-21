@@ -496,7 +496,9 @@ impl Client {
                 for added in &record.messages_added {
                     let labels = &added.message.label_ids;
                     let has = |l: &str| labels.iter().any(|x| x == l);
-                    if has("INBOX") && has("UNREAD") && !has("SENT") && !has("DRAFT") {
+                    // Any unread message landing in the inbox counts, including one you sent
+                    // to yourself (it carries both SENT and INBOX). Drafts never do.
+                    if has("INBOX") && has("UNREAD") && !has("DRAFT") {
                         changes
                             .new_unread_inbox
                             .push(added.message.thread_id.clone());
@@ -713,6 +715,7 @@ impl Client {
                 Some(serde_json::json!({ "addLabelIds": add, "removeLabelIds": remove })),
             )
         };
+        // Every request carries a body: Gmail refuses a POST without one (HTTP 411).
         let (action, body) = match change {
             Change::Archive => labels(&[], &["INBOX"]),
             Change::Unarchive => labels(&["INBOX"], &[]),
@@ -720,8 +723,8 @@ impl Client {
             Change::Unstar => labels(&[], &["STARRED"]),
             Change::MarkRead => labels(&[], &["UNREAD"]),
             Change::MarkUnread => labels(&["UNREAD"], &[]),
-            Change::Trash => ("trash", None),
-            Change::Untrash => ("untrash", None),
+            Change::Trash => ("trash", Some(serde_json::json!({}))),
+            Change::Untrash => ("untrash", Some(serde_json::json!({}))),
         };
         self.send::<serde_json::Value>(ureq::post(&format!("{API}/threads/{id}/{action}")), body)?;
         Ok(())
