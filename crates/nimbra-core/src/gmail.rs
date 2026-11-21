@@ -458,7 +458,7 @@ impl Client {
         summaries.into_iter().flatten().collect()
     }
 
-    fn summary(&self, id: &str, recipient: bool) -> Result<Summary> {
+    pub fn summary(&self, id: &str, recipient: bool) -> Result<Summary> {
         if !is_id(id) {
             bail!("unexpected thread id");
         }
@@ -751,6 +751,33 @@ impl Client {
                 _ => return Ok(count),
             }
         }
+    }
+
+    /// The ids of the newest unread threads in the inbox, for the new-mail check.
+    pub fn unread_inbox_ids(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize, Default)]
+        struct Listing {
+            #[serde(default)]
+            threads: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            id: String,
+        }
+        let listing: Listing = self.send(
+            ureq::get(&format!("{API}/threads"))
+                .query("labelIds", "INBOX")
+                .query("labelIds", "UNREAD")
+                .query("maxResults", "25")
+                .query("fields", "threads/id"),
+            None,
+        )?;
+        Ok(listing
+            .threads
+            .into_iter()
+            .map(|t| t.id)
+            .filter(|id| is_id(id))
+            .collect())
     }
 
     /// The labels the user created, by name.
