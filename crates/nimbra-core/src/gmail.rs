@@ -675,18 +675,27 @@ impl Client {
             ureq::get(&format!("{API}/threads/{id}")).query("format", "full"),
             None,
         )?;
-        Ok(thread
+        let mut messages: Vec<Message> = thread
             .messages
             .iter()
             .map(|m| Message {
+                from: person(m.header("From")),
+                to: people(m.header("To")),
+                cc: people(m.header("Cc")),
+                reply_to: people(m.header("Reply-To")).into_iter().next(),
+                attachments: m
+                    .payload
+                    .as_ref()
+                    .map(|p| attachments(p, &m.id))
+                    .unwrap_or_default(),
+                unsubscribe: unsubscribe_link(m.header("List-Unsubscribe")),
                 sender: sender_name(m.header("From")),
                 address: address_of(m.header("From")),
                 message_id: m.header("Message-ID").trim().to_string(),
-                others: [m.header("To"), m.header("Cc")]
-                    .iter()
-                    .flat_map(|list| list.split(','))
-                    .map(address_of)
-                    .filter(|address| is_address(address))
+                others: people(m.header("To"))
+                    .into_iter()
+                    .chain(people(m.header("Cc")))
+                    .map(|p| p.address)
                     .collect(),
                 snippet: decode_entities(&m.snippet),
                 timestamp_ms: m.timestamp_ms(),
@@ -700,7 +709,84 @@ impl Client {
                     .filter(|bytes| bytes.len() <= 2 * 1024 * 1024)
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             })
-            .collect())
+            .collect();
+        // Images embedded in the message itself (`cid:` links) are inlined as data URLs,
+        // so the original view can show them without any network access.
+        for (message, raw) in messages.iter_mut().zip(&thread.messages) {
+            if let (Some(html), Some(payload)) = (message.html.as_mut(), raw.payload.as_ref())
+                && html.contains("cid:")
+            {
+                self.inline_images(html, payload, &raw.id);
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Replaces `cid:` image links in `html` with the image data from the message's parts.
+    fn inline_images(&self, html: &mut String, payload: &Part, message_id: &str) {
+        const BUDGET: usize = 4 * 1024 * 1024;
+        let mut used = 0;
+        let mut parts = Vec::new();
+        collect_parts(payload, &mut parts);
+        for part in parts {
+            let Some(cid) = part
+                .header("Content-ID")
+                .map(|v| v.trim().trim_matches(['<', '>']).to_string())
+                .filter(|cid| !cid.is_empty())
+            else {
+                continue;
+            };
+            let mime = part.mime_type.to_ascii_lowercase();
+            if !matches!(
+                mime.as_str(),
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ) {
+                continue;
+            }
+            let reference = format!("cid:{cid}");
+            if !html.contains(&reference) {
+                continue;
+            }
+            let bytes = match decode_part(part) {
+                Some(bytes) => Some(bytes),
+                None => part
+                    .body
+                    .as_ref()
+                    .and_then(|b| b.attachment_id.as_deref())
+                    .and_then(|att| self.download(message_id, att).ok()),
+            };
+            let Some(bytes) = bytes else { continue };
+            used += bytes.len();
+            if used > BUDGET {
+                break;
+            }
+            let data = format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            *html = html.replace(&reference, &data);
+        }
+    }
+
+    /// Downloads one attachment's bytes.
+    pub fn download(&self, message_id: &str, attachment_id: &str) -> Result<Vec<u8>> {
+        #[derive(Deserialize)]
+        struct Body {
+            #[serde(default)]
+            data: String,
+        }
+        if !is_id(message_id) || !is_attachment_id(attachment_id) {
+            bail!("unexpected attachment id");
+        }
+        let body: Body = self.send(
+            ureq::get(&format!(
+                "{API}/messages/{message_id}/attachments/{attachment_id}"
+            )),
+            None,
+        )?;
+        URL_SAFE_NO_PAD
+            .decode(body.data.trim_end_matches('='))
+            .context("reading the attachment")
     }
 
     /// Applies one change to a thread. Nothing here deletes mail permanently: trash is
@@ -723,6 +809,8 @@ impl Client {
             Change::Unstar => labels(&[], &["STARRED"]),
             Change::MarkRead => labels(&[], &["UNREAD"]),
             Change::MarkUnread => labels(&["UNREAD"], &[]),
+            Change::Spam => labels(&["SPAM"], &["INBOX"]),
+            Change::NotSpam => labels(&["INBOX"], &["SPAM"]),
             Change::Trash => ("trash", Some(serde_json::json!({}))),
             Change::Untrash => ("untrash", Some(serde_json::json!({}))),
         };
@@ -1085,6 +1173,159 @@ fn clean_header(value: &str) -> String {
 }
 
 /// `Name <a@b.co>` or `a@b.co` to `a@b.co`.
+/// A sender or recipient: display name (may be empty) and address.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, Deserialize)]
+pub struct Person {
+    pub name: String,
+    pub address: String,
+}
+
+impl Person {
+    /// The name if there is one, else the address.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.address
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// A file attached to a message.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
+pub struct Attachment {
+    /// Gmail's id of the message it belongs to.
+    pub message_id: String,
+    pub attachment_id: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+fn person(value: &str) -> Person {
+    let address = address_of(value);
+    let name = value
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_string();
+    let name = if name == address { String::new() } else { name };
+    Person {
+        name: decode_entities(&name),
+        address,
+    }
+}
+
+/// Splits an address list on commas that are not inside quotes, keeping valid addresses.
+fn people(list: &str) -> Vec<Person> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted) = (0, false);
+    for (i, c) in list.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                parts.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&list[start..]);
+    parts
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(person)
+        .filter(|p| is_address(&p.address))
+        .collect()
+}
+
+/// The parts that are real attachments: they have a file name and are downloaded
+/// separately. Images embedded in the body (with a Content-ID, shown inline) are left out.
+fn attachments(payload: &Part, message_id: &str) -> Vec<Attachment> {
+    let mut parts = Vec::new();
+    collect_parts(payload, &mut parts);
+    parts
+        .into_iter()
+        .filter(|part| !part.filename.trim().is_empty())
+        .filter(|part| {
+            let inline = part
+                .header("Content-Disposition")
+                .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("inline"));
+            !(inline && part.header("Content-ID").is_some())
+        })
+        .filter_map(|part| {
+            let body = part.body.as_ref()?;
+            let attachment_id = body.attachment_id.clone().filter(|a| is_attachment_id(a))?;
+            Some(Attachment {
+                message_id: message_id.to_string(),
+                attachment_id,
+                name: safe_file_name(&part.filename),
+                mime: part.mime_type.clone(),
+                size: body.size,
+            })
+        })
+        .collect()
+}
+
+fn collect_parts<'a>(part: &'a Part, out: &mut Vec<&'a Part>) {
+    out.push(part);
+    for child in &part.parts {
+        collect_parts(child, out);
+    }
+}
+
+/// A file name that is safe to create in a folder: no path separators, no leading dots,
+/// no control characters, and not too long.
+pub fn safe_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || "/\\:".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').trim();
+    let cleaned: String = cleaned.chars().take(120).collect();
+    if cleaned.is_empty() {
+        "attachment".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The best way out of a mailing list: an https link if offered, else a mailto address.
+fn unsubscribe_link(header: &str) -> Option<String> {
+    let links: Vec<&str> = header
+        .split(',')
+        .map(|p| p.trim().trim_matches(['<', '>']).trim())
+        .collect();
+    links
+        .iter()
+        .find(|l| l.to_ascii_lowercase().starts_with("https://"))
+        .or_else(|| {
+            links
+                .iter()
+                .find(|l| l.to_ascii_lowercase().starts_with("mailto:"))
+        })
+        .filter(|l| l.len() <= 2000 && !l.chars().any(|c| c.is_whitespace() || c.is_control()))
+        .map(|l| l.to_string())
+}
+
+/// Attachment ids are long URL-safe tokens.
+fn is_attachment_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 1024
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn address_of(value: &str) -> String {
     let value = value.trim();
     match (value.rfind('<'), value.rfind('>')) {
@@ -1157,6 +1398,8 @@ pub enum Change {
     Unstar,
     MarkRead,
     MarkUnread,
+    Spam,
+    NotSpam,
 }
 
 impl Change {
@@ -1170,6 +1413,8 @@ impl Change {
             Change::Star => Some(Change::Unstar),
             Change::Unstar => Some(Change::Star),
             Change::MarkRead | Change::MarkUnread => None,
+            Change::Spam => Some(Change::NotSpam),
+            Change::NotSpam => Some(Change::Spam),
         }
     }
 }
@@ -1194,6 +1439,13 @@ pub struct Summary {
 }
 
 pub struct Message {
+    pub from: Person,
+    pub to: Vec<Person>,
+    pub cc: Vec<Person>,
+    pub reply_to: Option<Person>,
+    pub attachments: Vec<Attachment>,
+    /// Where to unsubscribe (`https:` or `mailto:`), from the List-Unsubscribe header.
+    pub unsubscribe: Option<String>,
     /// The sender's bare email address, for replying.
     pub address: String,
     /// The RFC 5322 Message-ID header, for threading a reply.
@@ -1218,6 +1470,9 @@ struct Thread {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawMessage {
+    /// Gmail's own id for the message (not the Message-ID header).
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     snippet: String,
     #[serde(default)]
@@ -1225,6 +1480,15 @@ struct RawMessage {
     #[serde(default)]
     internal_date: String,
     payload: Option<Part>,
+}
+
+impl Part {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
+    }
 }
 
 impl RawMessage {
@@ -1248,6 +1512,8 @@ struct Part {
     #[serde(default)]
     mime_type: String,
     #[serde(default)]
+    filename: String,
+    #[serde(default)]
     headers: Vec<Header>,
     body: Option<PartBody>,
     #[serde(default)]
@@ -1261,8 +1527,12 @@ struct Header {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PartBody {
     data: Option<String>,
+    attachment_id: Option<String>,
+    #[serde(default)]
+    size: u64,
 }
 
 // ------------------------------------------------------------------ parsing
@@ -1499,6 +1769,62 @@ mod tests {
         assert_eq!(View::Label(0).holds(&archived, None), None);
         assert_eq!(View::Done.holds(&archived, None), None);
         assert_eq!(View::Search.holds(&archived, None), None);
+    }
+
+    #[test]
+    fn address_lists_respect_quotes() {
+        let list = people(
+            "\"Doe, Jane\" <jane@example.com>, bob@example.org, Not An Address, \"Ana\" <ana@x.co>",
+        );
+        let names: Vec<_> = list
+            .iter()
+            .map(|p| (p.name.as_str(), p.address.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Doe, Jane", "jane@example.com"),
+                ("", "bob@example.org"),
+                ("Ana", "ana@x.co")
+            ]
+        );
+    }
+
+    #[test]
+    fn unsubscribe_prefers_https_and_rejects_odd_links() {
+        assert_eq!(
+            unsubscribe_link(
+                "<mailto:u@list.example.com?subject=stop>, <https://example.com/u?id=1>"
+            )
+            .as_deref(),
+            Some("https://example.com/u?id=1")
+        );
+        assert_eq!(
+            unsubscribe_link("<mailto:u@list.example.com>").as_deref(),
+            Some("mailto:u@list.example.com")
+        );
+        assert_eq!(unsubscribe_link("<javascript:alert(1)>"), None);
+        assert_eq!(unsubscribe_link(""), None);
+    }
+
+    #[test]
+    fn attachment_names_are_made_safe() {
+        assert_eq!(safe_file_name("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(safe_file_name(".hidden"), "hidden");
+        assert_eq!(safe_file_name("  "), "attachment");
+        assert_eq!(safe_file_name("Report Q4.pdf"), "Report Q4.pdf");
+    }
+
+    #[test]
+    fn attachments_and_inline_images_are_told_apart() {
+        let json = r#"{"mimeType":"multipart/mixed","parts":[
+            {"mimeType":"text/plain","body":{"data":"SGk"}},
+            {"mimeType":"image/png","filename":"logo.png","headers":[{"name":"Content-ID","value":"<logo1>"},{"name":"Content-Disposition","value":"inline"}],"body":{"attachmentId":"ANGjdJ_a","size":10}},
+            {"mimeType":"application/pdf","filename":"Plan.pdf","headers":[{"name":"Content-Disposition","value":"attachment"}],"body":{"attachmentId":"ANGjdJ_b","size":4200}}]}"#;
+        let part: Part = serde_json::from_str(json).unwrap();
+        let found = attachments(&part, "18c2f0a9b7d3e4f1");
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].name.as_str(), found[0].size), ("Plan.pdf", 4200));
     }
 
     #[test]

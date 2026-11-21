@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 const KEYCHAIN_SERVICE: &str = "nimbra";
 const KEYCHAIN_USER: &str = "store-key";
 /// Bumped whenever the stored shapes change; older stores are discarded, not misread.
-const FORMAT: u8 = 1;
+const FORMAT: u8 = 2;
 
 pub struct Store {
     dir: PathBuf,
