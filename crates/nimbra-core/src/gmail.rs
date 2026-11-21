@@ -920,7 +920,15 @@ impl Client {
             Change::Spam => labels(&["SPAM"], &["INBOX"]),
             Change::NotSpam => labels(&["INBOX"], &["SPAM"]),
             Change::Trash => ("trash", Some(serde_json::json!({}))),
-            Change::Untrash => ("untrash", Some(serde_json::json!({}))),
+            Change::Untrash => {
+                // Trash also takes a thread out of the inbox, and untrash does not put it
+                // back: restore it to the inbox as a second step.
+                self.send::<serde_json::Value>(
+                    ureq::post(&format!("{API}/threads/{id}/untrash")),
+                    Some(serde_json::json!({})),
+                )?;
+                labels(&["INBOX"], &[])
+            }
         };
         self.send::<serde_json::Value>(ureq::post(&format!("{API}/threads/{id}/{action}")), body)?;
         Ok(())
