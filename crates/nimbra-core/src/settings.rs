@@ -24,6 +24,8 @@ pub struct Settings {
     pub accounts: Vec<AccountRef>,
     /// The account shown.
     pub active: String,
+    /// Sidebar sections folded away ("split", "mailbox", "labels").
+    pub collapsed: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,6 +52,7 @@ impl Default for Settings {
             theme: ThemeChoice::System,
             accounts: Vec::new(),
             active: String::new(),
+            collapsed: Vec::new(),
         }
     }
 }
