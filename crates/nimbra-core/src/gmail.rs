@@ -565,9 +565,98 @@ impl Client {
         Ok(())
     }
 
+    /// Loads the draft that belongs to a thread in the Drafts mailbox, ready for editing.
+    pub fn draft_for_thread(&self, thread_id: &str) -> Result<Draft> {
+        #[derive(Deserialize, Default)]
+        struct Listing {
+            #[serde(default)]
+            drafts: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            id: String,
+            message: EntryMessage,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct EntryMessage {
+            thread_id: String,
+        }
+        #[derive(Deserialize)]
+        struct Full {
+            message: RawMessage,
+        }
+        let listing: Listing = self.send(
+            ureq::get(&format!("{API}/drafts")).query("maxResults", "100"),
+            None,
+        )?;
+        let id = listing
+            .drafts
+            .into_iter()
+            .find(|entry| entry.message.thread_id == thread_id)
+            .map(|entry| entry.id)
+            .filter(|id| is_label_id(id))
+            .ok_or_else(|| anyhow!("That draft is no longer in Gmail."))?;
+        let full: Full = self.send(
+            ureq::get(&format!("{API}/drafts/{id}")).query("format", "full"),
+            None,
+        )?;
+        let message = &full.message;
+        let text = message.payload.as_ref().map(body_text).unwrap_or_default();
+        let (body, quoted) = split_quote(&text);
+        let in_reply_to = message.header("In-Reply-To").trim().to_string();
+        Ok(Draft {
+            id,
+            to: message.header("To").trim().to_string(),
+            subject: message.header("Subject").trim().to_string(),
+            body,
+            quoted,
+            reply: is_message_id(&in_reply_to).then(|| ReplyTo {
+                thread_id: thread_id.to_string(),
+                message_id: in_reply_to,
+            }),
+        })
+    }
+
+    /// Saves what is in the composer as a Gmail draft: a new one, or over an existing one.
+    /// Returns the draft's id.
+    pub fn save_draft(&self, id: Option<&str>, outgoing: &Outgoing) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Saved {
+            id: String,
+        }
+        let mut message =
+            serde_json::json!({ "raw": URL_SAFE_NO_PAD.encode(outgoing.to_rfc822(true)?) });
+        if let Some(reply) = &outgoing.reply {
+            if !is_id(&reply.thread_id) {
+                bail!("unexpected thread id");
+            }
+            message["threadId"] = reply.thread_id.clone().into();
+        }
+        let request = match id {
+            Some(id) if is_label_id(id) => ureq::put(&format!("{API}/drafts/{id}")),
+            Some(_) => bail!("unexpected draft id"),
+            None => ureq::post(&format!("{API}/drafts")),
+        };
+        let saved: Saved = self.send(request, Some(serde_json::json!({ "message": message })))?;
+        Ok(saved.id)
+    }
+
+    /// Sends an edited draft: saves the edits over it, then asks Gmail to send that draft,
+    /// which also removes it from Drafts. Runs only when the user presses Send.
+    pub fn send_draft(&self, id: &str, outgoing: &Outgoing) -> Result<()> {
+        outgoing.recipients()?;
+        let id = self.save_draft(Some(id), outgoing)?;
+        self.send::<serde_json::Value>(
+            ureq::post(&format!("{API}/drafts/send")),
+            Some(serde_json::json!({ "id": id })),
+        )?;
+        Ok(())
+    }
+
     /// Sends a plain-text message. Runs only when the user presses Send.
     pub fn send_message(&self, outgoing: &Outgoing) -> Result<()> {
-        let raw = URL_SAFE_NO_PAD.encode(outgoing.to_rfc822()?);
+        let raw = URL_SAFE_NO_PAD.encode(outgoing.to_rfc822(false)?);
         let mut body = serde_json::json!({ "raw": raw });
         if let Some(reply) = &outgoing.reply {
             if !is_id(&reply.thread_id) {
@@ -633,6 +722,38 @@ fn is_label_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// A saved draft, opened for editing.
+pub struct Draft {
+    pub id: String,
+    pub to: String,
+    pub subject: String,
+    /// The part the user wrote (including any signature).
+    pub body: String,
+    /// The earlier message it quotes or forwards, kept collapsed in the composer.
+    pub quoted: Option<String>,
+    pub reply: Option<ReplyTo>,
+}
+
+/// Splits a draft's text into what the user wrote and the quoted earlier message.
+fn split_quote(text: &str) -> (String, Option<String>) {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|line| {
+        let line = line.trim();
+        line.starts_with('>')
+            || (line.starts_with("On ") && line.ends_with("wrote:"))
+            || line.contains("Forwarded message")
+            || line.starts_with("-----Original Message")
+    });
+    let join = |part: &[&str]| part.join("\n").trim_end().to_string();
+    match start {
+        Some(start) => (
+            join(&lines[..start]),
+            Some(join(&lines[start..])).filter(|q| !q.is_empty()),
+        ),
+        None => (join(&lines), None),
+    }
+}
+
 /// A message the user wrote.
 pub struct Outgoing {
     pub to: String,
@@ -671,11 +792,18 @@ impl Outgoing {
     }
 
     /// Builds the RFC 5322 message. Gmail fills in From and Date.
-    fn to_rfc822(&self) -> Result<Vec<u8>> {
+    /// A draft may still have no (or an unfinished) recipient; a message being sent may not.
+    fn to_rfc822(&self, draft: bool) -> Result<Vec<u8>> {
         use base64::engine::general_purpose::STANDARD;
-        let recipients = self.recipients()?;
+        let recipients = match self.recipients() {
+            Ok(recipients) => recipients,
+            Err(_) if draft => Vec::new(),
+            Err(error) => return Err(error),
+        };
         let mut message = String::new();
-        message.push_str(&format!("To: {}\r\n", recipients.join(", ")));
+        if !recipients.is_empty() {
+            message.push_str(&format!("To: {}\r\n", recipients.join(", ")));
+        }
         // Encoded-word form keeps the header ASCII and free of line breaks whatever was typed.
         message.push_str(&format!(
             "Subject: =?UTF-8?B?{}?=\r\n",
@@ -1041,6 +1169,26 @@ mod tests {
     }
 
     #[test]
+    fn drafts_split_into_own_text_and_quote() {
+        let (own, quoted) =
+            split_quote("Hi,\n\nSee below.\n\nLuan\n\nOn Tue, Ana wrote:\n> old\n> text\n");
+        assert_eq!(own, "Hi,\n\nSee below.\n\nLuan");
+        assert_eq!(quoted.as_deref(), Some("On Tue, Ana wrote:\n> old\n> text"));
+        let (own, quoted) = split_quote("Luan\n\n---------- Forwarded message ---------\nFrom: x");
+        assert_eq!(own, "Luan");
+        assert!(quoted.unwrap().starts_with("---------- Forwarded"));
+        assert_eq!(split_quote("Just me"), ("Just me".to_string(), None));
+    }
+
+    #[test]
+    fn a_draft_may_lack_a_recipient_but_a_sent_message_may_not() {
+        let draft = outgoing("", "Idea");
+        assert!(draft.to_rfc822(false).is_err());
+        let text = String::from_utf8(draft.to_rfc822(true).unwrap()).unwrap();
+        assert!(!text.contains("To:") && text.contains("Subject: =?UTF-8?B?"));
+    }
+
+    #[test]
     fn recipients_are_validated() {
         let ok = outgoing("Ana <ana@example.com>, bob@example.org; ", "x")
             .recipients()
@@ -1069,7 +1217,7 @@ mod tests {
             thread_id: "18c2f0a9b7d3e4f1".into(),
             message_id: "<abc@mail.example.com>".into(),
         });
-        let text = String::from_utf8(mail.to_rfc822().unwrap()).unwrap();
+        let text = String::from_utf8(mail.to_rfc822(false).unwrap()).unwrap();
         let (headers, body) = text.split_once("\r\n\r\n").unwrap();
         // The typed line break never becomes a real header line.
         assert!(
@@ -1085,7 +1233,7 @@ mod tests {
         assert_eq!(String::from_utf8(decoded).unwrap(), "Hello\r\nthere");
 
         mail.reply.as_mut().unwrap().message_id = "<a>\r\nBcc: evil@x.co".into();
-        let text = String::from_utf8(mail.to_rfc822().unwrap()).unwrap();
+        let text = String::from_utf8(mail.to_rfc822(false).unwrap()).unwrap();
         assert!(!text.contains("In-Reply-To") && !text.to_lowercase().contains("bcc"));
     }
 
