@@ -919,6 +919,13 @@ impl Client {
             subject: message.header("Subject").trim().to_string(),
             body,
             quoted,
+            html: message
+                .payload
+                .as_ref()
+                .and_then(|payload| find_part(payload, "text/html"))
+                .and_then(decode_part)
+                .filter(|bytes| bytes.len() <= 2 * 1024 * 1024)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             reply: is_message_id(&in_reply_to).then(|| ReplyTo {
                 thread_id: thread_id.to_string(),
                 message_id: in_reply_to,
@@ -1196,6 +1203,8 @@ pub struct Draft {
     pub body: String,
     /// The earlier message it quotes or forwards, kept collapsed in the composer.
     pub quoted: Option<String>,
+    /// The draft's HTML, when it was written with formatting.
+    pub html: Option<String>,
     pub reply: Option<ReplyTo>,
 }
 
@@ -1999,6 +2008,15 @@ mod tests {
             )
         );
         assert!(!text.contains("X-Evil"));
+        // A formatted message carries both a text and an HTML version.
+        mail.html = Some("<div dir=\"ltr\"><b>Hi</b></div>".into());
+        let text = String::from_utf8(mail.to_rfc822(false, &[]).unwrap()).unwrap();
+        assert!(text.contains("Content-Type: multipart/alternative; boundary=\"alt-"));
+        assert!(text.find("text/plain").unwrap() < text.find("text/html").unwrap());
+        assert!(
+            text.find("multipart/alternative").unwrap()
+                < text.find("application/octet-stream").unwrap()
+        );
         mail.files[0].bytes = vec![0; (ATTACHMENT_LIMIT + 1) as usize];
         assert!(mail.to_rfc822(false, &[]).is_err());
     }
