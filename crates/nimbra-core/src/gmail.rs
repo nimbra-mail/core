@@ -29,10 +29,25 @@ const UPLOAD: &str = "https://gmail.googleapis.com/upload/gmail/v1/users/me";
 pub const ATTACHMENT_LIMIT: u64 = 25 * 1024 * 1024;
 /// Sidebar unread counts stop here (20 pages of thread ids).
 const COUNT_CAP: u32 = 10_000;
-/// Read, archive and label. No send, no permanent delete.
-const SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
+/// Read, archive and label (no permanent delete), plus the basic profile (name and photo)
+/// for the account row.
+const SCOPE: &str =
+    "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/userinfo.profile";
 /// Asked for only when the user first deletes something permanently: full mail access.
-const FULL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify https://mail.google.com/";
+const FULL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/userinfo.profile https://mail.google.com/";
+/// The signed-in user's basic profile (name and photo address).
+const USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+/// The largest profile photo accepted.
+const PHOTO_LIMIT: u64 = 2 * 1024 * 1024;
+
+/// The account's Google profile photo.
+pub enum Photo {
+    Image(Vec<u8>),
+    /// The account has none.
+    NoPhoto,
+    /// This sign-in does not include the profile (signed in before Nimbra asked for it).
+    NotAllowed,
+}
 const KEYCHAIN_SERVICE: &str = "nimbra";
 const KEYCHAIN_USER: &str = "gmail-refresh-token";
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -417,6 +432,37 @@ impl Client {
         // Refresh a minute early so a token never expires mid-request.
         let expiry = Instant::now() + Duration::from_secs(expires_in.saturating_sub(60));
         *self.access.lock().unwrap() = Some((access_token, expiry));
+    }
+
+    /// The account's Google profile photo, downloaded (about 128 px). It is only ever
+    /// fetched from Google's own image host, over HTTPS.
+    pub fn profile_photo(&self) -> Result<Photo> {
+        let response = ureq::get(USERINFO)
+            .timeout(HTTP_TIMEOUT)
+            .set("Authorization", &format!("Bearer {}", self.access_token()?))
+            .call();
+        let info: serde_json::Value = match response {
+            Ok(response) => response.into_json()?,
+            Err(ureq::Error::Status(401 | 403, _)) => return Ok(Photo::NotAllowed),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(link) = info.get("picture").and_then(|p| p.as_str()) else {
+            return Ok(Photo::NoPhoto);
+        };
+        let Some(link) = photo_link(link) else {
+            return Ok(Photo::NoPhoto);
+        };
+        let response = ureq::get(&link).timeout(HTTP_TIMEOUT).call()?;
+        let mut bytes = Vec::new();
+        use std::io::Read as _;
+        response
+            .into_reader()
+            .take(PHOTO_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > PHOTO_LIMIT || bytes.is_empty() {
+            return Ok(Photo::NoPhoto);
+        }
+        Ok(Photo::Image(bytes))
     }
 
     fn access_token(&self) -> Result<String> {
@@ -1714,6 +1760,25 @@ pub struct Attachment {
     pub size: u64,
 }
 
+/// A profile photo address, only if it is Google's image host over HTTPS, asked for at
+/// 128 px (Google's size suffix, such as `=s96-c`, replaced).
+fn photo_link(link: &str) -> Option<String> {
+    let url = url::Url::parse(link).ok()?;
+    let host = url.host_str()?;
+    if url.scheme() != "https"
+        || !(host == "googleusercontent.com" || host.ends_with(".googleusercontent.com"))
+    {
+        return None;
+    }
+    let mut text = url.to_string();
+    if let Some(at) = text.rfind('=')
+        && text[at..].starts_with("=s")
+    {
+        text.truncate(at);
+    }
+    Some(format!("{text}=s128-c"))
+}
+
 fn person(value: &str) -> Person {
     let address = address_of(value);
     let name = value
@@ -2478,6 +2543,7 @@ mod tests {
         assert!(!url.as_str().contains("secret"));
         // Full mail access (permanent delete) is only asked for when it is needed.
         assert_eq!(get("scope"), SCOPE);
+        assert!(SCOPE.contains("userinfo.profile"));
         let (_, full) = SignIn::start(&config, true).unwrap();
         assert!(full.contains("mail.google.com"));
     }
@@ -2502,5 +2568,16 @@ mod tests {
         assert!(hit("/?code=evil&state=wrong".into()).starts_with("HTTP/1.1 404"));
         assert!(hit(format!("/?code=good&state={state}")).starts_with("HTTP/1.1 200"));
         assert_eq!(waiter.join().unwrap().unwrap(), "good");
+    }
+
+    #[test]
+    fn profile_photos_only_come_from_google() {
+        assert_eq!(
+            photo_link("https://lh3.googleusercontent.com/a/abc=s96-c").as_deref(),
+            Some("https://lh3.googleusercontent.com/a/abc=s128-c")
+        );
+        assert!(photo_link("http://lh3.googleusercontent.com/a/abc").is_none());
+        assert!(photo_link("https://evil.example.com/a.png").is_none());
+        assert!(photo_link("https://googleusercontent.com.evil.example/a").is_none());
     }
 }
