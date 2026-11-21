@@ -88,6 +88,8 @@ impl View {
     pub fn holds(&self, labels: &[String], label_id: Option<&str>) -> Option<bool> {
         let has = |l: &str| labels.iter().any(|x| x == l);
         Some(match self {
+            // Mixes accounts: always listed afresh.
+            View::AllInboxes => return None,
             View::Inbox => has("INBOX"),
             View::Primary => has("INBOX") && has("CATEGORY_PERSONAL"),
             View::Updates => has("INBOX") && has("CATEGORY_UPDATES"),
@@ -718,7 +720,7 @@ impl Client {
             request = request.query("pageToken", page);
         }
         let request = match view {
-            View::Inbox => request.query("labelIds", "INBOX"),
+            View::Inbox | View::AllInboxes => request.query("labelIds", "INBOX"),
             View::Primary => category(request, "CATEGORY_PERSONAL"),
             View::Updates => category(request, "CATEGORY_UPDATES"),
             View::Promotions => category(request, "CATEGORY_PROMOTIONS"),
@@ -1948,6 +1950,8 @@ fn is_id(id: &str) -> bool {
 /// The mailboxes the sidebar can show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum View {
+    /// Every signed-in account's inbox, merged (listed account by account as `Inbox`).
+    AllInboxes,
     Inbox,
     /// Gmail's inbox categories.
     Primary,
