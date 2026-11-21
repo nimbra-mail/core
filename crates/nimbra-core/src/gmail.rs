@@ -101,6 +101,18 @@ impl std::fmt::Display for SignedOut {
 
 impl std::error::Error for SignedOut {}
 
+/// Gmail (or Google's sign-in) could not be reached at all: no network, most likely.
+#[derive(Debug)]
+pub struct Offline;
+
+impl std::fmt::Display for Offline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("You’re offline. Nimbra will catch up when the connection is back.")
+    }
+}
+
+impl std::error::Error for Offline {}
+
 // ------------------------------------------------------------------ config
 
 #[derive(Clone)]
@@ -190,7 +202,7 @@ fn token_request(form: &[(&str, &str)]) -> Result<TokenResponse> {
             }
             bail!("Google rejected the sign-in ({code} {error})")
         }
-        Err(_) => bail!("Could not reach Google. Check your connection."),
+        Err(_) => Err(Offline.into()),
     }
 }
 
@@ -464,7 +476,7 @@ impl Client {
             Err(ureq::Error::Status(code, response)) => {
                 Err(api_error(code, &response.into_string().unwrap_or_default()))
             }
-            Err(_) => bail!("Could not reach Gmail. Check your connection."),
+            Err(_) => Err(Offline.into()),
         }
     }
 
@@ -1303,7 +1315,7 @@ fn split_quote(text: &str) -> (String, Option<String>) {
 }
 
 /// A message the user wrote.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, Deserialize)]
 pub struct Outgoing {
     pub to: String,
     pub cc: String,
@@ -1320,7 +1332,7 @@ pub struct Outgoing {
 }
 
 /// A file to attach, read into memory.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, Deserialize)]
 pub struct OutgoingFile {
     pub name: String,
     pub mime: String,
@@ -1804,7 +1816,7 @@ pub enum View {
     Trash,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub enum Change {
     Archive,
     Unarchive,
