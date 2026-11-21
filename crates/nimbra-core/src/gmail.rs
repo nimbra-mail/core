@@ -872,7 +872,7 @@ pub struct Outgoing {
     pub reply: Option<ReplyTo>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, Deserialize)]
 pub struct ReplyTo {
     pub thread_id: String,
     /// Message-ID of the message being answered.
@@ -1038,7 +1038,7 @@ impl Change {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, Deserialize)]
 pub struct Label {
     pub id: String,
     pub name: String,

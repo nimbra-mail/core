@@ -16,7 +16,7 @@ const MAX_BLOCKS: usize = 600;
 const MAX_CHARS: usize = 60_000;
 const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub kind: Kind,
     /// Nesting depth inside quoted text.
@@ -26,7 +26,7 @@ pub struct Block {
     pub spans: Vec<Span>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Paragraph,
     Heading(u8),
@@ -36,7 +36,7 @@ pub enum Kind {
     Image { src: String, alt: String },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub range: Range<usize>,
     pub bold: bool,
