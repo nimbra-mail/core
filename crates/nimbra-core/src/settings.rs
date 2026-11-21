@@ -26,6 +26,8 @@ pub struct Settings {
     pub active: String,
     /// Sidebar sections folded away ("split", "mailbox", "labels").
     pub collapsed: Vec<String>,
+    /// The last few searches, newest first.
+    pub recent_searches: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -53,6 +55,7 @@ impl Default for Settings {
             accounts: Vec::new(),
             active: String::new(),
             collapsed: Vec::new(),
+            recent_searches: Vec::new(),
         }
     }
 }
