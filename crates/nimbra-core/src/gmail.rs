@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+/// Sidebar unread counts stop here (20 pages of thread ids).
+const COUNT_CAP: u32 = 10_000;
 /// Read, archive and label. No send, no permanent delete.
 const SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
 const KEYCHAIN_SERVICE: &str = "nimbra";
@@ -678,6 +680,77 @@ impl Client {
             Some(serde_json::json!({ "addLabelIds": [label_id] })),
         )?;
         Ok(())
+    }
+
+    /// Sidebar counts per label id, as (unread, total) threads. Unread counts only threads
+    /// still in the inbox: Gmail's own label counts include archived ("Done") threads, which
+    /// the mailboxes here do not list. Total is read for Drafts only (0 elsewhere). A label
+    /// that cannot be read is simply left out.
+    pub fn counts(&self, label_ids: &[String]) -> std::collections::HashMap<String, (u32, u32)> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Detail {
+            #[serde(default)]
+            threads_total: u32,
+        }
+        let ids: Vec<&String> = label_ids.iter().filter(|id| is_label_id(id)).collect();
+        if ids.is_empty() || self.access_token().is_err() {
+            return Default::default();
+        }
+        let mut found: Vec<Option<(u32, u32)>> = vec![None; ids.len()];
+        let chunk = ids.len().div_ceil(6).max(1);
+        std::thread::scope(|scope| {
+            for (ids, out) in ids.chunks(chunk).zip(found.chunks_mut(chunk)) {
+                scope.spawn(move || {
+                    for (id, slot) in ids.iter().zip(out) {
+                        *slot = if id.as_str() == "DRAFT" {
+                            self.send::<Detail>(ureq::get(&format!("{API}/labels/{id}")), None)
+                                .ok()
+                                .map(|d| (0, d.threads_total))
+                        } else {
+                            self.inbox_unread(id).ok().map(|unread| (unread, 0))
+                        };
+                    }
+                });
+            }
+        });
+        ids.into_iter()
+            .zip(found)
+            .filter_map(|(id, counts)| Some((id.clone(), counts?)))
+            .collect()
+    }
+
+    /// Unread threads in the inbox that carry this label, counted from thread ids (Gmail has
+    /// no count for two labels together). Stops at COUNT_CAP.
+    fn inbox_unread(&self, label_id: &str) -> Result<u32> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Page {
+            #[serde(default)]
+            threads: Vec<serde::de::IgnoredAny>,
+            next_page_token: Option<String>,
+        }
+        let mut count = 0u32;
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = ureq::get(&format!("{API}/threads"))
+                .query("maxResults", "500")
+                .query("fields", "threads/id,nextPageToken")
+                .query("labelIds", "INBOX")
+                .query("labelIds", "UNREAD");
+            if label_id != "INBOX" {
+                request = request.query("labelIds", label_id);
+            }
+            if let Some(token) = &token {
+                request = request.query("pageToken", token);
+            }
+            let page: Page = self.send(request, None)?;
+            count += page.threads.len() as u32;
+            match page.next_page_token {
+                Some(next) if count < COUNT_CAP => token = Some(next),
+                _ => return Ok(count),
+            }
+        }
     }
 
     /// The labels the user created, by name.
