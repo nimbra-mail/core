@@ -110,7 +110,11 @@ impl View {
 /// Returned when Google no longer accepts the stored sign-in (revoked, or the weekly
 /// expiry of an app in Testing mode). The app reacts by asking the user to sign in again.
 #[derive(Debug)]
-pub struct SignedOut;
+pub struct SignedOut {
+    /// Whose sign-in: several accounts are connected at once, and only the one named may
+    /// be signed out for it. Empty while a sign-in is not yet any account's.
+    pub account: String,
+}
 
 impl std::fmt::Display for SignedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -248,7 +252,10 @@ fn token_request(form: &[(&str, &str)]) -> Result<TokenResponse> {
             }
             let error = response.into_json::<OAuthError>().unwrap_or_default().error;
             if error == "invalid_grant" {
-                return Err(SignedOut.into());
+                return Err(SignedOut {
+                    account: String::new(),
+                }
+                .into());
             }
             bail!("Google rejected the sign-in ({code} {error})")
         }
@@ -467,6 +474,13 @@ impl Client {
         Ok(Photo::Image(bytes))
     }
 
+    fn signed_out(&self) -> anyhow::Error {
+        SignedOut {
+            account: self.account.clone(),
+        }
+        .into()
+    }
+
     fn access_token(&self) -> Result<String> {
         if let Some((token, expiry)) = self.access.lock().unwrap().as_ref()
             && Instant::now() < *expiry
@@ -479,10 +493,12 @@ impl Client {
             ("client_id", &self.config.client_id),
             ("client_secret", &self.config.client_secret),
         ])
-        .inspect_err(|e| {
-            if e.is::<SignedOut>() {
-                forget_refresh_token(&self.account);
+        .map_err(|e| {
+            if !e.is::<SignedOut>() {
+                return e;
             }
+            forget_refresh_token(&self.account);
+            self.signed_out()
         })?;
         self.remember(tokens.access_token.clone(), tokens.expires_in);
         Ok(tokens.access_token)
@@ -565,7 +581,7 @@ impl Client {
             Ok(response) => Ok(response),
             Err(ureq::Error::Status(401, _)) => {
                 *self.access.lock().unwrap() = None;
-                Err(SignedOut.into())
+                Err(self.signed_out())
             }
             Err(ureq::Error::Status(code, response)) => {
                 Err(api_error(code, &response.into_string().unwrap_or_default()))
