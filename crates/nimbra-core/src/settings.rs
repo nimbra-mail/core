@@ -28,6 +28,8 @@ pub struct Settings {
     pub active: String,
     /// Sidebar sections folded away ("split", "mailbox", "labels").
     pub collapsed: Vec<String>,
+    /// The sidebar was left in auto-hide (⌘B).
+    pub sidebar_auto_hide: bool,
     /// The last few searches, newest first.
     pub recent_searches: Vec<String>,
     /// When an opened thread counts as read.
@@ -102,6 +104,7 @@ impl Default for Settings {
             accounts: Vec::new(),
             active: String::new(),
             collapsed: Vec::new(),
+            sidebar_auto_hide: false,
             recent_searches: Vec::new(),
             mark_read: MarkRead::Open,
             check_every: 30,
@@ -158,6 +161,10 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"signature":"Luan"}"#).unwrap();
         assert_eq!(settings.signature, "Luan");
         assert!(settings.notifications && settings.original_view);
+        // The sidebar starts docked until it has been put in auto-hide.
+        assert!(!settings.sidebar_auto_hide);
+        let hidden: Settings = serde_json::from_str(r#"{"sidebar_auto_hide":true}"#).unwrap();
+        assert!(hidden.sidebar_auto_hide);
         // On for settings saved before it existed; turning it off sticks.
         assert!(settings.dark_emails);
         let off: Settings = serde_json::from_str(r#"{"dark_emails":false}"#).unwrap();
