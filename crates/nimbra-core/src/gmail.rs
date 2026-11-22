@@ -1878,12 +1878,68 @@ pub fn safe_file_name(name: &str) -> String {
     }
 }
 
+/// The message a `mailto:` unsubscribe link asks for.
+pub struct UnsubscribeMail {
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+}
+
+/// Reads a `mailto:` unsubscribe link (RFC 6068). The sender wrote it, so only one address,
+/// a subject and a plain-text body are taken from it: never a Cc or a Bcc.
+pub fn unsubscribe_mail(link: &str) -> Option<UnsubscribeMail> {
+    let url = url::Url::parse(link)
+        .ok()
+        .filter(|u| u.scheme() == "mailto")?;
+    // In a mailto a plus is a plus, not a space as in a form.
+    let decode = |query: String| -> Vec<(String, String)> {
+        url::form_urlencoded::parse(query.replace('+', "%2B").as_bytes())
+            .map(|(key, value)| (key.to_ascii_lowercase(), value.into_owned()))
+            .collect()
+    };
+    let to = decode(format!("to={}", url.path())).into_iter().next()?.1;
+    if to.contains([',', ';', '<', '>']) || !is_address(&to) {
+        return None;
+    }
+    let fields = decode(url.query().unwrap_or("").to_string());
+    let field = |name: &str| fields.iter().find(|(key, _)| key == name).map(|(_, v)| v);
+    let subject: String = field("subject")
+        .map_or("unsubscribe", String::as_str)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(300)
+        .collect();
+    let body: String = field("body")
+        .map_or("", String::as_str)
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(2000)
+        .collect();
+    Some(UnsubscribeMail {
+        to,
+        subject: if subject.trim().is_empty() {
+            "unsubscribe".into()
+        } else {
+            subject
+        },
+        body,
+    })
+}
+
 /// The best way out of a mailing list: an https link if offered, else a mailto address.
 fn unsubscribe_link(header: &str) -> Option<String> {
-    let links: Vec<&str> = header
-        .split(',')
-        .map(|p| p.trim().trim_matches(['<', '>']).trim())
-        .collect();
+    // Each is in angle brackets (RFC 2369): commas may be inside one, and so may the
+    // whitespace of a folded header, which is not part of it. Some senders omit them.
+    let links: Vec<String> = if header.contains('<') {
+        header
+            .split('<')
+            .skip(1)
+            .filter_map(|part| part.split_once('>'))
+            .map(|(link, _)| link.split_ascii_whitespace().collect())
+            .collect()
+    } else {
+        header.split(',').map(|p| p.trim().to_string()).collect()
+    };
     links
         .iter()
         .find(|l| l.to_ascii_lowercase().starts_with("https://"))
@@ -2433,6 +2489,52 @@ mod tests {
                 ("Ana", "ana@x.co")
             ]
         );
+    }
+
+    #[test]
+    fn unsubscribe_links_can_be_folded_and_hold_commas() {
+        let github = "<mailto:unsub+AB12@reply.github.com>,\r\n <https://github.com/notifications/unsubscribe-auth/AB12>";
+        assert_eq!(
+            unsubscribe_link(github).as_deref(),
+            Some("https://github.com/notifications/unsubscribe-auth/AB12")
+        );
+        assert_eq!(
+            unsubscribe_link("<https://example.com/u?lists=1,2,\r\n 3>").as_deref(),
+            Some("https://example.com/u?lists=1,2,3")
+        );
+        assert_eq!(
+            unsubscribe_link("https://example.com/bare").as_deref(),
+            Some("https://example.com/bare")
+        );
+    }
+
+    #[test]
+    fn unsubscribe_mail_follows_the_link_and_nothing_more() {
+        let mail = unsubscribe_mail(
+            "MAILTO:unsub+AB12@list.example.com?Subject=stop%20list+1&body=line%3A%201%0Aline%202&cc=x@evil.example&bcc=y@evil.example",
+        )
+        .unwrap();
+        assert_eq!(mail.to, "unsub+AB12@list.example.com");
+        assert_eq!(mail.subject, "stop list+1");
+        assert_eq!(mail.body, "line: 1\nline 2");
+
+        let bare = unsubscribe_mail("mailto:leave%2Bme@list.example.com").unwrap();
+        assert_eq!(bare.to, "leave+me@list.example.com");
+        assert_eq!(
+            (bare.subject.as_str(), bare.body.as_str()),
+            ("unsubscribe", "")
+        );
+
+        let tricky = unsubscribe_mail("mailto:u@list.example.com?subject=a%0D%0ABcc:%20x@y.zz");
+        assert!(!tricky.unwrap().subject.contains(['\r', '\n']));
+        for bad in [
+            "mailto:",
+            "mailto:a@list.example.com,b@evil.example",
+            "mailto:a@list.example.com%2Cb@evil.example",
+            "https://example.com/u",
+        ] {
+            assert!(unsubscribe_mail(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]
