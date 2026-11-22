@@ -17,6 +17,8 @@ pub struct Settings {
     pub original_view: bool,
     /// Show remote images in the original view.
     pub load_images: bool,
+    /// In dark theme, give light emails a dark page in the original view.
+    pub dark_emails: bool,
     /// Light, dark, or follow the system.
     pub theme: ThemeChoice,
     /// The Gmail accounts signed in on this Mac (ids and addresses; the sign-ins themselves
@@ -95,6 +97,7 @@ impl Default for Settings {
             notifications: true,
             original_view: true,
             load_images: true,
+            dark_emails: true,
             theme: ThemeChoice::System,
             accounts: Vec::new(),
             active: String::new(),
@@ -155,6 +158,10 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"signature":"Luan"}"#).unwrap();
         assert_eq!(settings.signature, "Luan");
         assert!(settings.notifications && settings.original_view);
+        // On for settings saved before it existed; turning it off sticks.
+        assert!(settings.dark_emails);
+        let off: Settings = serde_json::from_str(r#"{"dark_emails":false}"#).unwrap();
+        assert!(!off.dark_emails);
         assert_eq!(settings.theme, ThemeChoice::System);
     }
 }
