@@ -68,13 +68,18 @@ impl Store {
     /// The same for work nobody is waiting on. It does not ask the keychain again once that
     /// has said no, as macOS would put up its question every time.
     pub fn open_quietly(account: &str) -> Result<Self> {
-        if locked(&UNREADABLE)
-            .as_ref()
-            .is_some_and(|all| all.contains(account))
-        {
+        if Self::unreadable(account) {
             bail!("the key of this account's store could not be read");
         }
         Self::open(account)
+    }
+
+    /// Whether the account's key could not be read when it was last asked for, so that
+    /// nothing of it can be kept.
+    pub fn unreadable(account: &str) -> bool {
+        locked(&UNREADABLE)
+            .as_ref()
+            .is_some_and(|all| all.contains(account))
     }
 
     fn open_at(dir: PathBuf, key: &[u8; 32]) -> Result<Self> {

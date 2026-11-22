@@ -3,6 +3,7 @@
 //! out is never sent again by itself. What was being written at quit is kept the same way,
 //! for Drafts only.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Instant;
 
@@ -33,6 +34,8 @@ pub enum Stage {
     Writing,
     /// The same, with a time to send it that was not saved yet.
     Unscheduled,
+    /// Discarded at quit: its draft is to be deleted, and nothing sent or saved.
+    Discarded,
     /// Sent, taken back, or handed on.
     Over,
 }
@@ -57,6 +60,8 @@ pub struct Job {
     pub composer: Option<u64>,
     client: Arc<gmail::Client>,
     name: String,
+    /// It is on disk. Outside the lock, which a write holds while the keychain is asked.
+    kept: AtomicBool,
     state: Mutex<State>,
     changed: Condvar,
 }
@@ -75,6 +80,7 @@ impl Job {
             composer: Some(composer),
             client,
             name: format!("{RECORD}{}", gmail::random_hex(8)?),
+            kept: AtomicBool::new(false),
             state: Mutex::new(State {
                 record: Record {
                     stage: Stage::Held,
@@ -87,7 +93,7 @@ impl Job {
         }))
     }
 
-    /// One that was still being written at quit: `stage` is `Writing` or `Unscheduled`.
+    /// One that was still open at quit: `stage` is `Writing`, `Unscheduled` or `Discarded`.
     pub fn unfinished(
         account: String,
         composer: u64,
@@ -137,6 +143,7 @@ impl Job {
                 composer: None,
                 client: client.clone(),
                 name,
+                kept: AtomicBool::new(true),
                 state: Mutex::new(State {
                     record,
                     store: Some(store.clone()),
@@ -172,6 +179,26 @@ impl Job {
         self.write(&mut self.state.lock().unwrap())
     }
 
+    /// The same on Send, which is worth asking the keychain again for. Blocking.
+    pub fn keep_asking(&self) -> bool {
+        if Store::unreadable(&self.account)
+            && let Ok(store) = Store::open(&self.account)
+        {
+            // Not under the lock while asking: the main thread takes that too.
+            self.state
+                .lock()
+                .unwrap()
+                .store
+                .get_or_insert(Arc::new(store));
+        }
+        self.keep()
+    }
+
+    /// Whether it is on disk.
+    pub fn kept(&self) -> bool {
+        self.kept.load(Ordering::Relaxed)
+    }
+
     fn write(&self, state: &mut State) -> bool {
         if state.record.stage == Stage::Over {
             return false;
@@ -186,6 +213,7 @@ impl Job {
             state.claim = store.claim(&self.name);
         }
         let saved = store.save(&self.name, &state.record).is_ok();
+        self.kept.store(saved, Ordering::Relaxed);
         if !saved {
             eprintln!("nimbra: could not save the message being sent");
         }
@@ -259,6 +287,22 @@ impl Job {
             .ok()?;
         self.forget();
         Some(id)
+    }
+
+    /// Deletes what was saved of a discarded message. Until that works it stays on disk.
+    /// Blocking.
+    pub fn discard(&self) -> bool {
+        let deleted = match self.mail().draft_id {
+            None => true,
+            Some(id) => match self.client.delete_draft(&id) {
+                Ok(()) => true,
+                Err(error) => gmail::is_gone(&error),
+            },
+        };
+        if deleted {
+            self.forget();
+        }
+        deleted
     }
 
     fn wait(&self) {

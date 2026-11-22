@@ -12,15 +12,17 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::store::Store;
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -106,6 +108,28 @@ impl View {
             View::Trash => has("TRASH"),
             View::Snoozed | View::Done | View::Search | View::AllMail => return None,
         })
+    }
+
+    /// Whether the change feed can keep this mailbox up to date. Done and All Mail are
+    /// searches, but ones that can be answered from a thread's labels.
+    pub fn syncs(&self, label_id: Option<&str>) -> bool {
+        matches!(self, View::Done | View::AllMail) || self.holds(&[], label_id).is_some()
+    }
+
+    /// Whether a changed thread is in this mailbox.
+    pub fn takes(&self, thread: &Summary, label_id: Option<&str>) -> bool {
+        // Gmail searches message by message: one that qualifies brings its thread.
+        let none_of = |out: &[&str]| {
+            thread
+                .message_labels
+                .iter()
+                .any(|labels| !labels.iter().any(|label| out.contains(&label.as_str())))
+        };
+        match self {
+            View::Done => none_of(&["INBOX", "SENT", "DRAFT", "CHAT", "SPAM", "TRASH"]),
+            View::AllMail => none_of(&["SPAM", "TRASH"]),
+            view => view.holds(&thread.labels, label_id) == Some(true),
+        }
     }
 }
 
@@ -514,6 +538,8 @@ pub struct Client {
     /// List rows by thread (and whether they name the recipient), each with the thread's
     /// history id then: one that has not moved is not fetched again (40 units). Memory only.
     rows: Mutex<HashMap<(String, bool), (String, Summary)>>,
+    /// Where the newest of them are kept over a relaunch: the account's encrypted store.
+    rows_kept_in: Mutex<Option<Arc<Store>>>,
 }
 
 impl Client {
@@ -525,6 +551,7 @@ impl Client {
             account,
             writes: AtomicU64::new(0),
             rows: Mutex::new(HashMap::new()),
+            rows_kept_in: Mutex::new(None),
         }
     }
 
@@ -731,16 +758,50 @@ impl Client {
         self.rows.lock().unwrap().clear();
     }
 
+    /// Takes up the rows kept in the account's store, and keeps them there from now on.
+    /// Blocking.
+    pub fn keep_rows_in(&self, store: &Arc<Store>) {
+        let kept: Vec<KeptRow> = store.load(ROWS).unwrap_or_default();
+        let mut rows = self.rows.lock().unwrap();
+        for (id, recipient, version, row) in kept {
+            rows.entry((id, recipient)).or_insert((version, row));
+        }
+        *self.rows_kept_in.lock().unwrap() = Some(store.clone());
+    }
+
+    /// Saves the newest rows. Blocking.
+    fn save_rows(&self) {
+        const KEPT_ROWS: usize = 600;
+        let Some(store) = self.rows_kept_in.lock().unwrap().clone() else {
+            return;
+        };
+        let taken = store.snapshot();
+        let mut kept: Vec<KeptRow> = self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((id, recipient), (version, row))| {
+                (id.clone(), *recipient, version.clone(), row.clone())
+            })
+            .collect();
+        kept.sort_by_key(|(_, _, _, row)| std::cmp::Reverse(row.timestamp_ms));
+        kept.truncate(KEPT_ROWS);
+        if store.save_newest(ROWS, &kept, taken).is_err() {
+            eprintln!("nimbra: could not save the list rows");
+        }
+    }
+
     /// A list row, fetched only if the thread has changed since it last was. `version` is
     /// its history id as listed; without one it is always fetched.
-    fn row(&self, id: &str, version: &str, recipient: bool) -> Result<Summary> {
+    fn row(&self, id: &str, version: &str, recipient: bool) -> Result<(Summary, bool)> {
         const MOST_ROWS: usize = 5000;
         let key = (id.to_string(), recipient);
         if !version.is_empty()
             && let Some((kept, row)) = self.rows.lock().unwrap().get(&key)
             && kept == version
         {
-            return Ok(row.clone());
+            return Ok((row.clone(), false));
         }
         let row = self.summary(id, recipient)?;
         if !version.is_empty() {
@@ -750,7 +811,7 @@ impl Client {
             }
             rows.insert(key, (version.to_string(), row.clone()));
         }
-        Ok(row)
+        Ok((row, true))
     }
 
     /// The account's address and its current history id (the point to sync from).
@@ -888,7 +949,7 @@ impl Client {
         // Fetch thread metadata a few at a time; one request per changed thread is the only way
         // to get subject and sender without the batch endpoint.
         self.access_token()?;
-        let mut summaries: Vec<Option<Result<Summary>>> = Vec::new();
+        let mut summaries: Vec<Option<Result<(Summary, bool)>>> = Vec::new();
         summaries.resize_with(threads.len(), || None);
         let workers = 6.min(threads.len().max(1));
         std::thread::scope(|scope| {
@@ -901,8 +962,12 @@ impl Client {
                 });
             }
         });
-        let summaries: Result<Vec<Summary>> = summaries.into_iter().flatten().collect();
-        Ok((summaries?, next))
+        let summaries: Result<Vec<(Summary, bool)>> = summaries.into_iter().flatten().collect();
+        let summaries = summaries?;
+        if summaries.iter().any(|(_, fetched)| *fetched) {
+            self.save_rows();
+        }
+        Ok((summaries.into_iter().map(|(row, _)| row).collect(), next))
     }
 
     /// Where the page after the first `count` threads starts, for a list that came from
@@ -1022,6 +1087,11 @@ impl Client {
                 }
                 labels
             },
+            message_labels: thread
+                .messages
+                .iter()
+                .map(|m| m.label_ids.clone())
+                .collect(),
         })
     }
 
@@ -2267,6 +2337,11 @@ pub struct Label {
     pub name: String,
 }
 
+/// The store record of the list rows.
+const ROWS: &str = "rows";
+/// A row as kept: thread, whether it names the recipient, its history id, and the row.
+type KeptRow = (String, bool, String, Summary);
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct Listing {
@@ -2284,7 +2359,7 @@ struct ListedThread {
     history_id: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Summary {
     pub id: String,
     pub sender: String,
@@ -2296,6 +2371,8 @@ pub struct Summary {
     pub starred: bool,
     /// Every label on any message in the thread, to tell which mailboxes it belongs to.
     pub labels: Vec<String>,
+    /// Each message's own, for the mailboxes that are searches (`View::takes`).
+    pub message_labels: Vec<Vec<String>>,
 }
 
 pub struct Message {
@@ -2501,6 +2578,36 @@ fn paragraphs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_and_all_mail_go_message_by_message_as_gmail_does() {
+        let thread = |messages: &[&[&str]]| Summary {
+            id: "t".into(),
+            sender: String::new(),
+            subject: String::new(),
+            snippet: String::new(),
+            timestamp_ms: 0,
+            message_count: messages.len(),
+            unread: false,
+            starred: false,
+            labels: messages
+                .iter()
+                .flat_map(|m| m.iter().map(|l| l.to_string()))
+                .collect(),
+            message_labels: messages
+                .iter()
+                .map(|m| m.iter().map(|l| l.to_string()).collect())
+                .collect(),
+        };
+        let done = |messages: &[&[&str]]| View::Done.takes(&thread(messages), None);
+        assert!(done(&[&["CATEGORY_UPDATES"]]) && done(&[&[]]));
+        // An archived message with your reply to it.
+        assert!(done(&[&["IMPORTANT"], &["SENT"]]));
+        assert!(!done(&[&["INBOX"]]) && !done(&[&["SENT"]]) && !done(&[&["TRASH"]]));
+        let all = |messages: &[&[&str]]| View::AllMail.takes(&thread(messages), None);
+        assert!(all(&[&["INBOX"]]) && all(&[&["SPAM"], &["SENT"]]) && !all(&[&["SPAM"]]));
+        assert!(View::Done.syncs(None) && !View::Search.syncs(None));
+    }
 
     #[test]
     fn a_failing_gmail_may_have_sent_it_and_a_refusing_one_has_not() {
