@@ -96,6 +96,42 @@ impl Store {
         serde_json::from_slice(&plain).ok()
     }
 
+    /// The records whose name starts with `prefix`.
+    pub fn names(&self, prefix: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let file = entry.file_name();
+                let name = file.to_str()?.strip_suffix(".bin")?;
+                name.starts_with(prefix).then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    /// Claims a record for this process for as long as the file returned is open. `None`
+    /// while someone has it.
+    pub fn claim(&self, name: &str) -> Option<std::fs::File> {
+        let path = self.path(name).ok()?.with_extension("lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(path).ok()?;
+        file.try_lock().ok()?;
+        Some(file)
+    }
+
+    /// Deletes a record and its claim.
+    pub fn remove(&self, name: &str) {
+        if let Ok(path) = self.path(name) {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("lock"));
+        }
+    }
+
     /// Whether the list saved under `name` is empty, as far as can be told without the key
     /// (which waits on the keychain): from its size. Good for choosing what to draw until
     /// the store is open and `load` has the real answer, and for nothing else.
@@ -227,6 +263,21 @@ mod tests {
             STANDARD.encode(id).replace(['/', '+', '='], "")
         ));
         Store::open_at(dir, &[key; 32]).unwrap()
+    }
+
+    #[test]
+    fn a_claimed_record_cannot_be_claimed_again_until_let_go() {
+        let store = temp_store(5);
+        store.save("sending-1", &1).unwrap();
+        store.save("view-0", &2).unwrap();
+        assert_eq!(store.names("sending-"), ["sending-1"]);
+        let claim = store.claim("sending-1").unwrap();
+        assert!(store.claim("sending-1").is_none());
+        drop(claim);
+        assert!(store.claim("sending-1").is_some());
+        store.remove("sending-1");
+        assert!(store.names("sending-").is_empty());
+        std::fs::remove_dir_all(&store.dir).unwrap();
     }
 
     #[test]

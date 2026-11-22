@@ -12,7 +12,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -135,6 +135,49 @@ impl std::fmt::Display for Offline {
 }
 
 impl std::error::Error for Offline {}
+
+/// The connection failed once a request may already have reached Gmail, so it may have
+/// been carried out: a send like this is never made again by itself.
+#[derive(Debug)]
+pub struct MayHaveArrived;
+
+impl std::fmt::Display for MayHaveArrived {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gmail’s answer did not arrive. Check your connection.")
+    }
+}
+
+/// What a request carries.
+#[derive(Clone, Copy)]
+enum Payload<'a> {
+    None,
+    Json(&'a serde_json::Value),
+    Bytes(&'a [u8]),
+}
+
+/// For the steps before the one that sends: whatever became of them, nothing was sent.
+fn before_sending(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<MayHaveArrived>() {
+        return Offline.into();
+    }
+    error
+}
+
+/// Whether a failed request certainly never left this Mac.
+fn never_left(kind: ureq::ErrorKind) -> bool {
+    use ureq::ErrorKind as E;
+    matches!(
+        kind,
+        E::Dns
+            | E::ConnectionFailed
+            | E::InvalidUrl
+            | E::UnknownScheme
+            | E::InsecureRequestHttpsOnly
+            | E::InvalidProxyUrl
+            | E::ProxyConnect
+            | E::ProxyUnauthorized
+    )
+}
 
 /// Permanent deletion needs a permission this sign-in does not have yet.
 #[derive(Debug)]
@@ -422,7 +465,9 @@ fn sanitize(text: &str) -> String {
 pub struct Client {
     config: Config,
     refresh_token: String,
-    access: Mutex<Option<(String, Instant)>>,
+    /// The access token and when it is over, by the wall clock: an `Instant` stands still
+    /// while the Mac sleeps, and the token does not.
+    access: Mutex<Option<(String, SystemTime)>>,
     /// Which account's keychain entry holds the refresh token.
     account: String,
 }
@@ -439,17 +484,15 @@ impl Client {
 
     fn remember(&self, access_token: String, expires_in: u64) {
         // Refresh a minute early so a token never expires mid-request.
-        let expiry = Instant::now() + Duration::from_secs(expires_in.saturating_sub(60));
+        let expiry = SystemTime::now() + Duration::from_secs(expires_in.saturating_sub(60));
         *self.access.lock().unwrap() = Some((access_token, expiry));
     }
 
     /// The account's Google profile photo, downloaded (about 128 px). It is only ever
     /// fetched from Google's own image host, over HTTPS.
     pub fn profile_photo(&self) -> Result<Photo> {
-        let response = ureq::get(USERINFO)
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.access_token()?))
-            .call();
+        let response =
+            self.authorized(&ureq::get(USERINFO).timeout(HTTP_TIMEOUT), Payload::None)?;
         let info: serde_json::Value = match response {
             Ok(response) => response.into_json()?,
             Err(ureq::Error::Status(401 | 403, _)) => return Ok(Photo::NotAllowed),
@@ -483,7 +526,7 @@ impl Client {
 
     fn access_token(&self) -> Result<String> {
         if let Some((token, expiry)) = self.access.lock().unwrap().as_ref()
-            && Instant::now() < *expiry
+            && SystemTime::now() < *expiry
         {
             return Ok(token.clone());
         }
@@ -504,6 +547,41 @@ impl Client {
         Ok(tokens.access_token)
     }
 
+    /// Makes a request with the access token. A refused token is renewed and the request
+    /// made once more (refused, so Gmail did nothing with it). Whether the sign-in itself
+    /// has ended only the renewal can say: see `access_token`.
+    fn authorized(
+        &self,
+        request: &ureq::Request,
+        payload: Payload<'_>,
+    ) -> Result<Result<ureq::Response, ureq::Error>> {
+        let mut renewed = false;
+        loop {
+            let token = self.access_token()?;
+            let call = request
+                .clone()
+                .set("Authorization", &format!("Bearer {token}"));
+            let result = match payload {
+                Payload::None => call.call(),
+                Payload::Json(value) => call.send_json(value),
+                Payload::Bytes(bytes) => call.send_bytes(bytes),
+            };
+            if renewed || !matches!(result, Err(ureq::Error::Status(401, _))) {
+                return Ok(result);
+            }
+            self.forget_access(&token);
+            renewed = true;
+        }
+    }
+
+    /// Drops `refused`, unless another thread has put a newer token in its place.
+    fn forget_access(&self, refused: &str) {
+        let mut access = self.access.lock().unwrap();
+        if access.as_ref().is_some_and(|(token, _)| token == refused) {
+            *access = None;
+        }
+    }
+
     fn send<T: serde::de::DeserializeOwned>(
         &self,
         request: ureq::Request,
@@ -514,14 +592,10 @@ impl Client {
         let mut wait = Duration::from_millis(1500);
         let mut attempt = 0;
         loop {
-            let call = request
-                .clone()
-                .timeout(HTTP_TIMEOUT)
-                .set("Authorization", &format!("Bearer {}", self.access_token()?));
-            let result = match &body {
-                Some(body) => call.send_json(body.clone()),
-                None => call.call(),
-            };
+            let result = self.authorized(
+                &request.clone().timeout(HTTP_TIMEOUT),
+                body.as_ref().map_or(Payload::None, Payload::Json),
+            )?;
             if let Err(ureq::Error::Status(code @ (403 | 429), response)) = result {
                 let text = response.into_string().unwrap_or_default();
                 if attempt < 3 && is_rate_limited(code, &text) {
@@ -537,7 +611,8 @@ impl Client {
             let text = self
                 .finish(result)?
                 .into_string()
-                .context("reading Gmail's reply")?;
+                .context("reading Gmail's reply")
+                .context(MayHaveArrived)?;
             let text = if text.trim().is_empty() {
                 "{}"
             } else {
@@ -565,28 +640,31 @@ impl Client {
         let request = request
             .query("uploadType", "multipart")
             .timeout(Duration::from_secs(180))
-            .set("Authorization", &format!("Bearer {}", self.access_token()?))
             .set(
                 "Content-Type",
                 &format!("multipart/related; boundary={boundary}"),
             );
-        self.finish(request.send_bytes(&body))?
+        let result = self.authorized(&request, Payload::Bytes(&body))?;
+        self.finish(result)?
             .into_json()
             .context("reading Gmail's reply")
+            .context(MayHaveArrived)
     }
 
     /// Turns a ureq result into the response or a readable error.
     fn finish(&self, result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response> {
         match result {
             Ok(response) => Ok(response),
-            Err(ureq::Error::Status(401, _)) => {
-                *self.access.lock().unwrap() = None;
-                Err(self.signed_out())
-            }
+            // Refused with a new token as well. The sign-in just gave that token, so this
+            // is Gmail's trouble, and no reason to sign out and delete anything.
+            Err(ureq::Error::Status(401, _)) => Err(anyhow!(
+                "Gmail did not accept the request. Try again in a moment."
+            )),
             Err(ureq::Error::Status(code, response)) => {
                 Err(api_error(code, &response.into_string().unwrap_or_default()))
             }
-            Err(_) => Err(Offline.into()),
+            Err(error) if never_left(error.kind()) => Err(Offline.into()),
+            Err(_) => Err(anyhow::Error::new(Offline).context(MayHaveArrived)),
         }
     }
 
@@ -1152,8 +1230,19 @@ impl Client {
     /// which also removes it from Drafts. Runs only when the user presses Send.
     pub fn send_draft(&self, id: &str, outgoing: &Outgoing) -> Result<()> {
         outgoing.recipients()?;
-        let id = self.save_draft(Some(id), outgoing)?;
+        let id = self
+            .save_draft(Some(id), outgoing)
+            .map_err(before_sending)?;
         self.send_saved_draft(&id)
+    }
+
+    /// Keeps a message that was not sent as a draft: over the one it had or, if that is
+    /// gone, as a new one.
+    pub fn keep_as_draft(&self, id: Option<&str>, outgoing: &Outgoing) -> Result<String> {
+        match self.save_draft(id, outgoing) {
+            Err(error) if id.is_some() && !error.is::<Offline>() => self.save_draft(None, outgoing),
+            result => result,
+        }
     }
 
     /// Sends a draft exactly as it is saved in Gmail (scheduled sends).
@@ -1173,16 +1262,17 @@ impl Client {
         if !is_draft_id(id) {
             bail!("unexpected draft id");
         }
-        let request = ureq::delete(&format!("{API}/drafts/{id}"))
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.access_token()?));
-        self.finish(request.call())?;
+        let result = self.authorized(
+            &ureq::delete(&format!("{API}/drafts/{id}")).timeout(HTTP_TIMEOUT),
+            Payload::None,
+        )?;
+        self.finish(result)?;
         Ok(())
     }
 
     /// Sends a message. Runs only when the user presses Send (or its undo window ends).
     pub fn send_message(&self, outgoing: &Outgoing) -> Result<()> {
-        let extra = self.kept_files(outgoing)?;
+        let extra = self.kept_files(outgoing).map_err(before_sending)?;
         let raw = outgoing.to_rfc822(false, &extra)?;
         let thread_id = match &outgoing.reply {
             Some(reply) if !is_id(&reply.thread_id) => bail!("unexpected thread id"),
@@ -1541,7 +1631,7 @@ pub fn mime_for(name: &str) -> &'static str {
     }
 }
 
-fn random_hex(bytes: usize) -> Result<String> {
+pub(crate) fn random_hex(bytes: usize) -> Result<String> {
     let mut buffer = vec![0u8; bytes];
     getrandom::getrandom(&mut buffer).map_err(|e| anyhow!("no secure random source: {e}"))?;
     Ok(buffer.iter().map(|b| format!("{b:02x}")).collect())
@@ -2299,6 +2389,16 @@ fn paragraphs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_request_that_never_left_is_safe_to_send_again() {
+        use ureq::ErrorKind as E;
+        assert!(never_left(E::Dns) && never_left(E::ConnectionFailed));
+        assert!(!never_left(E::Io) && !never_left(E::BadStatus) && !never_left(E::BadHeader));
+        let unclear = anyhow::Error::new(Offline).context(MayHaveArrived);
+        assert!(unclear.is::<Offline>() && unclear.is::<MayHaveArrived>());
+        assert!(!before_sending(unclear).is::<MayHaveArrived>());
+    }
 
     #[test]
     fn pkce_matches_rfc7636_example() {
