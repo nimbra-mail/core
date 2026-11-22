@@ -1,6 +1,7 @@
 //! A message from Send until Gmail has it. It is kept in its account's store meanwhile, so
 //! that quitting or switching accounts cannot lose it, and one that may already have gone
-//! out is never sent again by itself.
+//! out is never sent again by itself. What was being written at quit is kept the same way,
+//! for Drafts only.
 
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Instant;
@@ -28,6 +29,10 @@ pub enum Stage {
     Unsure,
     /// Gmail said no.
     Refused,
+    /// Was still being written at quit: for Drafts, never to be sent.
+    Writing,
+    /// The same, with a time to send it that was not saved yet.
+    Unscheduled,
     /// Sent, taken back, or handed on.
     Over,
 }
@@ -80,6 +85,20 @@ impl Job {
             }),
             changed: Condvar::new(),
         }))
+    }
+
+    /// One that was still being written at quit: `stage` is `Writing` or `Unscheduled`.
+    pub fn unfinished(
+        account: String,
+        composer: u64,
+        client: Arc<gmail::Client>,
+        store: Option<Arc<Store>>,
+        mail: QueuedMail,
+        stage: Stage,
+    ) -> anyhow::Result<Arc<Self>> {
+        let job = Job::new(account, composer, client, store, mail)?;
+        job.state.lock().unwrap().record.stage = stage;
+        Ok(job)
     }
 
     /// One from the offline queue of earlier versions.
@@ -158,7 +177,7 @@ impl Job {
             return false;
         }
         if state.store.is_none() {
-            state.store = Store::open(&self.account).ok().map(Arc::new);
+            state.store = Store::open_quietly(&self.account).ok().map(Arc::new);
         }
         let Some(store) = state.store.clone() else {
             return false;
@@ -228,15 +247,18 @@ impl Job {
 
     /// Puts it in Gmail's Drafts. Until that works it stays on disk. Blocking.
     pub fn to_drafts(&self) -> bool {
+        self.saved_as_draft().is_some()
+    }
+
+    /// The same, for who needs the draft's id.
+    pub fn saved_as_draft(&self) -> Option<String> {
         let mail = self.mail();
-        let saved = self
+        let id = self
             .client
             .keep_as_draft(mail.draft_id.as_deref(), &mail.outgoing)
-            .is_ok();
-        if saved {
-            self.forget();
-        }
-        saved
+            .ok()?;
+        self.forget();
+        Some(id)
     }
 
     fn wait(&self) {

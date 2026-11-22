@@ -147,6 +147,37 @@ impl std::fmt::Display for MayHaveArrived {
     }
 }
 
+/// An error Gmail answered with.
+#[derive(Debug)]
+struct Answered {
+    code: u16,
+    text: String,
+}
+
+impl std::fmt::Display for Answered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Gmail error {}: {}", self.code, self.text)
+    }
+}
+
+impl std::error::Error for Answered {}
+
+/// Whether what was asked for is not in Gmail (sent or deleted, say).
+pub fn is_gone(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<Answered>()
+        .is_some_and(|e| e.code == 404)
+}
+
+/// For the step that sends: Gmail failing (5xx, or giving up on waiting) does not say that
+/// the message was not sent.
+fn while_sending(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<Answered>() {
+        Some(answer) if answer.code >= 500 || answer.code == 408 => error.context(MayHaveArrived),
+        _ => error,
+    }
+}
+
 /// What a request carries.
 #[derive(Clone, Copy)]
 enum Payload<'a> {
@@ -249,8 +280,14 @@ fn keychain(account: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(KEYCHAIN_SERVICE, &user).context("opening the system keychain")
 }
 
-pub fn stored_refresh_token(account: &str) -> Option<String> {
-    keychain(account).ok()?.get_password().ok()
+/// The saved sign-in: `None` when there is none. A keychain that cannot be read (denied,
+/// locked) is an error, which is not being signed out.
+pub fn stored_refresh_token(account: &str) -> Result<Option<String>> {
+    match keychain(account)?.get_password() {
+        Ok(token) => Ok(Some(token)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error).context("reading the sign-in from the system keychain"),
+    }
 }
 
 fn store_refresh_token(account: &str, token: &str) -> Result<()> {
@@ -618,7 +655,10 @@ impl Client {
             } else {
                 text.as_str()
             };
-            return serde_json::from_str(text).context("reading Gmail's reply");
+            // Accepted, so it was carried out, whatever is wrong with the answer.
+            return serde_json::from_str(text)
+                .context("reading Gmail's reply")
+                .context(MayHaveArrived);
         }
     }
 
@@ -1253,7 +1293,8 @@ impl Client {
         self.send::<serde_json::Value>(
             ureq::post(&format!("{API}/drafts/send")),
             Some(serde_json::json!({ "id": id })),
-        )?;
+        )
+        .map_err(while_sending)?;
         Ok(())
     }
 
@@ -1288,16 +1329,15 @@ impl Client {
                 ureq::post(&format!("{UPLOAD}/messages/send")),
                 metadata,
                 &raw,
-            )?;
+            )
+            .map_err(while_sending)?;
         } else {
             let mut body = serde_json::json!({ "raw": URL_SAFE_NO_PAD.encode(&raw) });
             if let Some(thread_id) = thread_id {
                 body["threadId"] = thread_id.into();
             }
-            self.send::<serde_json::Value>(
-                ureq::post(&format!("{API}/messages/send")),
-                Some(body),
-            )?;
+            self.send::<serde_json::Value>(ureq::post(&format!("{API}/messages/send")), Some(body))
+                .map_err(while_sending)?;
         }
         Ok(())
     }
@@ -1821,10 +1861,11 @@ fn api_error(code: u16, body: &str) -> anyhow::Error {
     let message = serde_json::from_str::<ApiError>(body)
         .map(|e| e.error.message)
         .unwrap_or_default();
-    anyhow!(
-        "Gmail error {code}: {}",
-        message.chars().take(160).collect::<String>()
-    )
+    Answered {
+        code,
+        text: message.chars().take(160).collect(),
+    }
+    .into()
 }
 
 /// Collapses a typed header value to one line without control characters.
@@ -2389,6 +2430,15 @@ fn paragraphs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failing_gmail_may_have_sent_it_and_a_refusing_one_has_not() {
+        let unclear = |code| while_sending(api_error(code, "{}")).is::<MayHaveArrived>();
+        assert!(unclear(500) && unclear(502) && unclear(503) && unclear(408));
+        assert!(!unclear(400) && !unclear(403) && !unclear(404) && !unclear(429));
+        assert!(is_gone(&api_error(404, "{}")) && !is_gone(&api_error(500, "404")));
+        assert_eq!(api_error(418, "").to_string(), "Gmail error 418: ");
+    }
 
     #[test]
     fn only_a_request_that_never_left_is_safe_to_send_again() {

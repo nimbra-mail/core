@@ -7,7 +7,9 @@
 //! then rename) with permissions limited to the user. Signing out deletes both the files
 //! and the key.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -24,6 +26,17 @@ const FORMAT: u8 = 2;
 /// The size of a saved empty list: format, nonce, `[]`, and the cipher's tag.
 const EMPTY_LIST: u64 = 1 + 12 + 2 + 16;
 
+/// One key is made at a time: a second would replace the one just written with.
+static MAKING_KEY: Mutex<()> = Mutex::new(());
+/// One `update` at a time, so that none writes over what another just did.
+static UPDATING: Mutex<()> = Mutex::new(());
+/// The accounts whose key could not be read when it was last asked for.
+static UNREADABLE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 pub struct Store {
     dir: PathBuf,
     cipher: ChaCha20Poly1305,
@@ -35,7 +48,26 @@ impl Store {
     /// `account` is the account id ("" for the first account, as stored before accounts).
     pub fn open(account: &str) -> Result<Self> {
         let dir = default_dir(account)?;
-        Self::open_at(dir, &load_or_create_key(account)?)
+        let key = load_or_create_key(account);
+        let mut unreadable = locked(&UNREADABLE);
+        let unreadable = unreadable.get_or_insert_default();
+        match &key {
+            Ok(_) => unreadable.remove(account),
+            Err(_) => unreadable.insert(account.to_string()),
+        };
+        Self::open_at(dir, &key?)
+    }
+
+    /// The same for work nobody is waiting on. It does not ask the keychain again once that
+    /// has said no, as macOS would put up its question every time.
+    pub fn open_quietly(account: &str) -> Result<Self> {
+        if locked(&UNREADABLE)
+            .as_ref()
+            .is_some_and(|all| all.contains(account))
+        {
+            bail!("the key of this account's store could not be read");
+        }
+        Self::open(account)
     }
 
     fn open_at(dir: PathBuf, key: &[u8; 32]) -> Result<Self> {
@@ -94,6 +126,19 @@ impl Store {
             )
             .ok()?;
         serde_json::from_slice(&plain).ok()
+    }
+
+    /// Changes a record as it now is on disk. Blocking.
+    pub fn update<T: Serialize + DeserializeOwned + Default>(
+        &self,
+        name: &str,
+        change: impl FnOnce(&mut T),
+    ) -> Result<T> {
+        let _updating = locked(&UPDATING);
+        let mut value: T = self.load(name).unwrap_or_default();
+        change(&mut value);
+        self.save(name, &value)?;
+        Ok(value)
     }
 
     /// The records whose name starts with `prefix`.
@@ -223,11 +268,12 @@ fn base_dir() -> Result<PathBuf> {
 fn load_or_create_key(account: &str) -> Result<[u8; 32]> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &key_user(account)?)
         .context("opening the system keychain")?;
-    if let Ok(saved) = entry.get_password()
-        && let Ok(bytes) = STANDARD.decode(saved.trim())
-        && let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice())
-    {
+    if let Some(key) = key_in(entry.get_password())? {
         return Ok(key);
+    }
+    let _making = locked(&MAKING_KEY);
+    if let Some(key) = key_in(entry.get_password())? {
+        return Ok(key); // made meanwhile
     }
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key).map_err(|e| anyhow!("no secure random source: {e}"))?;
@@ -239,6 +285,20 @@ fn load_or_create_key(account: &str) -> Result<[u8; 32]> {
         let _ = std::fs::remove_dir_all(dir);
     }
     Ok(key)
+}
+
+/// The key in a keychain's answer. `None` only when there certainly is none: a read that
+/// failed (denied, locked) is an error, as making a key then would delete what the real one
+/// protects.
+fn key_in(read: keyring::Result<String>) -> Result<Option<[u8; 32]>> {
+    match read {
+        Ok(saved) => Ok(STANDARD
+            .decode(saved.trim())
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())),
+        Err(keyring::Error::NoEntry | keyring::Error::BadEncoding(_)) => Ok(None),
+        Err(error) => Err(error).context("reading the mail store key from the keychain"),
+    }
 }
 
 #[cfg(unix)]
@@ -277,6 +337,31 @@ mod tests {
         assert!(store.claim("sending-1").is_some());
         store.remove("sending-1");
         assert!(store.names("sending-").is_empty());
+        std::fs::remove_dir_all(&store.dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_is_only_made_when_there_is_none() {
+        use keyring::Error;
+        let failed = || Box::new(std::io::Error::other("denied"));
+        assert!(key_in(Err(Error::PlatformFailure(failed()))).is_err());
+        assert!(key_in(Err(Error::NoStorageAccess(failed()))).is_err());
+        assert_eq!(key_in(Err(Error::NoEntry)).unwrap(), None);
+        assert_eq!(key_in(Ok("not a key".into())).unwrap(), None);
+        let saved = STANDARD.encode([4; 32]);
+        assert_eq!(key_in(Ok(saved)).unwrap(), Some([4; 32]));
+    }
+
+    #[test]
+    fn updates_at_the_same_time_all_land() {
+        let store = temp_store(6);
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let store = &store;
+                scope.spawn(move || store.update::<Vec<u32>>("list", |list| list.push(n)));
+            }
+        });
+        assert_eq!(store.load::<Vec<u32>>("list").unwrap().len(), 8);
         std::fs::remove_dir_all(&store.dir).unwrap();
     }
 
