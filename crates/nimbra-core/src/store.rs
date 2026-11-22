@@ -7,7 +7,7 @@
 //! then rename) with permissions limited to the user. Signing out deletes both the files
 //! and the key.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -21,6 +21,8 @@ const KEYCHAIN_SERVICE: &str = "nimbra";
 const KEYCHAIN_USER: &str = "store-key";
 /// Bumped whenever the stored shapes change; older stores are discarded, not misread.
 const FORMAT: u8 = 2;
+/// The size of a saved empty list: format, nonce, `[]`, and the cipher's tag.
+const EMPTY_LIST: u64 = 1 + 12 + 2 + 16;
 
 pub struct Store {
     dir: PathBuf,
@@ -94,6 +96,13 @@ impl Store {
         serde_json::from_slice(&plain).ok()
     }
 
+    /// Whether the list saved under `name` is empty, as far as can be told without the key
+    /// (which waits on the keychain): from its size. Good for choosing what to draw until
+    /// the store is open and `load` has the real answer, and for nothing else.
+    pub fn saved_empty(account: &str, name: &str) -> bool {
+        default_dir(account).is_ok_and(|dir| empty_list_at(&dir, name))
+    }
+
     /// Deletes every stored record (keeps the key, so the store can be reused).
     pub fn clear(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
@@ -104,16 +113,29 @@ impl Store {
     }
 
     fn path(&self, name: &str) -> Result<PathBuf> {
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            bail!("bad record name");
-        }
-        Ok(self.dir.join(format!("{name}.bin")))
+        record_path(&self.dir, name)
     }
+}
+
+fn record_path(dir: &Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("bad record name");
+    }
+    Ok(dir.join(format!("{name}.bin")))
+}
+
+fn empty_list_at(dir: &Path, name: &str) -> bool {
+    let Ok(path) = record_path(dir, name) else {
+        return false;
+    };
+    // The size first: a full mailbox is megabytes, and this runs before the first frame.
+    std::fs::metadata(&path).is_ok_and(|file| file.is_file() && file.len() == EMPTY_LIST)
+        && std::fs::read(&path).is_ok_and(|file| file.first() == Some(&FORMAT))
 }
 
 /// Signing out: removes the stored mail and the key that protects it.
@@ -238,6 +260,26 @@ mod tests {
         std::fs::copy(store.dir.join("b.bin"), store.dir.join("c.bin")).unwrap();
         assert_eq!(store.load::<String>("c"), None);
         assert_eq!(store.load::<String>("b").as_deref(), Some("other"));
+        std::fs::remove_dir_all(&store.dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_list_is_known_without_the_key() {
+        let store = temp_store(5);
+        let empty = || empty_list_at(&store.dir, "view-0");
+        assert!(!empty(), "never saved");
+        store.save("view-0", &Vec::<String>::new()).unwrap();
+        assert!(empty());
+        // The shortest list that has anything in it.
+        store.save("view-0", &vec![0]).unwrap();
+        assert!(!empty());
+        store.save("view-0", &Vec::<String>::new()).unwrap();
+        let path = store.dir.join("view-0.bin");
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[0] = FORMAT + 1;
+        std::fs::write(&path, &raw).unwrap();
+        assert!(!empty(), "another format");
+        assert!(!empty_list_at(&store.dir, "../view-0"));
         std::fs::remove_dir_all(&store.dir).unwrap();
     }
 
