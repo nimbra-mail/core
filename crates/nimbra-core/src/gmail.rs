@@ -41,13 +41,20 @@ const SCOPE: &str =
 const FULL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/userinfo.profile https://mail.google.com/";
 /// The signed-in user's basic profile (name and photo address).
 const USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+/// The same person in the People API, which also says whether a photo is their own or the
+/// letter Google draws, and has the Workspace profile's as well.
+const PEOPLE_ME: &str = "https://people.googleapis.com/v1/people/me";
 /// The largest profile photo accepted.
 const PHOTO_LIMIT: u64 = 2 * 1024 * 1024;
 
 /// The account's Google profile photo.
 pub enum Photo {
+    /// Theirs.
     Image(Vec<u8>),
-    /// The account has none.
+    /// What Google gives every app, which can be a letter it drew: the People API, which
+    /// tells the two apart, could not be asked.
+    Unchecked(Vec<u8>),
+    /// The account has none (that Nimbra can see).
     NoPhoto,
     /// This sign-in does not include the profile (signed in before Nimbra asked for it).
     NotAllowed,
@@ -369,6 +376,14 @@ fn token_request(form: &[(&str, &str)]) -> Result<TokenResponse> {
     }
 }
 
+/// Refuses a sign-in to another account than the one it was started for.
+fn check_same_account(expected: &str, signed_in: &str) -> Result<()> {
+    if !expected.eq_ignore_ascii_case(signed_in) {
+        bail!("That was another Google account, so nothing was changed. Choose {expected}.");
+    }
+    Ok(())
+}
+
 /// A sign-in in progress: the browser has been pointed at `url` and we are waiting for
 /// Google to redirect back to our loopback listener.
 pub struct SignIn {
@@ -376,12 +391,16 @@ pub struct SignIn {
     redirect_uri: String,
     verifier: String,
     state: String,
+    /// The address it has to be, when it is a sign-in to an account Nimbra already has.
+    expected: Option<String>,
 }
 
 impl SignIn {
     /// Starts listening and returns the URL to open in the user's browser.
-    /// `full` also asks for permanent deletion (see `FULL_SCOPE`).
-    pub fn start(config: &Config, full: bool) -> Result<(Self, String)> {
+    /// `full` also asks for permanent deletion (see `FULL_SCOPE`). `expected` is the address
+    /// of the account being signed in to again: the browser is pointed at it, and no other
+    /// is accepted (see `finish`).
+    pub fn start(config: &Config, full: bool, expected: Option<&str>) -> Result<(Self, String)> {
         // Loopback only, on a port picked by the OS.
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("opening a local port for sign-in")?;
@@ -389,7 +408,7 @@ impl SignIn {
         let redirect_uri = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
         let verifier = random_token()?;
         let state = random_token()?;
-        let url = url::Url::parse_with_params(
+        let mut url = url::Url::parse_with_params(
             AUTH_URL,
             &[
                 ("client_id", config.client_id.as_str()),
@@ -404,12 +423,16 @@ impl SignIn {
                 ("prompt", "consent"),
             ],
         )?;
+        if let Some(email) = expected {
+            url.query_pairs_mut().append_pair("login_hint", email);
+        }
         Ok((
             Self {
                 listener,
                 redirect_uri,
                 verifier,
                 state,
+                expected: expected.map(String::from),
             },
             url.into(),
         ))
@@ -430,9 +453,18 @@ impl SignIn {
         let refresh = tokens
             .refresh_token
             .ok_or_else(|| anyhow!("Google did not return a long-lived sign-in"))?;
-        store_refresh_token(account, &refresh)?;
-        let client = Client::new(config.clone(), refresh, account.to_string());
+        let client = Client::new(config.clone(), refresh.clone(), account.to_string());
         client.remember(tokens.access_token, tokens.expires_in);
+        // The browser lets any Google account be picked. Another one's sign-in saved as this
+        // account's would send from it, and delete this one's mail kept here as someone
+        // else's. So it is asked whose it is before anything is saved.
+        if let Some(expected) = &self.expected {
+            let (email, _) = client
+                .profile()
+                .context("Nimbra could not check which account signed in")?;
+            check_same_account(expected, &email)?;
+        }
+        store_refresh_token(account, &refresh)?;
         Ok(client)
     }
 
@@ -564,6 +596,22 @@ impl Client {
     /// The account's Google profile photo, downloaded (about 128 px). It is only ever
     /// fetched from Google's own image host, over HTTPS.
     pub fn profile_photo(&self) -> Result<Photo> {
+        let people = ureq::get(PEOPLE_ME)
+            .query("personFields", "photos")
+            .query("sources", "READ_SOURCE_TYPE_PROFILE")
+            .timeout(HTTP_TIMEOUT);
+        match self.authorized(&people, Payload::None)? {
+            Ok(response) => {
+                let person: ProfilePhotos = response.into_json()?;
+                return match own_photo(&person.photos).and_then(photo_link) {
+                    Some(link) => Ok(photo_bytes(&link)?.map_or(Photo::NoPhoto, Photo::Image)),
+                    None => Ok(Photo::NoPhoto),
+                };
+            }
+            // Not turned on in the Cloud project, or not for this sign-in: the basic profile.
+            Err(ureq::Error::Status(400..=499, _)) => {}
+            Err(error) => return Err(error.into()),
+        }
         let response =
             self.authorized(&ureq::get(USERINFO).timeout(HTTP_TIMEOUT), Payload::None)?;
         let info: serde_json::Value = match response {
@@ -571,23 +619,11 @@ impl Client {
             Err(ureq::Error::Status(401 | 403, _)) => return Ok(Photo::NotAllowed),
             Err(error) => return Err(error.into()),
         };
-        let Some(link) = info.get("picture").and_then(|p| p.as_str()) else {
+        let link = info.get("picture").and_then(|p| p.as_str());
+        let Some(link) = link.and_then(photo_link) else {
             return Ok(Photo::NoPhoto);
         };
-        let Some(link) = photo_link(link) else {
-            return Ok(Photo::NoPhoto);
-        };
-        let response = ureq::get(&link).timeout(HTTP_TIMEOUT).call()?;
-        let mut bytes = Vec::new();
-        use std::io::Read as _;
-        response
-            .into_reader()
-            .take(PHOTO_LIMIT + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > PHOTO_LIMIT || bytes.is_empty() {
-            return Ok(Photo::NoPhoto);
-        }
-        Ok(Photo::Image(bytes))
+        Ok(photo_bytes(&link)?.map_or(Photo::NoPhoto, Photo::Unchecked))
     }
 
     fn signed_out(&self) -> anyhow::Error {
@@ -2035,13 +2071,15 @@ pub struct Attachment {
 /// A profile photo address, only if it is Google's image host over HTTPS, asked for at
 /// 128 px (Google's size suffix, such as `=s96-c`, replaced).
 fn photo_link(link: &str) -> Option<String> {
-    let url = url::Url::parse(link).ok()?;
+    let mut url = url::Url::parse(link).ok()?;
     let host = url.host_str()?;
     if url.scheme() != "https"
         || !(host == "googleusercontent.com" || host.ends_with(".googleusercontent.com"))
     {
         return None;
     }
+    // An older link's size is a query (`?sz=50`), which would swallow the one added here.
+    url.set_query(None);
     let mut text = url.to_string();
     if let Some(at) = text.rfind('=')
         && text[at..].starts_with("=s")
@@ -2049,6 +2087,51 @@ fn photo_link(link: &str) -> Option<String> {
         text.truncate(at);
     }
     Some(format!("{text}=s128-c"))
+}
+
+#[derive(Deserialize)]
+struct ProfilePhotos {
+    #[serde(default)]
+    photos: Vec<ListedPhoto>,
+}
+
+#[derive(Deserialize)]
+struct ListedPhoto {
+    url: String,
+    /// Drawn by Google (the letter), not given by the user.
+    #[serde(default)]
+    default: bool,
+    #[serde(default)]
+    metadata: PhotoMetadata,
+}
+
+#[derive(Deserialize, Default)]
+struct PhotoMetadata {
+    #[serde(default)]
+    primary: bool,
+}
+
+/// The person's own photo: never a drawn one, and the primary one first (the Google and the
+/// Workspace profile can each have one).
+fn own_photo(photos: &[ListedPhoto]) -> Option<&str> {
+    photos
+        .iter()
+        .filter(|photo| !photo.default)
+        .max_by_key(|photo| photo.metadata.primary)
+        .map(|photo| photo.url.as_str())
+}
+
+/// Downloads a photo, without the sign-in: only `photo_link`'s address, and not past
+/// `PHOTO_LIMIT`.
+fn photo_bytes(link: &str) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let response = ureq::get(link).timeout(HTTP_TIMEOUT).call()?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(PHOTO_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((!bytes.is_empty() && bytes.len() as u64 <= PHOTO_LIMIT).then_some(bytes))
 }
 
 fn person(value: &str) -> Person {
@@ -2977,7 +3060,7 @@ mod tests {
             client_id: "id.apps.googleusercontent.com".into(),
             client_secret: "secret".into(),
         };
-        let (sign_in, url) = SignIn::start(&config, false).unwrap();
+        let (sign_in, url) = SignIn::start(&config, false, None).unwrap();
         let url = url::Url::parse(&url).unwrap();
         let get = |k: &str| {
             url.query_pairs()
@@ -2994,8 +3077,13 @@ mod tests {
         // Full mail access (permanent delete) is only asked for when it is needed.
         assert_eq!(get("scope"), SCOPE);
         assert!(SCOPE.contains("userinfo.profile"));
-        let (_, full) = SignIn::start(&config, true).unwrap();
+        let (_, full) = SignIn::start(&config, true, None).unwrap();
         assert!(full.contains("mail.google.com"));
+        // Signing in again points at that account, and takes no other.
+        let (_, again) = SignIn::start(&config, false, Some("a@example.com")).unwrap();
+        assert!(again.contains("login_hint=a%40example.com"));
+        assert!(check_same_account("a@example.com", "A@Example.com").is_ok());
+        assert!(check_same_account("a@example.com", "b@example.com").is_err());
     }
 
     #[test]
@@ -3004,7 +3092,7 @@ mod tests {
             client_id: "id".into(),
             client_secret: "secret".into(),
         };
-        let (sign_in, _) = SignIn::start(&config, false).unwrap();
+        let (sign_in, _) = SignIn::start(&config, false, None).unwrap();
         let port = sign_in.listener.local_addr().unwrap().port();
         let state = sign_in.state.clone();
         let waiter = std::thread::spawn(move || sign_in.wait_for_code());
@@ -3029,5 +3117,26 @@ mod tests {
         assert!(photo_link("http://lh3.googleusercontent.com/a/abc").is_none());
         assert!(photo_link("https://evil.example.com/a.png").is_none());
         assert!(photo_link("https://googleusercontent.com.evil.example/a").is_none());
+        assert_eq!(
+            photo_link("https://lh3.googleusercontent.com/a/photo.jpg?sz=50").as_deref(),
+            Some("https://lh3.googleusercontent.com/a/photo.jpg=s128-c")
+        );
+    }
+
+    #[test]
+    fn the_users_own_photo_is_taken_over_the_drawn_letter() {
+        let pick = |json: &str| {
+            let found: ProfilePhotos = serde_json::from_str(json).unwrap();
+            own_photo(&found.photos).map(String::from)
+        };
+        let letter = r#"{"url":"letter","default":true,"metadata":{"primary":true}}"#;
+        assert_eq!(pick(&format!(r#"{{"photos":[{letter}]}}"#)), None);
+        assert_eq!(
+            pick(&format!(r#"{{"photos":[{letter},{{"url":"mine"}}]}}"#)).as_deref(),
+            Some("mine")
+        );
+        let two = r#"{"photos":[{"url":"a"},{"url":"b","metadata":{"primary":true}}]}"#;
+        assert_eq!(pick(two).as_deref(), Some("b"));
+        assert_eq!(pick("{}"), None);
     }
 }
