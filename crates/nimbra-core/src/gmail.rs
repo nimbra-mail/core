@@ -9,9 +9,11 @@
 //! - Tokens and the client secret are never logged or put into error messages.
 //! - HTML mail is converted to text; no remote content is ever fetched.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -507,6 +509,11 @@ pub struct Client {
     access: Mutex<Option<(String, SystemTime)>>,
     /// Which account's keychain entry holds the refresh token.
     account: String,
+    /// Changes asked of Gmail, so that what was listed before one is known to be old.
+    writes: AtomicU64,
+    /// List rows by thread (and whether they name the recipient), each with the thread's
+    /// history id then: one that has not moved is not fetched again (40 units). Memory only.
+    rows: Mutex<HashMap<(String, bool), (String, Summary)>>,
 }
 
 impl Client {
@@ -516,6 +523,8 @@ impl Client {
             refresh_token,
             access: Mutex::new(None),
             account,
+            writes: AtomicU64::new(0),
+            rows: Mutex::new(HashMap::new()),
         }
     }
 
@@ -604,6 +613,10 @@ impl Client {
                 Payload::Bytes(bytes) => call.send_bytes(bytes),
             };
             if renewed || !matches!(result, Err(ureq::Error::Status(401, _))) {
+                // Whatever the answer: a write with a lost one may have been carried out.
+                if request.method() != "GET" {
+                    self.writes.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(result);
             }
             self.forget_access(&token);
@@ -706,6 +719,38 @@ impl Client {
             Err(error) if never_left(error.kind()) => Err(Offline.into()),
             Err(_) => Err(anyhow::Error::new(Offline).context(MayHaveArrived)),
         }
+    }
+
+    /// How many changes have been asked of Gmail through this connection.
+    pub fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Forgets the list rows kept in memory.
+    pub fn forget_rows(&self) {
+        self.rows.lock().unwrap().clear();
+    }
+
+    /// A list row, fetched only if the thread has changed since it last was. `version` is
+    /// its history id as listed; without one it is always fetched.
+    fn row(&self, id: &str, version: &str, recipient: bool) -> Result<Summary> {
+        const MOST_ROWS: usize = 5000;
+        let key = (id.to_string(), recipient);
+        if !version.is_empty()
+            && let Some((kept, row)) = self.rows.lock().unwrap().get(&key)
+            && kept == version
+        {
+            return Ok(row.clone());
+        }
+        let row = self.summary(id, recipient)?;
+        if !version.is_empty() {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.len() >= MOST_ROWS {
+                rows.clear();
+            }
+            rows.insert(key, (version.to_string(), row.clone()));
+        }
+        Ok(row)
     }
 
     /// The account's address and its current history id (the point to sync from).
@@ -834,17 +879,50 @@ impl Client {
         limit: usize,
         page: Option<&str>,
     ) -> Result<(Vec<Summary>, Option<String>)> {
-        #[derive(Deserialize, Default)]
-        #[serde(rename_all = "camelCase")]
-        struct Listing {
-            #[serde(default)]
-            threads: Vec<ThreadRef>,
-            next_page_token: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct ThreadRef {
-            id: String,
-        }
+        let listing = self.list(view, label_id, limit, page)?;
+        let next = listing.next_page_token;
+        // In Sent and Drafts the interesting person is the recipient, not you.
+        let recipient = matches!(view, View::Sent | View::Drafts);
+        let threads = listing.threads;
+
+        // Fetch thread metadata a few at a time; one request per changed thread is the only way
+        // to get subject and sender without the batch endpoint.
+        self.access_token()?;
+        let mut summaries: Vec<Option<Result<Summary>>> = Vec::new();
+        summaries.resize_with(threads.len(), || None);
+        let workers = 6.min(threads.len().max(1));
+        std::thread::scope(|scope| {
+            let chunk = threads.len().div_ceil(workers).max(1);
+            for (threads, out) in threads.chunks(chunk).zip(summaries.chunks_mut(chunk)) {
+                scope.spawn(move || {
+                    for (thread, slot) in threads.iter().zip(out) {
+                        *slot = Some(self.row(&thread.id, &thread.history_id, recipient));
+                    }
+                });
+            }
+        });
+        let summaries: Result<Vec<Summary>> = summaries.into_iter().flatten().collect();
+        Ok((summaries?, next))
+    }
+
+    /// Where the page after the first `count` threads starts, for a list that came from
+    /// this Mac (and so has no page token). One request, for no thread's details.
+    pub fn page_after(
+        &self,
+        view: View,
+        label_id: Option<&str>,
+        count: usize,
+    ) -> Result<Option<String>> {
+        Ok(self.list(view, label_id, count, None)?.next_page_token)
+    }
+
+    fn list(
+        &self,
+        view: View,
+        label_id: Option<&str>,
+        limit: usize,
+        page: Option<&str>,
+    ) -> Result<Listing> {
         let mut request =
             ureq::get(&format!("{API}/threads")).query("maxResults", &limit.to_string());
         if let Some(page) = page {
@@ -889,32 +967,7 @@ impl Client {
                 .query("labelIds", "TRASH")
                 .query("includeSpamTrash", "true"),
         };
-        let listing: Listing = self.send(request, None)?;
-        let next = listing.next_page_token.clone();
-        // In Sent and Drafts the interesting person is the recipient, not you.
-        let recipient = matches!(view, View::Sent | View::Drafts);
-        let ids: Vec<String> = listing.threads.into_iter().map(|t| t.id).collect();
-
-        // Fetch thread metadata a few at a time; one request per thread is the only way
-        // to get subject and sender without the batch endpoint.
-        self.access_token()?;
-        let mut summaries: Vec<Option<Result<Summary>>> = Vec::new();
-        summaries.resize_with(ids.len(), || None);
-        let workers = 6.min(ids.len().max(1));
-        std::thread::scope(|scope| {
-            for (ids, out) in ids
-                .chunks(ids.len().div_ceil(workers).max(1))
-                .zip(summaries.chunks_mut(ids.len().div_ceil(workers).max(1)))
-            {
-                scope.spawn(move || {
-                    for (id, slot) in ids.iter().zip(out) {
-                        *slot = Some(self.summary(id, recipient));
-                    }
-                });
-            }
-        });
-        let summaries: Result<Vec<Summary>> = summaries.into_iter().flatten().collect();
-        Ok((summaries?, next))
+        self.send(request, None)
     }
 
     pub fn summary(&self, id: &str, recipient: bool) -> Result<Summary> {
@@ -2214,6 +2267,24 @@ pub struct Label {
     pub name: String,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct Listing {
+    #[serde(default)]
+    threads: Vec<ListedThread>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedThread {
+    id: String,
+    /// Moves with every change to the thread, its labels included.
+    #[serde(default)]
+    history_id: String,
+}
+
+#[derive(Clone)]
 pub struct Summary {
     pub id: String,
     pub sender: String,

@@ -7,8 +7,9 @@
 //! then rename) with permissions limited to the user. Signing out deletes both the files
 //! and the key.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -30,6 +31,9 @@ const EMPTY_LIST: u64 = 1 + 12 + 2 + 16;
 static MAKING_KEY: Mutex<()> = Mutex::new(());
 /// One `update` at a time, so that none writes over what another just did.
 static UPDATING: Mutex<()> = Mutex::new(());
+/// One file is written at a time: two saves of a record shared their temporary file, and
+/// one failed or both were mixed.
+static WRITING: Mutex<()> = Mutex::new(());
 /// The accounts whose key could not be read when it was last asked for.
 static UNREADABLE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
@@ -40,6 +44,9 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct Store {
     dir: PathBuf,
     cipher: ChaCha20Poly1305,
+    snapshots: AtomicU64,
+    /// The snapshot each record saved with `save_newest` has.
+    newest: Mutex<HashMap<String, u64>>,
 }
 
 impl Store {
@@ -76,6 +83,8 @@ impl Store {
         Ok(Self {
             dir,
             cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
+            snapshots: AtomicU64::new(0),
+            newest: Mutex::new(HashMap::new()),
         })
     }
 
@@ -101,6 +110,7 @@ impl Store {
         file.push(FORMAT);
         file.extend_from_slice(&nonce);
         file.extend_from_slice(&sealed);
+        let _writing = locked(&WRITING);
         let temp = path.with_extension("tmp");
         std::fs::write(&temp, &file).context("writing the mail store")?;
         restrict(&temp, 0o600);
@@ -126,6 +136,22 @@ impl Store {
             )
             .ok()?;
         serde_json::from_slice(&plain).ok()
+    }
+
+    /// Numbers a copy that is about to be saved in the background, for `save_newest`.
+    pub fn snapshot(&self) -> u64 {
+        self.snapshots.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Saves a copy unless a newer one already is: background saves land in any order.
+    pub fn save_newest<T: Serialize>(&self, name: &str, value: &T, taken: u64) -> Result<()> {
+        let mut newest = locked(&self.newest);
+        if newest.get(name).is_some_and(|saved| *saved > taken) {
+            return Ok(());
+        }
+        self.save(name, value)?;
+        newest.insert(name.to_string(), taken);
+        Ok(())
     }
 
     /// Changes a record as it now is on disk. Blocking.
@@ -362,6 +388,23 @@ mod tests {
             }
         });
         assert_eq!(store.load::<Vec<u32>>("list").unwrap().len(), 8);
+        std::fs::remove_dir_all(&store.dir).unwrap();
+    }
+
+    #[test]
+    fn saves_at_the_same_time_all_work_and_the_newest_stays() {
+        let store = temp_store(8);
+        let (older, newer) = (store.snapshot(), store.snapshot());
+        store.save_newest("view-0", &"newer", newer).unwrap();
+        store.save_newest("view-0", &"older", older).unwrap();
+        assert_eq!(store.load::<String>("view-0").as_deref(), Some("newer"));
+        std::thread::scope(|scope| {
+            for n in 0..16 {
+                let store = &store;
+                scope.spawn(move || store.save("meta", &vec![n; 20_000]).unwrap());
+            }
+        });
+        assert_eq!(store.load::<Vec<u32>>("meta").unwrap().len(), 20_000);
         std::fs::remove_dir_all(&store.dir).unwrap();
     }
 
