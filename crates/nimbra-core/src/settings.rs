@@ -26,6 +26,9 @@ pub struct Settings {
     pub accounts: Vec<AccountRef>,
     /// The account shown.
     pub active: String,
+    /// The account that is yours by default: its profile at the bottom of the sidebar, and
+    /// new messages are from it. `None`, or one signed out since: the first account.
+    pub default_account: Option<String>,
     /// Sidebar sections folded away ("split", "mailbox", "labels").
     pub collapsed: Vec<String>,
     /// The sidebar was left in auto-hide (⌘B).
@@ -103,6 +106,7 @@ impl Default for Settings {
             theme: ThemeChoice::System,
             accounts: Vec::new(),
             active: String::new(),
+            default_account: None,
             collapsed: Vec::new(),
             sidebar_auto_hide: false,
             recent_searches: Vec::new(),
@@ -114,6 +118,26 @@ impl Default for Settings {
             dock_badge: true,
             reader_text: TextSize::Default,
         }
+    }
+}
+
+impl Settings {
+    /// The default account's id, when any account is signed in. The first account's id is
+    /// "", so this is never tested for emptiness.
+    pub fn default_account(&self) -> Option<&str> {
+        self.default_account
+            .as_deref()
+            .filter(|id| self.accounts.iter().any(|a| a.id == *id))
+            .or_else(|| self.accounts.first().map(|a| a.id.as_str()))
+    }
+
+    /// The default account's address.
+    pub fn default_email(&self) -> Option<&str> {
+        let id = self.default_account()?;
+        self.accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.email.as_str())
     }
 }
 
@@ -170,5 +194,46 @@ mod tests {
         let off: Settings = serde_json::from_str(r#"{"dark_emails":false}"#).unwrap();
         assert!(!off.dark_emails);
         assert_eq!(settings.theme, ThemeChoice::System);
+        assert_eq!(settings.default_account, None);
+    }
+
+    fn two() -> Settings {
+        Settings {
+            accounts: vec![
+                AccountRef {
+                    id: String::new(),
+                    email: "a@example.com".into(),
+                },
+                AccountRef {
+                    id: "bbbbbbbbbbbb".into(),
+                    email: "b@example.com".into(),
+                },
+            ],
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn the_default_account_is_the_chosen_one_or_else_the_first() {
+        let mut settings = two();
+        // Never chosen: the first, whose id is "".
+        assert_eq!(settings.default_account(), Some(""));
+        assert_eq!(settings.default_email(), Some("a@example.com"));
+        settings.default_account = Some("bbbbbbbbbbbb".into());
+        assert_eq!(settings.default_account(), Some("bbbbbbbbbbbb"));
+        assert_eq!(settings.default_email(), Some("b@example.com"));
+        // Chosen and then signed out: the first again.
+        settings.accounts.pop();
+        assert_eq!(settings.default_account(), Some(""));
+        // Choosing the first one is kept as such ("" is an id, not "none").
+        settings.default_account = Some(String::new());
+        assert_eq!(settings.default_account(), Some(""));
+        settings.accounts.clear();
+        assert_eq!(settings.default_account(), None);
+        // Saved and read back.
+        let mut chosen = two();
+        chosen.default_account = Some("bbbbbbbbbbbb".into());
+        let back: Settings = serde_json::from_slice(&serde_json::to_vec(&chosen).unwrap()).unwrap();
+        assert_eq!(back.default_account(), Some("bbbbbbbbbbbb"));
     }
 }
