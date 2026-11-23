@@ -55,7 +55,9 @@ impl View {
             View::Important => has("IMPORTANT"),
             View::Spam => has("SPAM"),
             View::Trash => has("TRASH"),
-            View::Snoozed | View::Done | View::Search | View::AllMail => return None,
+            View::Snoozed | View::Reminders | View::Done | View::Search | View::AllMail => {
+                return None;
+            }
         })
     }
 
@@ -732,6 +734,8 @@ pub enum View {
     Search,
     Starred,
     Snoozed,
+    /// Threads put away until later unless someone replies (kept on this Mac).
+    Reminders,
     Drafts,
     Sent,
     Done,

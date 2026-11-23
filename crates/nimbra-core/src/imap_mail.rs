@@ -807,10 +807,13 @@ impl Client {
                 .filter(|f| !matches!(f.role, Role::Trash | Role::Junk | Role::Drafts))
                 .cloned()
                 .collect(),
-            // Gmail's own: nothing here.
-            View::Updates | View::Promotions | View::Social | View::Important | View::Snoozed => {
-                Vec::new()
-            }
+            // Gmail's own, and the ones kept on this Mac: nothing here.
+            View::Updates
+            | View::Promotions
+            | View::Social
+            | View::Important
+            | View::Snoozed
+            | View::Reminders => Vec::new(),
         })
     }
 
@@ -1042,13 +1045,31 @@ impl Client {
                 for copy in &copies {
                     by_message.entry(&copy.2.message_id).or_default().push(copy);
                 }
+                // Into the inbox (back from Done or from a snooze), as Gmail does: what was
+                // archived moves back, and the user's own messages stay in Sent rather than
+                // being copied in, unless they are all the thread has.
+                let to_inbox = add_folders.iter().any(|f| f.role == Role::Inbox);
+                let own = |copies: &[&(Folder, u32, Entry)]| {
+                    copies
+                        .iter()
+                        .all(|c| matches!(c.0.role, Role::Sent | Role::Drafts))
+                };
+                let others = by_message.values().any(|copies| !own(copies));
                 for copies in by_message.values() {
                     let in_folder = |f: &Folder| copies.iter().any(|c| c.0.name == f.name);
-                    let mut targets: Vec<&Folder> =
-                        add_folders.iter().filter(|f| !in_folder(f)).collect();
+                    let mut targets: Vec<&Folder> = add_folders
+                        .iter()
+                        .filter(|f| !in_folder(f))
+                        .filter(|f| !(f.role == Role::Inbox && others && own(copies)))
+                        .collect();
                     let mut leaving: Vec<&(Folder, u32, Entry)> = copies
                         .iter()
-                        .filter(|c| remove_folders.iter().any(|f| f.name == c.0.name))
+                        .filter(|c| {
+                            remove_folders.iter().any(|f| f.name == c.0.name)
+                                || (to_inbox
+                                    && c.0.role == Role::Archive
+                                    && targets.iter().any(|f| f.role == Role::Inbox))
+                        })
                         .copied()
                         .collect();
                     if targets.is_empty() && !leaving.is_empty() && leaving.len() == copies.len() {
@@ -3089,6 +3110,29 @@ mod live {
         assert!(inbox.iter().any(|r| r.id == trip.id));
         let (starred, _) = c.threads_page(View::Starred, None, 30, None).unwrap();
         assert!(starred.iter().any(|r| r.id == trip.id));
+
+        // Back from a snooze: out of Done into the inbox, unread; the reply stays in Sent
+        // only, and nothing is left behind in Archive.
+        c.change(&trip.id, Change::Archive).unwrap();
+        c.relabel(&trip.id, &["INBOX", "UNREAD"], &[]).unwrap();
+        let row = c.summary(&trip.id, false).unwrap();
+        assert!(row.unread && row.labels.contains(&"INBOX".to_string()));
+        let (done, _) = c.threads_page(View::Done, None, 30, None).unwrap();
+        assert!(
+            !done.iter().any(|r| r.id == trip.id),
+            "a copy stayed in Archive"
+        );
+        let copied = c
+            .with(true, |conn| {
+                conn.selected = None;
+                conn.session.examine("INBOX")?;
+                Ok(conn
+                    .session
+                    .uid_search("HEADER Message-ID \"<3@x>\"")?
+                    .len())
+            })
+            .unwrap();
+        assert_eq!(copied, 0, "the user's own reply was copied into the inbox");
 
         // Labels are folders.
         let label = c.create_label("Reisen & Pläne").unwrap();

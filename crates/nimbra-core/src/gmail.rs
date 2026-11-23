@@ -872,6 +872,8 @@ impl Client {
             View::Drafts => request.query("labelIds", "DRAFT"),
             View::Sent => request.query("labelIds", "SENT"),
             View::Snoozed => request.query("q", "in:snoozed"),
+            // Kept on this Mac only.
+            View::Reminders => return Ok(Listing::default()),
             // "Done" is Gmail's archive: everything that is not somewhere else.
             View::Done => request.query(
                 "q",
