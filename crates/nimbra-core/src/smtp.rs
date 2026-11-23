@@ -1,11 +1,13 @@
 //! Sending mail over SMTP, for accounts that are not Gmail: one already-built message to its
-//! recipients, through the account's own server, signed in with its password.
+//! recipients, through the account's own server, signed in with its password (or, for a
+//! Microsoft account, an OAuth access token: AUTH XOAUTH2).
 //!
 //! Security notes:
 //! - The connection is TLS from the first byte (`Tls`), or made secure with STARTTLS
 //!   before anything else is said (`StartTls`). A server that does not offer STARTTLS is
-//!   refused, never spoken to in plain text, and the password is only ever sent over TLS.
-//! - The password is never written to a log or put in an error.
+//!   refused, never spoken to in plain text, and the password (or token) is only ever
+//!   sent over TLS.
+//! - The password and the token are never written to a log or put in an error.
 //! - Every address is checked before it goes into a command, so none can carry a line break
 //!   or a second command with it.
 //! - The plain connection is read one byte at a time until STARTTLS is answered, so nothing
@@ -21,7 +23,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
 use crate::mail::{self, MayHaveArrived, Offline};
-use crate::servers::{Security, Server};
+use crate::servers::{Secret, Security, Server};
 use crate::tls;
 
 /// What this end calls itself in EHLO: the same for everyone, so it says nothing about the
@@ -50,13 +52,13 @@ impl std::error::Error for AuthFailed {}
 pub fn send(
     server: &Server,
     username: &str,
-    password: &str,
+    secret: &Secret,
     from: &str,
     recipients: &[String],
     message: &[u8],
 ) -> Result<()> {
     check_envelope(from, recipients)?;
-    let (mut session, extensions) = open(server, username, password)?;
+    let (mut session, extensions) = open(server, username, secret)?;
     deliver(&mut session, &extensions, from, recipients, message)?;
     session.quit();
     Ok(())
@@ -64,8 +66,8 @@ pub fn send(
 
 /// Connects, makes the connection secure and signs in: whether the server and password
 /// work, for setting up an account.
-pub fn check_login(server: &Server, username: &str, password: &str) -> Result<()> {
-    let (mut session, _) = open(server, username, password)?;
+pub fn check_login(server: &Server, username: &str, secret: &Secret) -> Result<()> {
+    let (mut session, _) = open(server, username, secret)?;
     session.quit();
     Ok(())
 }
@@ -75,7 +77,7 @@ pub fn check_login(server: &Server, username: &str, password: &str) -> Result<()
 fn open(
     server: &Server,
     username: &str,
-    password: &str,
+    secret: &Secret,
 ) -> Result<(Session<tls::TlsStream>, Extensions)> {
     server.check()?;
     let mut session = match server.security {
@@ -90,7 +92,7 @@ fn open(
             Session::new(tls::upgrade(plain.stream, &server.host)?)
         }
     };
-    let extensions = signed_in(&mut session, username, password).map_err(mail::before_sending)?;
+    let extensions = signed_in(&mut session, username, secret).map_err(mail::before_sending)?;
     Ok((session, extensions))
 }
 
@@ -112,10 +114,10 @@ fn start_tls<S: Read + Write>(session: &mut Session<S>) -> Result<()> {
 fn signed_in<S: Read + Write>(
     session: &mut Session<S>,
     username: &str,
-    password: &str,
+    secret: &Secret,
 ) -> Result<Extensions> {
     let extensions = session.ehlo()?;
-    sign_in(session, &extensions, username, password)?;
+    sign_in(session, &extensions, username, secret)?;
     Ok(extensions)
 }
 
@@ -123,11 +125,8 @@ fn sign_in<S: Read + Write>(
     session: &mut Session<S>,
     extensions: &Extensions,
     username: &str,
-    password: &str,
+    secret: &Secret,
 ) -> Result<()> {
-    if username.is_empty() || username.contains('\0') || password.contains('\0') {
-        bail!("The user name or password is not valid.");
-    }
     let refused = |reply: &Reply| -> anyhow::Error {
         if matches!(reply.code, 535 | 534) {
             AuthFailed.into()
@@ -135,6 +134,28 @@ fn sign_in<S: Read + Write>(
             reply.error("signing in")
         }
     };
+    let password = match secret {
+        Secret::Password(password) => password,
+        Secret::Bearer(token) => {
+            if !extensions.offers_auth("XOAUTH2") {
+                bail!("The mail server does not offer a way to sign in that Nimbra knows.");
+            }
+            let initial = STANDARD.encode(crate::servers::xoauth2(username, token)?);
+            let mut reply = session.command(&format!("AUTH XOAUTH2 {initial}"))?;
+            // A refused token comes back as a challenge (base64 JSON), answered with an
+            // empty line; then the server says no.
+            if reply.code == 334 {
+                reply = session.command("")?;
+            }
+            if reply.code != 235 {
+                return Err(refused(&reply));
+            }
+            return Ok(());
+        }
+    };
+    if username.is_empty() || username.contains('\0') || password.contains('\0') {
+        bail!("The user name or password is not valid.");
+    }
     if extensions.offers_auth("PLAIN") {
         let token = STANDARD.encode(format!("\0{username}\0{password}"));
         let reply = session.command(&format!("AUTH PLAIN {token}"))?;
@@ -487,6 +508,10 @@ mod tests {
         }
     }
 
+    fn pw(password: &str) -> Secret {
+        Secret::Password(password.into())
+    }
+
     fn sent(session: &Session<Fake>) -> String {
         String::from_utf8(session.stream.sent.clone()).unwrap()
     }
@@ -506,7 +531,7 @@ mod tests {
         );
         let mut session = Fake::new(&answers);
         session.greeting().unwrap();
-        let extensions = signed_in(&mut session, "me@example.com", "secret").unwrap();
+        let extensions = signed_in(&mut session, "me@example.com", &pw("secret")).unwrap();
         let message = b"Subject: Hi\nTo: a@example.com\n\n.hidden\r\n..two\rlast";
         deliver(
             &mut session,
@@ -599,7 +624,7 @@ mod tests {
         let mut session = Fake::new(
             "250-mail.example.com\r\n250 AUTH LOGIN\r\n334 VXNlcm5hbWU6\r\n334 UGFzc3dvcmQ6\r\n235 OK\r\n",
         );
-        signed_in(&mut session, "me", "pa ss").unwrap();
+        signed_in(&mut session, "me", &pw("pa ss")).unwrap();
         assert_eq!(
             sent(&session),
             format!(
@@ -613,14 +638,14 @@ mod tests {
     #[test]
     fn a_rejected_password_is_auth_failed() {
         let mut session = Fake::new(&format!("{EHLO}535 5.7.8 Authentication failed\r\n"));
-        let error = signed_in(&mut session, "me", "wrong").unwrap_err();
+        let error = signed_in(&mut session, "me", &pw("wrong")).unwrap_err();
         assert!(error.is::<AuthFailed>());
         assert!(!format!("{error:#}").contains("wrong"));
 
         let mut session =
             Fake::new("250-x\r\n250 AUTH LOGIN\r\n334 VXNlcm5hbWU6\r\n535 No such user\r\n");
         assert!(
-            signed_in(&mut session, "me", "pw")
+            signed_in(&mut session, "me", &pw("pw"))
                 .unwrap_err()
                 .is::<AuthFailed>()
         );
@@ -628,8 +653,35 @@ mod tests {
         assert!(!sent(&session).contains(&STANDARD.encode("pw")));
 
         let mut session = Fake::new("250-x\r\n250 SIZE 10\r\n");
-        let error = signed_in(&mut session, "me", "pw").unwrap_err();
+        let error = signed_in(&mut session, "me", &pw("pw")).unwrap_err();
         assert!(!error.is::<AuthFailed>());
+        assert_eq!(sent(&session), "EHLO [127.0.0.1]\r\n");
+    }
+
+    #[test]
+    fn a_token_signs_in_with_xoauth2() {
+        let mut session = Fake::new("250-x\r\n250 AUTH LOGIN XOAUTH2\r\n235 2.7.0 OK\r\n");
+        let token = Secret::Bearer("EwBtoken".into());
+        signed_in(&mut session, "ana@outlook.com", &token).unwrap();
+        let initial = STANDARD.encode("user=ana@outlook.com\x01auth=Bearer EwBtoken\x01\x01");
+        assert_eq!(
+            sent(&session),
+            format!("EHLO [127.0.0.1]\r\nAUTH XOAUTH2 {initial}\r\n")
+        );
+
+        // Refused: the challenge is answered with an empty line, then the server says no.
+        let challenge = STANDARD.encode(r#"{"status":"401","schemes":"bearer"}"#);
+        let mut session = Fake::new(&format!(
+            "250-x\r\n250 AUTH XOAUTH2\r\n334 {challenge}\r\n535 5.7.3 Authentication unsuccessful\r\n"
+        ));
+        let error = signed_in(&mut session, "ana@outlook.com", &token).unwrap_err();
+        assert!(error.is::<AuthFailed>());
+        assert!(sent(&session).ends_with(&format!("AUTH XOAUTH2 {initial}\r\n\r\n")));
+        assert!(!format!("{error:#}").contains("EwBtoken"));
+
+        // Not offered: nothing is sent.
+        let mut session = Fake::new(EHLO);
+        assert!(signed_in(&mut session, "ana@outlook.com", &token).is_err());
         assert_eq!(sent(&session), "EHLO [127.0.0.1]\r\n");
     }
 

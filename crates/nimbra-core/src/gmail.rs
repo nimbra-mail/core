@@ -101,25 +101,28 @@ impl Config {
     /// Reads the OAuth client from the environment, falling back to
     /// `~/.config/nimbra/oauth.env`. Returns `None` when it is not configured.
     pub fn load() -> Option<Self> {
-        let file = std::env::var_os("HOME")
-            .map(|home| std::path::Path::new(&home).join(".config/nimbra/oauth.env"))
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_default();
-        let lookup = |key: &str| {
-            std::env::var(key).ok().or_else(|| {
-                file.lines().find_map(|line| {
-                    let (name, value) = line.split_once('=')?;
-                    (name.trim() == key).then(|| value.trim().trim_matches('"').to_string())
-                })
-            })
-        };
-        let client_id = lookup("NIMBRA_GOOGLE_CLIENT_ID").filter(|v| !v.is_empty())?;
-        let client_secret = lookup("NIMBRA_GOOGLE_CLIENT_SECRET").filter(|v| !v.is_empty())?;
+        let client_id = oauth_setting("NIMBRA_GOOGLE_CLIENT_ID")?;
+        let client_secret = oauth_setting("NIMBRA_GOOGLE_CLIENT_SECRET")?;
         Some(Self {
             client_id,
             client_secret,
         })
     }
+}
+
+/// One OAuth setting: from the environment, falling back to `~/.config/nimbra/oauth.env`.
+/// `None` when it is not there or empty.
+pub(crate) fn oauth_setting(key: &str) -> Option<String> {
+    let value = std::env::var(key).ok().or_else(|| {
+        let file = std::env::var_os("HOME")
+            .map(|home| std::path::Path::new(&home).join(".config/nimbra/oauth.env"))
+            .and_then(|path| std::fs::read_to_string(path).ok())?;
+        file.lines().find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == key).then(|| value.trim().trim_matches('"').to_string())
+        })
+    })?;
+    (!value.is_empty()).then_some(value)
 }
 
 // ------------------------------------------------------------------ keychain
@@ -160,13 +163,13 @@ pub fn forget_refresh_token(account: &str) {
 
 // ------------------------------------------------------------------ oauth
 
-fn random_token() -> Result<String> {
+pub(crate) fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("no secure random source: {e}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn pkce_challenge(verifier: &str) -> String {
+pub(crate) fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
@@ -356,7 +359,7 @@ impl SignIn {
     }
 }
 
-fn respond(mut stream: &TcpStream, status: &str, message: &str) {
+pub(crate) fn respond(mut stream: &TcpStream, status: &str, message: &str) {
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>Nimbra</title>\
          <body style=\"font:16px system-ui;background:#0e0e14;color:#f5f3ef;display:grid;\

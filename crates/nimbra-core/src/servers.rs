@@ -1,5 +1,6 @@
 //! Where an account that is not Gmail gets its mail: the IMAP and SMTP servers it uses, and
-//! its password, which is kept in the system keychain (never in the settings file).
+//! its password, which is kept in the system keychain (never in the settings file). A
+//! Microsoft account has no password here: its sign-in is in `microsoft.rs`.
 //!
 //! Security notes:
 //! - Both servers are only ever reached over TLS: from the first byte (`Tls`), or after
@@ -77,6 +78,22 @@ impl Servers {
     }
 }
 
+/// What one sign-in to a server sends: a password, or an OAuth access token (XOAUTH2).
+pub enum Secret {
+    Password(String),
+    Bearer(String),
+}
+
+/// The XOAUTH2 sign-in string (before base64): `user=…^Aauth=Bearer …^A^A`. Neither part
+/// may hold a control character or a space, so neither can end the string early.
+pub fn xoauth2(user: &str, token: &str) -> Result<String> {
+    let plain = |s: &str| !s.is_empty() && !s.chars().any(|c| c.is_control() || c == ' ');
+    if !plain(user) || !plain(token) {
+        bail!("The user name or sign-in is not valid.");
+    }
+    Ok(format!("user={user}\x01auth=Bearer {token}\x01\x01"))
+}
+
 /// Letters, digits, hyphens and dots, as a DNS name is; or an IP address.
 pub fn is_host(host: &str) -> bool {
     if host.parse::<std::net::IpAddr>().is_ok() {
@@ -150,6 +167,24 @@ mod tests {
             "user@host",
         ] {
             assert!(!is_host(host), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn the_xoauth2_string_is_exact_and_refuses_odd_parts() {
+        assert_eq!(
+            xoauth2("ana@outlook.com", "EwB.abc-_+/=").unwrap(),
+            "user=ana@outlook.com\x01auth=Bearer EwB.abc-_+/=\x01\x01"
+        );
+        for (user, token) in [
+            ("", "t"),
+            ("a@b.c", ""),
+            ("a@b.c\x01auth=Bearer x", "t"),
+            ("a@b.c", "t\x01\x01"),
+            ("a@b.c", "t\r\nA1 LOGOUT"),
+            ("a b@c.d", "t"),
+        ] {
+            assert!(xoauth2(user, token).is_err(), "{user:?} {token:?}");
         }
     }
 

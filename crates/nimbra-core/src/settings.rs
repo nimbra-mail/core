@@ -89,6 +89,10 @@ pub struct AccountRef {
     /// the keychain). None for Gmail, which is all an older settings file has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub servers: Option<crate::servers::Servers>,
+    /// For an account with servers that signs in with its provider rather than a password:
+    /// "microsoft" (its sign-in is in the keychain). None for a password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -208,11 +212,13 @@ mod tests {
                     id: String::new(),
                     email: "a@example.com".into(),
                     servers: None,
+                    oauth: None,
                 },
                 AccountRef {
                     id: "bbbbbbbbbbbb".into(),
                     email: "b@example.com".into(),
                     servers: None,
+                    oauth: None,
                 },
             ],
             ..Settings::default()
@@ -241,5 +247,17 @@ mod tests {
         chosen.default_account = Some("bbbbbbbbbbbb".into());
         let back: Settings = serde_json::from_slice(&serde_json::to_vec(&chosen).unwrap()).unwrap();
         assert_eq!(back.default_account(), Some("bbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn an_account_says_how_it_signs_in_only_when_it_is_not_a_password() {
+        let mut settings = two();
+        let plain = serde_json::to_string(&settings).unwrap();
+        assert!(!plain.contains("oauth"));
+        settings.accounts[1].oauth = Some("microsoft".into());
+        let back: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(back.accounts[1].oauth.as_deref(), Some("microsoft"));
+        assert_eq!(back.accounts[0].oauth, None);
     }
 }

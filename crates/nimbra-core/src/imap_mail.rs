@@ -10,19 +10,29 @@
 //! - A local index (the newest few hundred messages of each folder, more as the list is
 //!   scrolled) is kept in the account's encrypted store, and comparing it with the server
 //!   is the change feed: each difference found moves its position on by one.
+//! - Where the server has CONDSTORE (RFC 7162), a look at a folder asks only for the flags
+//!   that changed since the last one, and a folder where nothing moved is skipped.
+//! - Where it has IDLE (RFC 2177), a second connection waits on the inbox in a thread of
+//!   its own and wakes the app as soon as the server says something changed.
 //!
 //! Security notes:
 //! - Every connection is TLS (`tls.rs`): from the start, or after STARTTLS, which is
-//!   required. The password is only ever sent over it, and is never logged.
+//!   required. The password (or, for a Microsoft account, its access token, with
+//!   AUTHENTICATE XOAUTH2) is only ever sent over it, and is never logged.
 //! - Everything put into a command (folder names, search words) is checked or quoted, and
 //!   ids handed back by the app are parsed strictly.
 //! - Mail is parsed by `mime.rs`, which treats it as hostile input.
+//! - The IDLE thread holds a copy of the credential (to sign in again after a drop) and
+//!   nothing else of the client; it stops when the client goes. A refused password stops
+//!   it for good, so it never tries the same wrong password again and again. A refused
+//!   token is dropped and a new one asked for at the next try; a sign-in Microsoft has
+//!   ended stops it for good.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -33,7 +43,7 @@ use crate::mail::{
     Change, Changes, Draft, HistoryExpired, Label, MayHaveArrived, Message, Offline, Outgoing,
     OutgoingFile, Person, Provider, SignedOut, Summary, View,
 };
-use crate::servers::{Security, Servers};
+use crate::servers::{Secret, Security, Servers};
 use crate::store::Store;
 use crate::tls::{self, TlsStream};
 
@@ -55,6 +65,14 @@ const RAW_KEPT: usize = 40;
 const INDEX: &str = "imap-index";
 /// What a list row needs: flags, date, the header, and the start of the text for a snippet.
 const ROW_FETCH: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.2048>)";
+/// How long one IDLE lasts before it is ended and started again. RFC 2177: servers may
+/// drop a client idle for 30 minutes, and routers forget quiet connections sooner.
+const IDLE_RENEW: Duration = Duration::from_secs(10 * 60);
+/// How long a read on the IDLE connection may wait outside an IDLE (as in `tls.rs`).
+const IDLE_IO: Duration = Duration::from_secs(60);
+/// Waits before connecting again after the IDLE connection failed: the first, the most.
+const RETRY_FIRST: Duration = Duration::from_secs(5);
+const RETRY_MOST: Duration = Duration::from_secs(5 * 60);
 
 /// What a folder is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -125,6 +143,13 @@ struct Indexed {
     /// Indexed back to its first message.
     complete: bool,
     messages: BTreeMap<u32, Entry>,
+    /// HIGHESTMODSEQ at the last look, where the server has CONDSTORE: flags changed since
+    /// are all that is asked for. (Defaults: indexes saved before still load.)
+    #[serde(default)]
+    mod_seq: Option<u64>,
+    /// How many messages the folder had at the last look (EXISTS).
+    #[serde(default)]
+    exists: Option<u32>,
     /// When the feed last compared it with the server (not kept).
     #[serde(skip)]
     synced: Option<Instant>,
@@ -164,6 +189,50 @@ impl State {
 struct Abilities {
     uid_move: bool,
     uidplus: bool,
+    /// CONDSTORE (or QRESYNC, which includes it): mod-sequences, CHANGEDSINCE.
+    condstore: bool,
+}
+
+/// What SELECT said of a folder, as the feed compares it with what is known.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    next: u32,
+    exists: u32,
+    /// HIGHESTMODSEQ; none without CONDSTORE (or a folder the server keeps none for).
+    mod_seq: Option<u64>,
+}
+
+/// Nothing moved since the last look: no flag changed (every change raises HIGHESTMODSEQ),
+/// nothing came (UIDNEXT), and so nothing went either, as the count is the same (with
+/// nothing new, the count can only fall by messages going). Only with CONDSTORE: without
+/// it a flag change shows in nothing SELECT says.
+fn unchanged(known: &Indexed, now: Seen) -> bool {
+    known.mod_seq.is_some()
+        && known.mod_seq == now.mod_seq
+        && known.uid_next == now.next
+        && known.exists == Some(now.exists)
+}
+
+/// Whether messages may have gone since the last look: there are fewer than there were
+/// plus those that came. (Fewer is certain; more or the same cannot hide one.) Not known
+/// how many there were (an index saved before this was kept): they may have.
+fn may_have_gone(before: Option<u32>, came: usize, now: u32) -> bool {
+    before.is_none_or(|before| u64::from(now) < u64::from(before) + came as u64)
+}
+
+/// Whether something the server says during IDLE is a change to the mailbox: a message
+/// came (EXISTS), went (EXPUNGE, VANISHED) or had its flags changed (FETCH).
+fn announces_change(response: &::imap::types::UnsolicitedResponse) -> bool {
+    use ::imap::types::UnsolicitedResponse as U;
+    matches!(
+        response,
+        U::Exists(_) | U::Expunge(_) | U::Fetch { .. } | U::Vanished { .. }
+    )
+}
+
+/// The wait before the next try, after one of `retry` failed: twice as long, to a limit.
+fn next_retry(retry: Duration) -> Duration {
+    (retry * 2).clamp(RETRY_FIRST, RETRY_MOST)
 }
 
 struct Connection {
@@ -173,11 +242,51 @@ struct Connection {
     selected: Option<String>,
 }
 
+/// How an account signs in to its servers.
+#[derive(Clone)]
+pub enum Credential {
+    /// Its password (or app password), from the keychain.
+    Password(String),
+    /// A Microsoft sign-in, which hands out access tokens for XOAUTH2.
+    Microsoft(Arc<crate::microsoft::Tokens>),
+}
+
+impl Credential {
+    /// What to send for one sign-in. For a Microsoft account this may renew the access
+    /// token, and is `SignedOut` when Microsoft has ended the sign-in.
+    fn secret(&self) -> Result<Secret> {
+        match self {
+            Credential::Password(password) => Ok(Secret::Password(password.clone())),
+            Credential::Microsoft(tokens) => Ok(Secret::Bearer(tokens.access_token()?)),
+        }
+    }
+
+    /// A server refused `secret`. A token is dropped, so the next sign-in has a new one,
+    /// and true is returned: that one is worth a try. A password is not tried again.
+    fn refused(&self, secret: &Secret) -> bool {
+        match (self, secret) {
+            (Credential::Microsoft(tokens), Secret::Bearer(token)) => {
+                tokens.forget_access(token);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A new access token was refused as well. Microsoft's sign-in itself works (it just gave
+/// that token), so signing out and in again would not help.
+fn token_refused(which: &str) -> anyhow::Error {
+    anyhow!(
+        "Microsoft signed Nimbra in, but its {which} server did not let it in. The account may have {which} turned off."
+    )
+}
+
 pub struct Client {
     account: String,
     email: String,
     servers: Servers,
-    password: String,
+    credential: Credential,
     connection: Mutex<Option<Connection>>,
     /// The folders, found once per connection.
     folders: Mutex<Option<Vec<Folder>>>,
@@ -185,21 +294,92 @@ pub struct Client {
     store: Mutex<Option<Arc<Store>>>,
     raw: Mutex<VecDeque<(String, Arc<Vec<u8>>)>>,
     writes: AtomicU64,
+    /// Shared with the IDLE thread.
+    watch: Arc<Watch>,
+}
+
+/// What the IDLE thread and the client share. The thread holds this, never the client, so
+/// the client can go; when it does, it stops the thread.
+#[derive(Default)]
+struct Watch {
+    state: Mutex<Watching>,
+    /// Signalled when a change is announced, and when the thread stops or gives up.
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct Watching {
+    /// Whether the server can IDLE, as the main connection found (none before sign-in).
+    can_idle: Option<bool>,
+    started: bool,
+    /// The thread gave up for good (the server cannot IDLE, or refused the password).
+    off: bool,
+    /// The client is gone.
+    stop: bool,
+    /// Changes the server announced, and how many of them a wait has returned for.
+    announced: u64,
+    seen: u64,
+    /// The IDLE connection's socket, to cut it short when the client goes.
+    socket: Option<TcpStream>,
+}
+
+impl Watch {
+    fn announce(&self) {
+        self.state.lock().unwrap().announced += 1;
+        self.wake.notify_all();
+    }
+
+    fn stopped(&self) -> bool {
+        self.state.lock().unwrap().stop
+    }
+
+    fn give_up(&self) {
+        self.state.lock().unwrap().off = true;
+        self.wake.notify_all();
+    }
+
+    /// Ends the thread: a read it is blocked in returns at once, as the socket is shut.
+    fn stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.stop = true;
+        if let Some(socket) = state.socket.take() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        drop(state);
+        self.wake.notify_all();
+    }
+
+    /// Waits for `wait`, or less if stopped meanwhile. False when stopped.
+    fn pause(&self, wait: Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .wake
+            .wait_timeout_while(state, wait, |s| !s.stop)
+            .unwrap();
+        !state.stop
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.watch.stop();
+    }
 }
 
 impl Client {
-    pub fn new(account: String, email: String, servers: Servers, password: String) -> Self {
+    pub fn new(account: String, email: String, servers: Servers, credential: Credential) -> Self {
         Client {
             account,
             email,
             servers,
-            password,
+            credential,
             connection: Mutex::new(None),
             folders: Mutex::new(None),
             state: Mutex::new(State::default()),
             store: Mutex::new(None),
             raw: Mutex::new(VecDeque::new()),
             writes: AtomicU64::new(0),
+            watch: Arc::default(),
         }
     }
 
@@ -234,51 +414,45 @@ impl Client {
         unreachable!("the loop returns")
     }
 
-    /// Connects, secures and signs in.
+    /// Connects, secures and signs in. A refused token is renewed and tried once more, on a
+    /// new connection.
     fn open(&self) -> Result<Connection> {
-        let server = &self.servers.imap;
-        let stream = match server.security {
-            Security::Tls => tls::connect(&server.host, server.port)?,
-            Security::StartTls => starttls(&server.host, server.port)?,
+        let attempt = |secret: &Secret| {
+            let stream = secure_stream(&self.servers)?;
+            sign_in(&self.servers, secret, &self.account, stream)
         };
-        let mut client = ::imap::Client::new(stream);
-        if server.security == Security::Tls {
-            client
-                .read_greeting()
-                .map_err(|e| anyhow!(Offline).context(e))?;
-        }
-        let plain = client
-            .capabilities()
-            .map(|c| c.has_str("AUTH=PLAIN"))
-            .unwrap_or(false);
-        let signed_in = if plain {
-            client.authenticate(
-                "PLAIN",
-                &Plain {
-                    username: &self.servers.username,
-                    password: &self.password,
-                },
-            )
-        } else {
-            client.login(&self.servers.username, &self.password)
-        };
-        let mut session = match signed_in {
-            Ok(session) => session,
-            Err((::imap::Error::No(_), _)) | Err((::imap::Error::Bad(_), _)) => {
-                return Err(SignedOut {
-                    account: self.account.clone(),
-                }
-                .into());
+        let secret = self.credential.secret()?;
+        let mut session = match attempt(&secret) {
+            Err(error) if error.is::<SignedOut>() && self.credential.refused(&secret) => {
+                let secret = self.credential.secret()?;
+                attempt(&secret).map_err(|error| {
+                    if error.is::<SignedOut>() {
+                        self.credential.refused(&secret);
+                        token_refused("IMAP")
+                    } else {
+                        error
+                    }
+                })?
             }
-            Err((error, _)) => return Err(anyhow!(Offline).context(error.to_string())),
+            result => result?,
         };
-        let abilities = session
+        let (abilities, idle, enable) = session
             .capabilities()
-            .map(|c| Abilities {
-                uid_move: c.has_str("MOVE"),
-                uidplus: c.has_str("UIDPLUS"),
+            .map(|c| {
+                let abilities = Abilities {
+                    uid_move: c.has_str("MOVE"),
+                    uidplus: c.has_str("UIDPLUS"),
+                    condstore: c.has_str("CONDSTORE") || c.has_str("QRESYNC"),
+                };
+                (abilities, c.has_str("IDLE"), c.has_str("ENABLE"))
             })
             .unwrap_or_default();
+        if abilities.condstore && enable {
+            // So that every SELECT says HIGHESTMODSEQ (RFC 7162 3.1). Servers that keep
+            // mod-sequences say it anyway; a refusal leaves the feed asking for all flags.
+            let _ = session.run_command_and_check_ok("ENABLE CONDSTORE");
+        }
+        self.watch.state.lock().unwrap().can_idle = Some(idle);
         Ok(Connection {
             session,
             abilities,
@@ -370,6 +544,9 @@ impl Client {
     fn select(connection: &mut Connection, folder: &str) -> Result<::imap::types::Mailbox> {
         let mailbox = connection.session.select(folder)?;
         connection.selected = Some(folder.to_string());
+        // What the server said unasked (EXISTS, FETCH) about the folder before: SELECT has
+        // the news, and the library would keep it all for as long as the connection lasts.
+        connection.session.take_all_unsolicited().for_each(drop);
         Ok(mailbox)
     }
 
@@ -377,10 +554,21 @@ impl Client {
 
     /// Brings one folder's index up to date with the server: new messages, flags that
     /// changed, messages that went. Each thread touched goes into the feed.
+    ///
+    /// With CONDSTORE: nothing is asked when nothing moved (`unchanged`); otherwise only
+    /// the flags changed since the last look, and the UIDs there are (no flags) only when
+    /// the count says some may have gone. Without it, every indexed message's flags.
     fn sync_folder(&self, connection: &mut Connection, folder: &Folder) -> Result<()> {
         let mailbox = Self::select(connection, &folder.name)?;
         let validity = mailbox.uid_validity.unwrap_or(0);
         let next = mailbox.uid_next.unwrap_or(0);
+        let now = Seen {
+            next,
+            exists: mailbox.exists,
+            mod_seq: mailbox
+                .highest_mod_seq
+                .filter(|_| connection.abilities.condstore),
+        };
         let mut known = self
             .state
             .lock()
@@ -390,6 +578,12 @@ impl Client {
             .cloned()
             .unwrap_or_default();
         let fresh = known.uid_validity != validity || known.uid_next == 0;
+        if !fresh && unchanged(&known, now) {
+            if let Some(known) = self.state.lock().unwrap().folders.get_mut(&folder.name) {
+                known.synced = Some(Instant::now());
+            }
+            return Ok(());
+        }
         let mut touched: Vec<(String, bool)> = Vec::new();
         if fresh {
             // First look, or the server numbered the folder anew: index its newest.
@@ -408,6 +602,7 @@ impl Client {
                 known.messages.insert(uid, entry);
             }
         } else {
+            let mut came = 0;
             if next > known.uid_next {
                 let uids: Vec<u32> = connection
                     .session
@@ -415,44 +610,41 @@ impl Client {
                     .into_iter()
                     .filter(|uid| *uid >= known.uid_next)
                     .collect();
+                came = uids.len();
                 for (uid, entry) in self.fetch_rows(connection, &folder.name, &uids)? {
                     let arrival = folder.role == Role::Inbox && !entry.seen;
                     touched.push((entry.thread.clone(), arrival));
                     known.messages.insert(uid, entry);
                 }
             }
-            // Flags and what went, for everything indexed.
             if known.oldest > 0 && !known.messages.is_empty() {
-                let fetched = connection
-                    .session
-                    .uid_fetch(format!("{}:*", known.oldest), "(UID FLAGS)")?;
-                let mut present = HashSet::new();
-                for fetch in fetched.iter() {
-                    let Some(uid) = fetch.uid else { continue };
-                    present.insert(uid);
-                    let (seen, flagged) = flags_of(fetch.flags());
-                    if let Some(entry) = known.messages.get_mut(&uid)
-                        && (entry.seen != seen || entry.flagged != flagged)
-                    {
-                        entry.seen = seen;
-                        entry.flagged = flagged;
-                        touched.push((entry.thread.clone(), false));
+                let range = format!("{}:*", known.oldest);
+                match (known.mod_seq, now.mod_seq) {
+                    // CONDSTORE, and known since when: what changed, then what went.
+                    (Some(since), Some(highest)) => {
+                        if highest != since {
+                            let fetched = connection
+                                .session
+                                .uid_fetch(&range, format!("(UID FLAGS) (CHANGEDSINCE {since})"))?;
+                            take_flags(&mut known, &fetched, &mut touched);
+                        }
+                        if may_have_gone(known.exists, came, now.exists) {
+                            let present = connection.session.uid_search(format!("UID {range}"))?;
+                            drop_gone(&mut known, &present, &mut touched);
+                        }
                     }
-                }
-                let gone: Vec<u32> = known
-                    .messages
-                    .keys()
-                    .filter(|uid| !present.contains(uid))
-                    .copied()
-                    .collect();
-                for uid in gone {
-                    if let Some(entry) = known.messages.remove(&uid) {
-                        touched.push((entry.thread, false));
+                    // Flags and what went, for everything indexed.
+                    _ => {
+                        let fetched = connection.session.uid_fetch(&range, "(UID FLAGS)")?;
+                        let present = take_flags(&mut known, &fetched, &mut touched);
+                        drop_gone(&mut known, &present, &mut touched);
                     }
                 }
             }
         }
         known.uid_next = next.max(known.uid_next);
+        known.exists = Some(now.exists);
+        known.mod_seq = now.mod_seq;
         known.synced = Some(Instant::now());
         let mut state = self.state.lock().unwrap();
         state.folders.insert(folder.name.clone(), known);
@@ -1049,15 +1241,35 @@ impl Client {
     /// Hands a built message to the SMTP server, then files it in Sent unless the server
     /// did. `raw` has no Bcc header; `recipients` has everyone.
     fn deliver(&self, raw: &[u8], recipients: &[String], message_id: &str) -> Result<()> {
-        crate::smtp::send(
-            &self.servers.smtp,
-            &self.servers.username,
-            &self.password,
-            &self.email,
-            recipients,
-            raw,
-        )
-        .map_err(|error| {
+        let send = |secret: &Secret| {
+            crate::smtp::send(
+                &self.servers.smtp,
+                &self.servers.username,
+                secret,
+                &self.email,
+                recipients,
+                raw,
+            )
+        };
+        // A refused sign-in is before anything is sent, so a renewed token can be tried.
+        let secret = self.credential.secret()?;
+        let sent = match send(&secret) {
+            Err(error)
+                if error.is::<crate::smtp::AuthFailed>() && self.credential.refused(&secret) =>
+            {
+                let secret = self.credential.secret()?;
+                send(&secret).map_err(|error| {
+                    if error.is::<crate::smtp::AuthFailed>() {
+                        self.credential.refused(&secret);
+                        token_refused("SMTP")
+                    } else {
+                        error
+                    }
+                })
+            }
+            sent => sent,
+        };
+        sent.map_err(|error| {
             if error.is::<crate::smtp::AuthFailed>() {
                 SignedOut {
                     account: self.account.clone(),
@@ -1158,6 +1370,38 @@ impl Provider for Client {
             }
         }
         Ok(changes)
+    }
+
+    /// Starts the IDLE thread the first time, where the server can IDLE (as the main
+    /// connection found: before it is open, nothing is known and this returns at once).
+    fn wait_for_change(&self, timeout: Duration) -> bool {
+        let mut state = self.watch.state.lock().unwrap();
+        if state.can_idle != Some(true) || state.off || state.stop {
+            return false;
+        }
+        if !state.started {
+            state.started = true;
+            let watch = self.watch.clone();
+            let servers = self.servers.clone();
+            let credential = self.credential.clone();
+            let spawned = std::thread::Builder::new()
+                .name("nimbra-imap-idle".into())
+                .spawn(move || idle_inbox(&watch, &servers, &credential));
+            if spawned.is_err() {
+                state.off = true;
+                return false;
+            }
+        }
+        let (mut state, _) = self
+            .watch
+            .wake
+            .wait_timeout_while(state, timeout, |s| {
+                s.announced == s.seen && !s.off && !s.stop
+            })
+            .unwrap();
+        let changed = state.announced != state.seen;
+        state.seen = state.announced;
+        changed
     }
 
     fn threads_page(
@@ -1625,6 +1869,258 @@ impl ::imap::Authenticator for Plain<'_> {
     }
 }
 
+/// A secure connection to the IMAP server: TLS from the start, or after STARTTLS.
+fn secure_stream(servers: &Servers) -> Result<TlsStream> {
+    let server = &servers.imap;
+    match server.security {
+        Security::Tls => tls::connect(&server.host, server.port),
+        Security::StartTls => starttls(&server.host, server.port),
+    }
+}
+
+/// AUTHENTICATE XOAUTH2. The library sends the command alone and hands each challenge
+/// here: the first (empty) gets the sign-in string; a refusal comes as a second one (base64
+/// JSON), answered with an empty line, after which the server says NO.
+struct XOAuth2 {
+    initial: String,
+    sent: std::cell::Cell<bool>,
+}
+
+impl ::imap::Authenticator for XOAuth2 {
+    type Response = Vec<u8>;
+    fn process(&self, _: &[u8]) -> Self::Response {
+        if self.sent.replace(true) {
+            Vec::new()
+        } else {
+            self.initial.as_bytes().to_vec()
+        }
+    }
+}
+
+/// Signs in over a secure stream. A refused password or token is `SignedOut` (for
+/// `account`).
+fn sign_in<S: Read + Write>(
+    servers: &Servers,
+    secret: &Secret,
+    account: &str,
+    stream: S,
+) -> Result<::imap::Session<S>> {
+    let mut client = ::imap::Client::new(stream);
+    if servers.imap.security == Security::Tls {
+        client
+            .read_greeting()
+            .map_err(|e| anyhow!(Offline).context(e))?;
+    }
+    let (plain, xoauth2) = client
+        .capabilities()
+        .map(|c| (c.has_str("AUTH=PLAIN"), c.has_str("AUTH=XOAUTH2")))
+        .unwrap_or((false, false));
+    let password = match secret {
+        Secret::Password(password) => password,
+        Secret::Bearer(_) if !xoauth2 => {
+            bail!("The mail server does not offer a way to sign in that Nimbra knows.")
+        }
+        Secret::Bearer(token) => {
+            let initial = crate::servers::xoauth2(&servers.username, token)?;
+            let signed_in = client.authenticate(
+                "XOAUTH2",
+                &XOAuth2 {
+                    initial,
+                    sent: std::cell::Cell::new(false),
+                },
+            );
+            return signed_in_or_refused(signed_in, account);
+        }
+    };
+    let signed_in = if plain {
+        client.authenticate(
+            "PLAIN",
+            &Plain {
+                username: &servers.username,
+                password,
+            },
+        )
+    } else {
+        client.login(&servers.username, password)
+    };
+    signed_in_or_refused(signed_in, account)
+}
+
+/// The session, or why there is none: NO or BAD is a refused sign-in.
+fn signed_in_or_refused<S: Read + Write>(
+    signed_in: std::result::Result<::imap::Session<S>, (::imap::Error, ::imap::Client<S>)>,
+    account: &str,
+) -> Result<::imap::Session<S>> {
+    match signed_in {
+        Ok(session) => Ok(session),
+        // What the server said goes along (cleaned, short): "enable IMAP first" and the like
+        // is what tells someone setting up an account what to do.
+        Err((::imap::Error::No(no), _)) => Err(anyhow!(SignedOut {
+            account: account.to_string(),
+        })
+        .context(ServerSaid(said(&no.information)))),
+        Err((::imap::Error::Bad(_), _)) => Err(SignedOut {
+            account: account.to_string(),
+        }
+        .into()),
+        Err((error, _)) => Err(anyhow!(Offline).context(error.to_string())),
+    }
+}
+
+/// What a server said when it refused a sign-in, for whoever is setting the account up.
+#[derive(Debug)]
+pub struct ServerSaid(pub String);
+
+impl std::fmt::Display for ServerSaid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A server's words, made safe to show: no control characters, one line, 200 at most.
+fn said(text: &str) -> String {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    clean.chars().take(200).collect()
+}
+
+/// The IDLE connection's stream: the library sets how long a read may wait while idling.
+struct Idling(TlsStream);
+
+impl Read for Idling {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for Idling {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl ::imap::extensions::idle::SetReadTimeout for Idling {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> ::imap::Result<()> {
+        // None (after an IDLE) puts back the usual limit, not no limit at all.
+        self.0
+            .sock
+            .set_read_timeout(Some(timeout.unwrap_or(IDLE_IO)))
+            .map_err(::imap::Error::Io)
+    }
+}
+
+/// How an IDLE connection ended, when it was not by failing.
+enum Ended {
+    /// The client is gone.
+    Stopped,
+    /// The server cannot IDLE.
+    Unable,
+}
+
+/// The IDLE thread: waits on the inbox over a connection of its own, announcing each
+/// change, and connects again (waiting longer each time) when the connection fails.
+fn idle_inbox(watch: &Watch, servers: &Servers, credential: &Credential) {
+    let mut retry = RETRY_FIRST;
+    let mut watched_before = false;
+    loop {
+        let began = Instant::now();
+        let mut watching = false;
+        let ended = idle_session(watch, servers, credential, watched_before, &mut watching);
+        watched_before |= watching;
+        // A connection that lasted: the next failure starts the waits over.
+        if watching && began.elapsed() >= IDLE_IO {
+            retry = RETRY_FIRST;
+        }
+        match ended {
+            Ok(Ended::Stopped) => return,
+            Ok(Ended::Unable) => return watch.give_up(),
+            // The password was refused, or Microsoft ended the sign-in: polling tells the
+            // app. Never tried again from here, so a wrong one is not sent over and over.
+            Err(error) if error.is::<SignedOut>() => return watch.give_up(),
+            Err(_) => {}
+        }
+        if !watch.pause(retry) {
+            return;
+        }
+        retry = next_retry(retry);
+    }
+}
+
+/// One IDLE connection, from connecting until it fails or the client goes. `again`: one
+/// watched before, so changes may have come while there was none: announced at once.
+/// `watching` is set once the inbox is open.
+fn idle_session(
+    watch: &Watch,
+    servers: &Servers,
+    credential: &Credential,
+    again: bool,
+    watching: &mut bool,
+) -> Result<Ended> {
+    let secret = credential.secret()?;
+    let stream = secure_stream(servers)?;
+    {
+        let mut state = watch.state.lock().unwrap();
+        let socket = stream.sock.try_clone()?;
+        if state.stop {
+            return Ok(Ended::Stopped);
+        }
+        state.socket = Some(socket);
+    }
+    let mut session = sign_in(servers, &secret, "", Idling(stream)).map_err(|error| {
+        // A refused token: a new one at the next try, after a wait.
+        if error.is::<SignedOut>() && credential.refused(&secret) {
+            token_refused("IMAP")
+        } else {
+            error
+        }
+    })?;
+    let can = session
+        .capabilities()
+        .map(|c| c.has_str("IDLE"))
+        .unwrap_or(false);
+    if !can {
+        let _ = session.logout();
+        return Ok(Ended::Unable);
+    }
+    // Read-only: this connection never changes anything.
+    session.examine("INBOX")?;
+    *watching = true;
+    if again {
+        watch.announce();
+    }
+    loop {
+        if watch.stopped() {
+            return Ok(Ended::Stopped);
+        }
+        let waited = session
+            .idle()
+            .timeout(IDLE_RENEW)
+            .keepalive(false)
+            .wait_while(|response| !announces_change(&response));
+        let outcome = match waited {
+            Ok(outcome) => outcome,
+            Err(_) if watch.stopped() => return Ok(Ended::Stopped),
+            Err(error) => return Err(error.into()),
+        };
+        // What came while IDLE was being ended counts too.
+        let more = session
+            .take_all_unsolicited()
+            .any(|response| announces_change(&response));
+        if outcome == ::imap::extensions::idle::WaitOutcome::MailboxChanged || more {
+            watch.announce();
+        }
+    }
+}
+
 /// IMAP on a plain connection made secure with STARTTLS before anything else. A server
 /// that does not take it is refused.
 fn starttls(host: &str, port: u16) -> Result<TlsStream> {
@@ -1697,6 +2193,44 @@ fn flags_of(flags: &[::imap::types::Flag<'_>]) -> (bool, bool) {
         flags.iter().any(|f| matches!(f, Flag::Seen)),
         flags.iter().any(|f| matches!(f, Flag::Flagged)),
     )
+}
+
+/// Takes the flags fetched into the index, noting each thread whose flags changed. The
+/// UIDs fetched.
+fn take_flags(
+    known: &mut Indexed,
+    fetched: &::imap::types::Fetches,
+    touched: &mut Vec<(String, bool)>,
+) -> HashSet<u32> {
+    let mut present = HashSet::new();
+    for fetch in fetched.iter() {
+        let Some(uid) = fetch.uid else { continue };
+        present.insert(uid);
+        let (seen, flagged) = flags_of(fetch.flags());
+        if let Some(entry) = known.messages.get_mut(&uid)
+            && (entry.seen != seen || entry.flagged != flagged)
+        {
+            entry.seen = seen;
+            entry.flagged = flagged;
+            touched.push((entry.thread.clone(), false));
+        }
+    }
+    present
+}
+
+/// Takes out of the index the messages the server no longer has, noting their threads.
+fn drop_gone(known: &mut Indexed, present: &HashSet<u32>, touched: &mut Vec<(String, bool)>) {
+    let gone: Vec<u32> = known
+        .messages
+        .keys()
+        .filter(|uid| !present.contains(uid))
+        .copied()
+        .collect();
+    for uid in gone {
+        if let Some(entry) = known.messages.remove(&uid) {
+            touched.push((entry.thread, false));
+        }
+    }
 }
 
 /// The newest `count` UIDs of the selected folder, at or under `below` if given, oldest
@@ -2032,15 +2566,10 @@ fn decode_utf7(text: &str) -> String {
     out
 }
 
-/// Checks that an account's IMAP server takes its password, for setting it up. The mail
+/// Checks that an account's IMAP server takes its password (or token), for setting it up. The mail
 /// is not looked at.
-pub fn check_login(servers: &Servers, password: &str) -> Result<()> {
-    let client = Client::new(
-        String::new(),
-        String::new(),
-        servers.clone(),
-        password.to_string(),
-    );
+pub fn check_login(servers: &Servers, credential: Credential) -> Result<()> {
+    let client = Client::new(String::new(), String::new(), servers.clone(), credential);
     let mut connection = client.open()?;
     let _ = connection.session.logout();
     Ok(())
@@ -2055,6 +2584,101 @@ impl From<SignedOut> for MayHaveArrived {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that answers with what it was given, keeping what it is sent where the test
+    /// can see it after the stream is gone.
+    struct Scripted {
+        answers: std::io::Cursor<Vec<u8>>,
+        sent: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.answers.read(buf)
+        }
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sent.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scripted_sign_in(answers: &str, secret: &Secret) -> (Result<()>, String) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let stream = Scripted {
+            answers: std::io::Cursor::new(answers.as_bytes().to_vec()),
+            sent: sent.clone(),
+        };
+        // STARTTLS servers: no greeting is read here (`starttls` read it).
+        let servers = Servers {
+            username: "ana@outlook.com".into(),
+            imap: crate::servers::Server::new("imap.example.com", 143, Security::StartTls),
+            smtp: crate::servers::Server::new("smtp.example.com", 587, Security::StartTls),
+        };
+        let result = sign_in(&servers, secret, "acct", stream).map(|_| ());
+        let sent = String::from_utf8(sent.lock().unwrap().clone()).unwrap();
+        (result, sent)
+    }
+
+    #[test]
+    fn a_token_signs_in_with_authenticate_xoauth2() {
+        use base64::Engine as _;
+        let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+        const CAPS: &str = "* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=XOAUTH2\r\na1 OK done\r\n";
+        let token = Secret::Bearer("EwBtoken".into());
+        let initial = b64("user=ana@outlook.com\x01auth=Bearer EwBtoken\x01\x01");
+
+        // Both forms of the empty challenge, "+ " and "+".
+        for go_ahead in ["+ \r\n", "+\r\n"] {
+            let (result, sent) = scripted_sign_in(
+                &format!("{CAPS}{go_ahead}a2 OK AUTHENTICATE completed.\r\n"),
+                &token,
+            );
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(
+                sent,
+                format!("a1 CAPABILITY\r\na2 AUTHENTICATE XOAUTH2\r\n{initial}\r\n")
+            );
+        }
+
+        // Refused: the JSON challenge is answered with an empty line, then NO is SignedOut.
+        let challenge = b64(r#"{"status":"401","schemes":"Bearer","scope":"x"}"#);
+        let (result, sent) = scripted_sign_in(
+            &format!("{CAPS}+ \r\n+ {challenge}\r\na2 NO AUTHENTICATE failed.\r\n"),
+            &token,
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<SignedOut>()
+                .is_some_and(|e| e.account == "acct")
+        );
+        assert!(sent.ends_with(&format!("{initial}\r\n\r\n")), "{sent:?}");
+        assert!(!format!("{error:#}").contains("EwBtoken"));
+
+        // Not offered: nothing is sent but the question.
+        let (result, sent) = scripted_sign_in(
+            "* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\na1 OK done\r\n",
+            &token,
+        );
+        assert!(result.is_err_and(|e| !e.is::<SignedOut>()));
+        assert_eq!(sent, "a1 CAPABILITY\r\n");
+
+        // A password still goes with PLAIN.
+        let (result, sent) = scripted_sign_in(
+            &format!("{CAPS}+ \r\na2 OK done\r\n"),
+            &Secret::Password("pw".into()),
+        );
+        assert!(result.is_ok());
+        assert!(
+            sent.contains("AUTHENTICATE PLAIN") && sent.contains(&b64("\0ana@outlook.com\0pw"))
+        );
+    }
 
     #[test]
     fn folder_names_go_to_and_from_modified_utf7() {
@@ -2132,6 +2756,139 @@ mod tests {
         assert_eq!(role_by_name("Clients"), Role::Label);
     }
 
+    #[test]
+    fn a_folder_where_nothing_moved_is_skipped_only_with_condstore() {
+        let known = Indexed {
+            uid_next: 50,
+            exists: Some(20),
+            mod_seq: Some(900),
+            ..Default::default()
+        };
+        let now = Seen {
+            next: 50,
+            exists: 20,
+            mod_seq: Some(900),
+        };
+        assert!(unchanged(&known, now));
+        // A flag changed, a message came, one went.
+        for moved in [
+            Seen {
+                mod_seq: Some(901),
+                ..now
+            },
+            Seen { next: 51, ..now },
+            Seen { exists: 19, ..now },
+        ] {
+            assert!(!unchanged(&known, moved), "{moved:?}");
+        }
+        // Without CONDSTORE (or before the first look with it) a flag change shows nowhere.
+        let plain = Seen {
+            mod_seq: None,
+            ..now
+        };
+        let unknown = Indexed {
+            mod_seq: None,
+            ..known.clone()
+        };
+        assert!(!unchanged(&known, plain));
+        assert!(!unchanged(&unknown, plain));
+        assert!(!unchanged(&unknown, now));
+    }
+
+    #[test]
+    fn the_count_says_when_messages_may_have_gone() {
+        // 20, then 2 came: 22 means none went, 21 that one did.
+        assert!(!may_have_gone(Some(20), 2, 22));
+        assert!(may_have_gone(Some(20), 2, 21));
+        assert!(may_have_gone(Some(20), 0, 19));
+        // More than counted (one came after the count): nothing to look for.
+        assert!(!may_have_gone(Some(20), 0, 21));
+        // Not known (an index saved before counts were): look.
+        assert!(may_have_gone(None, 0, 20));
+        // No overflow at the top.
+        assert!(may_have_gone(Some(u32::MAX), 1, u32::MAX));
+    }
+
+    #[test]
+    fn an_index_saved_before_condstore_still_loads() {
+        let old = r#"{"uid_validity":7,"uid_next":12,"oldest":1,"complete":true,"messages":{}}"#;
+        let known: Indexed = serde_json::from_str(old).unwrap();
+        assert_eq!((known.uid_validity, known.uid_next), (7, 12));
+        assert_eq!((known.mod_seq, known.exists), (None, None));
+    }
+
+    #[test]
+    fn idle_wakes_for_changes_to_the_mailbox_only() {
+        use ::imap::types::UnsolicitedResponse as U;
+        assert!(announces_change(&U::Exists(3)));
+        assert!(announces_change(&U::Expunge(2)));
+        assert!(announces_change(&U::Vanished {
+            earlier: false,
+            uids: vec![4..=6, 9..=9],
+        }));
+        assert!(!announces_change(&U::Recent(1)));
+        // Dovecot's "* OK Still here" while idling.
+        assert!(!announces_change(&U::Ok {
+            code: None,
+            information: Some("Still here".into()),
+        }));
+    }
+
+    #[test]
+    fn retries_wait_longer_each_time_up_to_a_limit() {
+        let mut wait = RETRY_FIRST;
+        let mut waits = Vec::new();
+        for _ in 0..10 {
+            waits.push(wait.as_secs());
+            wait = next_retry(wait);
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300, 300, 300]);
+        assert!(IDLE_RENEW < Duration::from_secs(25 * 60));
+    }
+
+    #[test]
+    fn a_change_wakes_a_wait_once_and_a_stop_ends_it() {
+        let client = offline_client();
+        let watch = client.watch.clone();
+        // Not signed in yet, or no IDLE: returns at once.
+        assert!(!client.wait_for_change(Duration::from_secs(5)));
+        {
+            let mut state = watch.state.lock().unwrap();
+            state.can_idle = Some(true);
+            // As if the thread were running (none is started in a unit test).
+            state.started = true;
+        }
+        let announcer = watch.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            announcer.announce();
+        });
+        let began = Instant::now();
+        assert!(client.wait_for_change(Duration::from_secs(10)));
+        assert!(began.elapsed() < Duration::from_secs(5));
+        thread.join().unwrap();
+        // Seen: the next wait times out.
+        assert!(!client.wait_for_change(Duration::from_millis(50)));
+        // Gone: the wait (and the thread's pauses) end.
+        drop(client);
+        assert!(watch.stopped());
+        assert!(!watch.pause(Duration::from_secs(10)));
+    }
+
+    fn offline_client() -> Client {
+        let servers = Servers {
+            username: "me".into(),
+            imap: crate::servers::Server::new("localhost", 1, Security::Tls),
+            smtp: crate::servers::Server::new("localhost", 1, Security::Tls),
+        };
+        Client::new(
+            String::new(),
+            String::new(),
+            servers,
+            Credential::Password(String::new()),
+        )
+    }
+
     fn entry(id: &str, thread: &str, at: i64, seen: bool) -> Entry {
         Entry {
             message_id: id.into(),
@@ -2198,7 +2955,12 @@ mod live {
             imap: Server::new("localhost", 10993, Security::Tls),
             smtp: Server::new("localhost", 10587, Security::StartTls),
         };
-        Client::new("acct".into(), user.to_string(), servers, "pass".into())
+        Client::new(
+            "acct".into(),
+            user.to_string(),
+            servers,
+            Credential::Password("pass".into()),
+        )
     }
 
     fn put(client: &Client, folder: &str, raw: &str, seen: bool) {
@@ -2231,9 +2993,10 @@ mod live {
     fn live_a_whole_mailbox() {
         let user = format!("t{}@example.org", std::process::id());
         let c = client(&user);
-        assert!(check_login(&c.servers, "pass").is_ok());
+        assert!(check_login(&c.servers, Credential::Password("pass".into())).is_ok());
         assert!(
-            check_login(&c.servers, "wrong").is_err_and(|e| e.is::<SignedOut>()),
+            check_login(&c.servers, Credential::Password("wrong".into()))
+                .is_err_and(|e| e.is::<SignedOut>()),
             "a wrong password is a sign-in to fix"
         );
         let (email, start) = c.profile().unwrap();
@@ -2432,5 +3195,115 @@ mod live {
         // Counts, and the index kept over a new connection.
         let counts = c.counts(&["INBOX".to_string(), "DRAFT".to_string()]);
         assert!(counts.contains_key("INBOX"));
+    }
+
+    /// Runs a command on `client`'s own connection, with INBOX selected: what another
+    /// mail app on the same account would do.
+    fn elsewhere(client: &Client, command: impl Fn(&mut Session) -> ::imap::Result<()>) {
+        client
+            .with(false, |c| {
+                Client::select(c, "INBOX")?;
+                command(&mut c.session)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn live_changes_elsewhere_by_condstore_and_idle() {
+        let user = format!("c{}@example.org", std::process::id());
+        let c = client(&user);
+        let other = client(&user);
+        for (n, subject) in ["Lunch", "Report", "Party"].iter().enumerate() {
+            put(
+                &other,
+                "INBOX",
+                &mail(&format!("<c{n}@x>"), subject, "", "Hi"),
+                false,
+            );
+        }
+        let (_, start) = c.profile().unwrap();
+        let (rows, _) = c.threads_page(View::Inbox, None, 30, None).unwrap();
+        assert_eq!(rows.len(), 3);
+        let id = |subject: &str| {
+            rows.iter()
+                .find(|r| r.subject == subject)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let at = c.history(&start).unwrap().latest;
+        {
+            let state = c.state.lock().unwrap();
+            let inbox = &state.folders["INBOX"];
+            assert!(inbox.mod_seq.is_some(), "Dovecot has CONDSTORE");
+            assert_eq!(inbox.exists, Some(3));
+        }
+
+        // Nothing moved: the feed stays where it is.
+        assert_eq!(c.history(&at).unwrap().latest, at);
+
+        // Read elsewhere: found by CHANGEDSINCE.
+        let uid_of = |subject: &str| {
+            let state = c.state.lock().unwrap();
+            let thread = id(subject);
+            *state.folders["INBOX"]
+                .messages
+                .iter()
+                .find(|(_, e)| e.thread == thread)
+                .unwrap()
+                .0
+        };
+        let lunch = uid_of("Lunch");
+        elsewhere(&other, |s| {
+            s.uid_store(lunch.to_string(), "+FLAGS.SILENT (\\Seen)")
+                .map(drop)
+        });
+        let changes = c.history(&at).unwrap();
+        assert_eq!(changes.threads, vec![id("Lunch")]);
+        assert!(!c.summary(&id("Lunch"), false).unwrap().unread);
+        let at = changes.latest;
+
+        // Deleted elsewhere: noticed by the count, found by UID SEARCH.
+        let report = uid_of("Report");
+        elsewhere(&other, |s| {
+            s.uid_store(report.to_string(), "+FLAGS.SILENT (\\Deleted)")?;
+            s.uid_expunge(report.to_string()).map(drop)
+        });
+        let changes = c.history(&at).unwrap();
+        assert_eq!(changes.threads, vec![id("Report")]);
+        let (rows, _) = c.threads_page(View::Inbox, None, 30, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        let at = changes.latest;
+
+        // New mail elsewhere wakes a wait at once (IDLE), well before it would time out.
+        // The first wait starts the IDLE thread; nothing has changed for it to see.
+        assert!(!c.wait_for_change(Duration::from_secs(3)));
+        let began = Instant::now();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            put(&other, "INBOX", &mail("<c9@x>", "News", "", "Fresh"), false);
+        });
+        assert!(c.wait_for_change(Duration::from_secs(30)));
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            began.elapsed()
+        );
+        sender.join().unwrap();
+        let changes = c.history(&at).unwrap();
+        assert_eq!(changes.new_unread_inbox.len(), 1);
+        // Looking does not wake it again.
+        assert!(!c.wait_for_change(Duration::from_secs(3)));
+
+        // The client gone, the thread ends (and lets go of what it shared).
+        let watch = c.watch.clone();
+        drop(c);
+        let began = Instant::now();
+        while Arc::strong_count(&watch) > 1 && began.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(Arc::strong_count(&watch), 1, "the IDLE thread stopped");
     }
 }

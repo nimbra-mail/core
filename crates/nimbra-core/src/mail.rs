@@ -924,6 +924,12 @@ pub trait Provider: Send + Sync {
     fn keep_rows_in(&self, store: &std::sync::Arc<crate::store::Store>);
     /// What changed since a point in the change feed.
     fn history(&self, start: &str) -> Result<Changes>;
+    /// Waits up to `timeout` for the server to say something changed, and says whether it
+    /// did (IMAP IDLE). Blocking: never on the UI thread. False at once where the provider
+    /// has no way to be told (Gmail), so the caller waits as it would have.
+    fn wait_for_change(&self, _timeout: std::time::Duration) -> bool {
+        false
+    }
     /// A page of a mailbox's threads, newest first, and where the next page starts.
     fn threads_page(
         &self,
