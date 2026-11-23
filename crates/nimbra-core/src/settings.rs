@@ -33,6 +33,8 @@ pub struct Settings {
     pub collapsed: Vec<String>,
     /// The sidebar was left in auto-hide (⌘B).
     pub sidebar_auto_hide: bool,
+    /// The sidebar's width, as its right edge was dragged to (docked and floating alike).
+    pub sidebar_width: f32,
     /// The last few searches, newest first.
     pub recent_searches: Vec<String>,
     /// When an opened thread counts as read.
@@ -117,6 +119,7 @@ impl Default for Settings {
             default_account: None,
             collapsed: Vec::new(),
             sidebar_auto_hide: false,
+            sidebar_width: 236.,
             recent_searches: Vec::new(),
             mark_read: MarkRead::Open,
             check_every: 30,
