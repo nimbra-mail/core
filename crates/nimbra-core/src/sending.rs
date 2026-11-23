@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::gmail;
+use crate::mail;
 use crate::store::Store;
 
 const RECORD: &str = "sending-";
@@ -17,7 +17,7 @@ const RECORD: &str = "sending-";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct QueuedMail {
     pub draft_id: Option<String>,
-    pub outgoing: gmail::Outgoing,
+    pub outgoing: mail::Outgoing,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ pub struct Job {
     pub account: String,
     /// The composer it came from; none for one found at launch.
     pub composer: Option<u64>,
-    client: Arc<gmail::Client>,
+    client: Arc<mail::Client>,
     name: String,
     /// It is on disk. Outside the lock, which a write holds while the keychain is asked.
     kept: AtomicBool,
@@ -71,7 +71,7 @@ impl Job {
     pub fn new(
         account: String,
         composer: u64,
-        client: Arc<gmail::Client>,
+        client: Arc<mail::Client>,
         store: Option<Arc<Store>>,
         mail: QueuedMail,
     ) -> anyhow::Result<Arc<Self>> {
@@ -79,7 +79,7 @@ impl Job {
             account,
             composer: Some(composer),
             client,
-            name: format!("{RECORD}{}", gmail::random_hex(8)?),
+            name: format!("{RECORD}{}", mail::random_hex(8)?),
             kept: AtomicBool::new(false),
             state: Mutex::new(State {
                 record: Record {
@@ -97,7 +97,7 @@ impl Job {
     pub fn unfinished(
         account: String,
         composer: u64,
-        client: Arc<gmail::Client>,
+        client: Arc<mail::Client>,
         store: Option<Arc<Store>>,
         mail: QueuedMail,
         stage: Stage,
@@ -110,7 +110,7 @@ impl Job {
     /// One from the offline queue of earlier versions.
     pub fn queued(
         account: &str,
-        client: &Arc<gmail::Client>,
+        client: &Arc<mail::Client>,
         store: &Arc<Store>,
         mail: QueuedMail,
     ) -> anyhow::Result<Arc<Self>> {
@@ -127,7 +127,7 @@ impl Job {
     /// Blocking.
     pub fn left_behind(
         account: &str,
-        client: &Arc<gmail::Client>,
+        client: &Arc<mail::Client>,
         store: &Arc<Store>,
     ) -> Vec<Arc<Self>> {
         let mut found = Vec::new();
@@ -257,8 +257,8 @@ impl Job {
         if state.record.stage == Stage::Out {
             state.record.stage = match &result {
                 Ok(()) => Stage::Over,
-                Err(error) if error.is::<gmail::MayHaveArrived>() => Stage::Unsure,
-                Err(error) if error.is::<gmail::Offline>() => Stage::Held,
+                Err(error) if error.is::<mail::MayHaveArrived>() => Stage::Unsure,
+                Err(error) if error.is::<mail::Offline>() => Stage::Held,
                 Err(_) => Stage::Refused,
             };
             if state.record.stage == Stage::Over {
@@ -296,7 +296,7 @@ impl Job {
             None => true,
             Some(id) => match self.client.delete_draft(&id) {
                 Ok(()) => true,
-                Err(error) => gmail::is_gone(&error),
+                Err(error) => mail::is_gone(&error),
             },
         };
         if deleted {

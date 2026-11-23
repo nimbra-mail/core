@@ -85,6 +85,10 @@ impl TextSize {
 pub struct AccountRef {
     pub id: String,
     pub email: String,
+    /// For an account that is not Gmail: its IMAP and SMTP servers (its password is in
+    /// the keychain). None for Gmail, which is all an older settings file has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub servers: Option<crate::servers::Servers>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,10 +207,12 @@ mod tests {
                 AccountRef {
                     id: String::new(),
                     email: "a@example.com".into(),
+                    servers: None,
                 },
                 AccountRef {
                     id: "bbbbbbbbbbbb".into(),
                     email: "b@example.com".into(),
+                    servers: None,
                 },
             ],
             ..Settings::default()

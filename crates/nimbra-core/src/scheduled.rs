@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::gmail;
+use crate::mail;
 use crate::store::Store;
 
 const LIST: &str = "scheduled";
@@ -40,7 +40,7 @@ pub fn add(store: &Store, item: Scheduled) -> anyhow::Result<()> {
 
 /// Sends one, unless someone else is on it or has sent it. `None`: nothing came of it.
 /// Blocking.
-pub fn send(store: &Store, client: &gmail::Client, draft_id: &str) -> Option<Outcome> {
+pub fn send(store: &Store, client: &mail::Client, draft_id: &str) -> Option<Outcome> {
     let name = claim_name(draft_id);
     let _claim = store.claim(&name)?;
     if !list(store).iter().any(|item| item.draft_id == draft_id) {
@@ -49,7 +49,7 @@ pub fn send(store: &Store, client: &gmail::Client, draft_id: &str) -> Option<Out
     }
     let outcome = match client.send_saved_draft(draft_id) {
         Ok(()) => Outcome::Sent,
-        Err(error) if gmail::is_gone(&error) => Outcome::Gone,
+        Err(error) if mail::is_gone(&error) => Outcome::Gone,
         // Tried again on a later check. That cannot send it twice: sending uses the draft up.
         Err(_) => return None,
     };

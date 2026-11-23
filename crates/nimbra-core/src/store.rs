@@ -264,7 +264,7 @@ pub fn wipe(account: &str) {
 
 /// The keychain entry of an account's store key.
 fn key_user(account: &str) -> Result<String> {
-    if !crate::gmail::is_account_id(account) {
+    if !crate::mail::is_account_id(account) {
         bail!("unexpected account id");
     }
     Ok(if account.is_empty() {
@@ -275,7 +275,7 @@ fn key_user(account: &str) -> Result<String> {
 }
 
 fn default_dir(account: &str) -> Result<PathBuf> {
-    if !crate::gmail::is_account_id(account) {
+    if !crate::mail::is_account_id(account) {
         bail!("unexpected account id");
     }
     let folder = if account.is_empty() {
