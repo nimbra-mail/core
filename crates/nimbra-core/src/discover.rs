@@ -1,6 +1,7 @@
 //! Finds the IMAP and SMTP servers for an email address: from a list of well-known
-//! providers first, then from the domain's own autoconfig file, then from Thunderbird's
-//! ISPDB (the public list Thunderbird uses).
+//! providers first, then from the domain's own autoconfig file, then from the domain's
+//! mail servers (MX records), then from Thunderbird's ISPDB (the public list Thunderbird
+//! uses), for the domain and then for its mail server's domain.
 //!
 //! Security/privacy notes:
 //! - The address is checked before anything else, and its domain must be a plain host name
@@ -10,7 +11,12 @@
 //! - Asking the domain's own autoconfig server (`autoconfig.<domain>` and
 //!   `<domain>/.well-known/…`) sends it the full address, as Thunderbird does: that server
 //!   belongs to whoever runs the mail for the address.
-//! - Asking Thunderbird's ISPDB sends Mozilla the domain only, never the full address.
+//! - Looking up the domain's MX records sends the domain to the system's own DNS resolver,
+//!   as any app looking up a name does (see `dns`). The answer is not trusted further than
+//!   choosing which provider to suggest: its host names are checked like any other.
+//! - Asking Thunderbird's ISPDB sends Mozilla the domain only, never the full address; a
+//!   domain whose mail server is Google, Microsoft or Zoho is not sent at all. The lookup
+//!   by mail server sends only the mail server's domain.
 //! - A server that is only reached in plain text is never offered, and POP3 is ignored.
 //!   Host names from the network are checked like typed ones, so a hostile file cannot
 //!   carry anything else into a connection.
@@ -64,9 +70,9 @@ pub fn known(email: &str) -> Option<Found> {
     })
 }
 
-/// The servers for an address: the presets, then the domain's own autoconfig, then
-/// Thunderbird's ISPDB. Blocks for up to a few seconds per source; `Unknown` when none
-/// of them answers.
+/// The servers for an address: the presets, then the domain's own autoconfig, then its
+/// MX records and Thunderbird's ISPDB. Blocks for up to a few seconds per source;
+/// `Unknown` when none of them answers.
 pub fn discover(email: &str) -> Result<Found> {
     let email = email.trim();
     if !is_address(email) {
@@ -85,25 +91,105 @@ pub fn discover(email: &str) -> Result<Found> {
         );
     };
     let address: String = url::form_urlencoded::byte_serialize(email.as_bytes()).collect();
-    let sources = [
+    let own = [
         format!("https://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress={address}"),
         format!("https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml"),
-        format!("https://autoconfig.thunderbird.net/v1.1/{domain}"),
     ];
     let agent = ureq::AgentBuilder::new()
         .timeout(TIMEOUT)
         .https_only(true)
         .redirects(MAX_REDIRECTS)
         .build();
-    for url in &sources {
-        let Some(xml) = fetch(&agent, url) else {
+    let from = |url: &str| parse(&fetch(&agent, url)?, email);
+    if let Some(found) = own.iter().find_map(|url| from(url)) {
+        return Ok(found);
+    }
+    // The most preferred mail server. A big provider is known from it straight away, so
+    // Mozilla never hears of the domain; otherwise ISPDB is asked about the domain (a
+    // listing there is the most exact), then about the mail server's own domain.
+    let mx = crate::dns::mx(&domain)
+        .ok()
+        .and_then(|hosts| hosts.into_iter().next());
+    if let Some(found) = mx.as_deref().and_then(|host| by_mx(host, email)) {
+        return Ok(found);
+    }
+    let mut lookups = vec![domain.clone()];
+    if let Some(host) = &mx {
+        lookups.extend(mx_domains(host).into_iter().filter(|name| *name != domain));
+    }
+    Ok(lookups
+        .iter()
+        .find_map(|name| from(&format!("https://autoconfig.thunderbird.net/v1.1/{name}")))
+        .unwrap_or(Found::Unknown))
+}
+
+/// The provider behind a mail server (MX host) that is known without asking anyone:
+/// Google and Microsoft sign in with their own pages, and Zoho's regions have presets. The
+/// user name is the full address on the user's own domain.
+fn by_mx(host: &str, email: &str) -> Option<Found> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if under(&host, "google.com") || under(&host, "googlemail.com") {
+        return Some(Found::NeedsOAuth { provider: "Google" });
+    }
+    // `*.mail.protection.outlook.com`, and the newer `*.mx.microsoft` (with DNSSEC).
+    if under(&host, "outlook.com") || under(&host, "mx.microsoft") {
+        return Some(Found::NeedsOAuth {
+            provider: "Microsoft",
+        });
+    }
+    let (first, region) = host.split_once('.')?;
+    const ZOHO: [&str; 7] = [
+        "zoho.com",
+        "zoho.eu",
+        "zoho.in",
+        "zoho.com.au",
+        "zoho.jp",
+        "zohocloud.ca",
+        "zoho.sa",
+    ];
+    if !matches!(first, "mx" | "mx2" | "mx3") || !ZOHO.contains(&region) {
+        return None;
+    }
+    let Some(Found::Servers(servers)) = known(&format!("a@{region}")) else {
+        return None;
+    };
+    Some(Found::Servers(Servers {
+        username: email.to_string(),
+        ..servers
+    }))
+}
+
+/// The names to ask ISPDB about for a mail server, as Thunderbird does: the host without
+/// its first label, then its registrable domain (`mx1.mail.example.net` gives
+/// `mail.example.net`, then `example.net`). At most two, each a plain host name of at least
+/// two labels.
+fn mx_domains(host: &str) -> Vec<String> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    // An IP address is no domain (no top-level domain is all digits).
+    if labels
+        .last()
+        .is_none_or(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Vec::new();
+    }
+    // Without the public suffix list: `co.uk`, `com.au` and the like take a third label.
+    let generic = ["co", "com", "net", "org", "ac", "gov", "edu", "ne", "or"];
+    let keep = match labels.as_slice() {
+        [.., second, tld] if tld.len() == 2 && generic.contains(second) => 3,
+        _ => 2,
+    };
+    let mut found: Vec<String> = Vec::new();
+    for size in [labels.len().saturating_sub(1), keep] {
+        if size < keep || size > labels.len() {
             continue;
-        };
-        if let Some(found) = parse(&xml, email) {
-            return Ok(found);
+        }
+        let name = labels[labels.len() - size..].join(".");
+        if is_host(&name) && name.parse::<std::net::IpAddr>().is_err() && !found.contains(&name) {
+            found.push(name);
         }
     }
-    Ok(Found::Unknown)
+    found
 }
 
 /// The address's domain, lowercase, when it is safe to put into a URL: a plain DNS name,
@@ -822,6 +908,88 @@ mod tests {
                 provider: "your email provider"
             })
         );
+    }
+
+    #[test]
+    fn google_and_microsoft_mail_servers_need_their_sign_in() {
+        for host in [
+            "aspmx.l.google.com",
+            "ALT1.ASPMX.L.GOOGLE.COM.",
+            "smtp.google.com",
+            "aspmx2.googlemail.com",
+        ] {
+            assert_eq!(
+                by_mx(host, "a@acme.dev"),
+                Some(Found::NeedsOAuth { provider: "Google" }),
+                "{host}"
+            );
+        }
+        for host in [
+            "acme-dev.mail.protection.outlook.com",
+            "acme-dev.o-v1.mx.microsoft",
+        ] {
+            assert_eq!(
+                by_mx(host, "a@acme.dev"),
+                Some(Found::NeedsOAuth {
+                    provider: "Microsoft"
+                }),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn zoho_mail_servers_give_the_regional_preset() {
+        for (host, imap) in [
+            ("mx.zoho.com", "imap.zoho.com"),
+            ("mx2.zoho.com", "imap.zoho.com"),
+            ("mx3.zoho.eu", "imap.zoho.eu"),
+            ("mx.zoho.in", "imap.zoho.in"),
+            ("mx2.zoho.com.au", "imap.zoho.com.au"),
+            ("mx.zoho.jp", "imap.zoho.jp"),
+            ("mx.zohocloud.ca", "imap.zohocloud.ca"),
+            ("mx3.zoho.sa", "imap.zoho.sa"),
+        ] {
+            let found = servers(by_mx(host, "Jo@Acme.dev"));
+            assert_eq!(found.username, "Jo@Acme.dev", "{host}");
+            assert_eq!(found.imap, Server::new(imap, 993, Security::Tls), "{host}");
+            assert!(found.check().is_ok());
+        }
+    }
+
+    #[test]
+    fn other_mail_servers_are_not_known() {
+        for host in [
+            "mx.example.net",
+            "mx4.zoho.com",
+            "mx.zoho.com.evil.net",
+            "mx.notzoho.com",
+            "zoho.com",
+            "google.com.evil.net",
+            "notgoogle.com",
+            "outlook.com.evil.net",
+            "",
+        ] {
+            assert_eq!(by_mx(host, "a@acme.dev"), None, "{host:?}");
+        }
+    }
+
+    #[test]
+    fn ispdb_is_asked_about_the_mail_servers_domain() {
+        assert_eq!(
+            mx_domains("mx1.mail.example.net."),
+            ["mail.example.net", "example.net"]
+        );
+        assert_eq!(mx_domains("MX.Example.net"), ["example.net"]);
+        assert_eq!(mx_domains("example.net"), ["example.net"]);
+        assert_eq!(mx_domains("mx.provider.co.uk"), ["provider.co.uk"]);
+        assert_eq!(
+            mx_domains("a.b.mail.provider.com.au"),
+            ["b.mail.provider.com.au", "provider.com.au"]
+        );
+        for host in ["net", "co.uk", "", "bad host.net", "127.0.0.1"] {
+            assert!(mx_domains(host).is_empty(), "{host:?}");
+        }
     }
 
     #[test]
