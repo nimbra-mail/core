@@ -654,6 +654,8 @@ impl Client {
         if !version.is_empty()
             && let Some((kept, row)) = self.rows.lock().unwrap().get(&key)
             && kept == version
+            // Kept before rows knew their senders (blocked senders need them).
+            && row.senders.len() == row.message_count
         {
             return Ok((row.clone(), false));
         }
@@ -947,6 +949,11 @@ impl Client {
                 .messages
                 .iter()
                 .map(|m| m.label_ids.clone())
+                .collect(),
+            senders: thread
+                .messages
+                .iter()
+                .map(|m| address_of(m.header("From")).to_lowercase())
                 .collect(),
         })
     }
@@ -1946,6 +1953,7 @@ mod tests {
                 .iter()
                 .map(|m| m.iter().map(|l| l.to_string()).collect())
                 .collect(),
+            senders: Vec::new(),
         };
         let done = |messages: &[&[&str]]| View::Done.takes(&thread(messages), None);
         assert!(done(&[&["CATEGORY_UPDATES"]]) && done(&[&[]]));

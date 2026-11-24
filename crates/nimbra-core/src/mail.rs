@@ -797,6 +797,9 @@ pub struct Summary {
     pub labels: Vec<String>,
     /// Each message's own, for the mailboxes that are searches (`View::takes`).
     pub message_labels: Vec<Vec<String>>,
+    /// Each message's sender, as a bare lowercase address (for blocked senders).
+    #[serde(default)]
+    pub senders: Vec<String>,
 }
 
 pub struct Message {

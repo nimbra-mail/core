@@ -93,6 +93,15 @@ impl Store {
         })
     }
 
+    /// A store in a fresh temporary folder, for tests elsewhere.
+    #[cfg(test)]
+    pub fn temp() -> Self {
+        let mut id = [0u8; 8];
+        getrandom::getrandom(&mut id).unwrap();
+        let name: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        Self::open_at(std::env::temp_dir().join(format!("nimbra-test-{name}")), &[7; 32]).unwrap()
+    }
+
     /// Saves a record under `name`, replacing any previous one.
     pub fn save<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
         let path = self.path(name)?;

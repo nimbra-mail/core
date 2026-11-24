@@ -2391,6 +2391,10 @@ fn summary(id: &str, copies: &[(&Folder, &Entry)], recipient: bool) -> Summary {
         starred: labels.iter().any(|l| l == "STARRED"),
         labels,
         message_labels,
+        senders: messages
+            .iter()
+            .map(|m| m.from.address.trim().to_lowercase())
+            .collect(),
     }
 }
 
@@ -3251,6 +3255,58 @@ mod live {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn live_blocked_senders() {
+        use crate::blocking;
+        let user = format!("b{}@example.org", std::process::id());
+        let c = client(&user);
+        let from = |who: &str, id: &str, subject: &str| {
+            format!(
+                "From: {who}\r\nTo: me@example.org\r\nSubject: {subject}\r\n\
+                 Date: Mon, 23 Nov 2026 10:00:00 +0000\r\nMessage-ID: {id}\r\n\
+                 MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nHi\r\n"
+            )
+        };
+        // Spark's Blocked folder, with one sender in it already.
+        let label = c.create_label("Blocked").unwrap();
+        put(&c, &label.name, &from("Old Ads <old@ads.example>", "<b0@x>", "Old"), true);
+        put(&c, "INBOX", &from("Old Ads <OLD@ads.example>", "<b1@x>", "Left"), false);
+        put(&c, "INBOX", &from("Ana <ana@example.com>", "<b2@x>", "Lunch"), false);
+        let store = crate::store::Store::temp();
+
+        // The first look learns the sender and moves what it left in the inbox.
+        assert_eq!(blocking::sweep(&c, &store), 1);
+        assert_eq!(blocking::load(&store).senders, ["old@ads.example"]);
+        let (inbox, _) = c.threads_page(View::Inbox, None, 30, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].subject, "Lunch");
+        let (blocked, _) = c
+            .threads_page(View::Label(0), Some(&label.id), 30, None)
+            .unwrap();
+        assert!(blocked.iter().any(|t| t.subject == "Left" && !t.unread));
+
+        // New mail: a blocked sender's is moved and not given back to notify about.
+        assert!(blocking::set(&store, "Spam@Ads.example", true).unwrap());
+        let (_, start) = c.profile().unwrap();
+        put(&c, "INBOX", &from("Spam <spam@ads.example>", "<b3@x>", "Sale"), false);
+        put(&c, "INBOX", &from("Ana <ana@example.com>", "<b4@x>", "Dinner"), false);
+        let fresh = c.history(&start).unwrap().new_unread_inbox;
+        assert_eq!(fresh.len(), 2);
+        let kept = blocking::screen(&c, &store, fresh);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(c.summary(&kept[0], false).unwrap().subject, "Dinner");
+        let (inbox, _) = c.threads_page(View::Inbox, None, 30, None).unwrap();
+        assert!(!inbox.iter().any(|t| t.subject == "Sale"));
+
+        // Unblocked: their mail stays in the inbox again.
+        assert!(blocking::set(&store, "spam@ads.example", false).unwrap());
+        let (_, start) = c.profile().unwrap();
+        put(&c, "INBOX", &from("Spam <spam@ads.example>", "<b5@x>", "Again"), false);
+        let fresh = c.history(&start).unwrap().new_unread_inbox;
+        assert_eq!(blocking::screen(&c, &store, fresh).len(), 1);
     }
 
     #[test]
