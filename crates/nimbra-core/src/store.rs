@@ -99,7 +99,11 @@ impl Store {
         let mut id = [0u8; 8];
         getrandom::getrandom(&mut id).unwrap();
         let name: String = id.iter().map(|b| format!("{b:02x}")).collect();
-        Self::open_at(std::env::temp_dir().join(format!("nimbra-test-{name}")), &[7; 32]).unwrap()
+        Self::open_at(
+            std::env::temp_dir().join(format!("nimbra-test-{name}")),
+            &[7; 32],
+        )
+        .unwrap()
     }
 
     /// Saves a record under `name`, replacing any previous one.

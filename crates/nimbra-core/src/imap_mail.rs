@@ -3272,9 +3272,24 @@ mod live {
         };
         // Spark's Blocked folder, with one sender in it already.
         let label = c.create_label("Blocked").unwrap();
-        put(&c, &label.name, &from("Old Ads <old@ads.example>", "<b0@x>", "Old"), true);
-        put(&c, "INBOX", &from("Old Ads <OLD@ads.example>", "<b1@x>", "Left"), false);
-        put(&c, "INBOX", &from("Ana <ana@example.com>", "<b2@x>", "Lunch"), false);
+        put(
+            &c,
+            &label.name,
+            &from("Old Ads <old@ads.example>", "<b0@x>", "Old"),
+            true,
+        );
+        put(
+            &c,
+            "INBOX",
+            &from("Old Ads <OLD@ads.example>", "<b1@x>", "Left"),
+            false,
+        );
+        put(
+            &c,
+            "INBOX",
+            &from("Ana <ana@example.com>", "<b2@x>", "Lunch"),
+            false,
+        );
         let store = crate::store::Store::temp();
 
         // The first look learns the sender and moves what it left in the inbox.
@@ -3291,8 +3306,18 @@ mod live {
         // New mail: a blocked sender's is moved and not given back to notify about.
         assert!(blocking::set(&store, "Spam@Ads.example", true).unwrap());
         let (_, start) = c.profile().unwrap();
-        put(&c, "INBOX", &from("Spam <spam@ads.example>", "<b3@x>", "Sale"), false);
-        put(&c, "INBOX", &from("Ana <ana@example.com>", "<b4@x>", "Dinner"), false);
+        put(
+            &c,
+            "INBOX",
+            &from("Spam <spam@ads.example>", "<b3@x>", "Sale"),
+            false,
+        );
+        put(
+            &c,
+            "INBOX",
+            &from("Ana <ana@example.com>", "<b4@x>", "Dinner"),
+            false,
+        );
         let fresh = c.history(&start).unwrap().new_unread_inbox;
         assert_eq!(fresh.len(), 2);
         let kept = blocking::screen(&c, &store, fresh);
@@ -3304,7 +3329,12 @@ mod live {
         // Unblocked: their mail stays in the inbox again.
         assert!(blocking::set(&store, "spam@ads.example", false).unwrap());
         let (_, start) = c.profile().unwrap();
-        put(&c, "INBOX", &from("Spam <spam@ads.example>", "<b5@x>", "Again"), false);
+        put(
+            &c,
+            "INBOX",
+            &from("Spam <spam@ads.example>", "<b5@x>", "Again"),
+            false,
+        );
         let fresh = c.history(&start).unwrap().new_unread_inbox;
         assert_eq!(blocking::screen(&c, &store, fresh).len(), 1);
     }
