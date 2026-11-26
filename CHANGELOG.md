@@ -4,6 +4,18 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Breaking
+- `NimbraError.SignedOut(account:)` is now `SignedOut(accountId: String?)`: always an account id on this device, or `nil` when the address being added (`addImapAccount`, a new account's `finish…SignIn`) did not take the password or sign-in. It was an empty string there before. A refused SMTP password while adding is now `SignedOut` too, not `Failed`. Match on `accountId` instead of `account`.
+- `ThreadRow` has a new field, `senderAddress` (see Added): code that builds a `ThreadRow` itself (previews, tests) passes it. In the crate, so does code that builds a `mail::Summary` (`sender_address`).
+
+### Added
+- `Engine.updateImapPassword(accountId:password:)`: signs in to an account with its own servers again with a new password, checked with its IMAP and SMTP servers as adding one is. The account keeps its id, its stored mail and its signatures; a refused password is `SignedOut` for that account and leaves the old one. Network.
+- `ThreadRow.senderAddress`: the address of whoever `sender` names (the latest message's sender, or in Sent and Drafts its first recipient), so an avatar's tone and a quick reply are right before the thread is read. `nil` when there is none, and for rows kept by 0.1.0 until their thread changes. In the crate: `Summary::sender_address` and `Row::sender_address`.
+- `accounts::check_password` in the crate: both servers' check that adding an account and a new password share.
+
+### Fixed
+- After a change-feed sync, `refreshMailbox`'s `nextPage` started after as many threads as were listed before the changes, so `loadMore` skipped a thread for each one that left the list. It now starts right after the threads returned, and nothing is kept if finding it fails.
+
 ## [0.1.0] - 2026-11-26
 
 The first release: the engine the macOS app ran, split out of it so the iOS app can run it too.

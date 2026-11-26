@@ -17,7 +17,7 @@ use nimbra_core::settings::{AccountRef, Settings};
 use nimbra_core::store::Store;
 use nimbra_core::{
     accounts, blocking, contacts, discover, gmail, imap_mail, listing, mail, microsoft, paths,
-    sending, servers, settings, signature, smtp, snooze, store,
+    sending, servers, settings, signature, snooze, store,
 };
 
 use crate::error::{NimbraError, Result};
@@ -123,7 +123,7 @@ impl Engine {
     }
 
     /// Writes what is waiting to be written (settings, stores), for a few seconds at most:
-    /// call it when the app goes to the background. Whether everything is on disk.
+    /// call it when the app goes to the background. Whether everything is on disk. Disk.
     pub fn flush(&self) -> bool {
         let settings = settings::flush();
         let stores = store::flush(std::time::Instant::now() + std::time::Duration::from_secs(3));
@@ -132,7 +132,7 @@ impl Engine {
 
     // -------------------------------------------------------------- accounts
 
-    /// The accounts on this device, in their order.
+    /// The accounts on this device, in their order. Memory only.
     pub fn accounts(&self) -> Vec<Account> {
         let settings = locked(&self.settings);
         let default = settings.default_account().map(String::from);
@@ -148,6 +148,7 @@ impl Engine {
             .collect()
     }
 
+    /// The account new messages are from unless another is picked. Disk.
     pub fn set_default_account(&self, account_id: String) -> Result<()> {
         self.change_settings(|settings| {
             if !settings.accounts.iter().any(|a| a.id == account_id) {
@@ -161,7 +162,7 @@ impl Engine {
     /// Starts a Google sign-in that comes back to `redirect_uri` (for an iOS client,
     /// `com.googleusercontent.apps.<id>:/oauth2redirect`). `account_id` signs in to that
     /// account again: no other Google account is then accepted. `full_access` also asks
-    /// for deleting for good.
+    /// for deleting for good. Memory only: the browser talks to Google.
     pub fn begin_google_sign_in(
         &self,
         redirect_uri: String,
@@ -211,7 +212,16 @@ impl Engine {
             ));
         };
         let config = self.google()?;
-        let client = authorization.finish(config, &account, &callback_url)?;
+        let client = authorization
+            .finish(config, &account, &callback_url)
+            .map_err(|e| {
+                let refused = NimbraError::from(e);
+                if existing {
+                    refused.for_account(&account)
+                } else {
+                    refused
+                }
+            })?;
         if existing {
             // A new sign-in for the same account: the connection opens again with it.
             locked(&self.open).remove(&account);
@@ -242,7 +252,7 @@ impl Engine {
 
     /// Starts a Microsoft sign-in that comes back to `redirect_uri` (for iOS,
     /// `msauth.<bundle id>://auth`, as registered). `account_id` signs in to that account
-    /// again. `hint` is an address to fill in.
+    /// again. `hint` is an address to fill in. Memory only: the browser talks to Microsoft.
     pub fn begin_microsoft_sign_in(
         &self,
         redirect_uri: String,
@@ -287,7 +297,11 @@ impl Engine {
             ));
         };
         let config = self.microsoft()?;
-        let (email, tokens) = authorization.finish(config, &callback_url)?;
+        let named = |error: anyhow::Error| match &existing {
+            Some(id) => NimbraError::from(error).for_account(id),
+            None => NimbraError::from(error),
+        };
+        let (email, tokens) = authorization.finish(config, &callback_url).map_err(named)?;
         if let Some(id) = &existing {
             let expected = self
                 .account(id)?
@@ -299,7 +313,7 @@ impl Engine {
         }
         let servers = microsoft::servers(&email);
         let tokens = Arc::new(tokens);
-        imap_mail::check_login(&servers, Credential::Microsoft(tokens.clone()))?;
+        imap_mail::check_login(&servers, Credential::Microsoft(tokens.clone())).map_err(named)?;
         let id = match existing {
             Some(id) => id,
             None => mail::new_account_id()?,
@@ -322,7 +336,7 @@ impl Engine {
     }
 
     /// Forgets a sign-in that was started and will not be finished (the user closed the
-    /// browser).
+    /// browser). Memory only.
     pub fn cancel_sign_in(&self, request_id: String) {
         locked(&self.pending).remove(&request_id);
     }
@@ -355,12 +369,7 @@ impl Engine {
         servers
             .check()
             .map_err(|e| NimbraError::invalid(e.to_string()))?;
-        imap_mail::check_login(&servers, Credential::Password(password.clone()))?;
-        smtp::check_login(
-            &servers.smtp,
-            &servers.username,
-            &servers::Secret::Password(password.clone()),
-        )?;
+        accounts::check_password(&servers, &password)?;
         let id = mail::new_account_id()?;
         servers::store_password(&id, &password)?;
         self.keep_account(AccountRef {
@@ -369,6 +378,39 @@ impl Engine {
             servers: Some(servers),
             oauth: None,
         })
+    }
+
+    /// Signs in to an account with its own servers again, with a new password (it was
+    /// changed, or the server stopped taking the old one: `SignedOut`). Checks that both
+    /// servers take it, as `add_imap_account` does, then keeps it in the Keychain in place
+    /// of the old one; the account keeps its id, its stored mail, its signatures and
+    /// whatever waits to be sent. A refused password is `SignedOut` for this account, and
+    /// the old one is kept. Not for Gmail or Microsoft accounts, which sign in again in
+    /// the browser. Network.
+    pub fn update_imap_password(&self, account_id: String, password: String) -> Result<Account> {
+        let account = self
+            .account(&account_id)?
+            .ok_or_else(|| NimbraError::invalid("There is no such account."))?;
+        let servers = match (&account.servers, kind_of(&account)) {
+            (Some(servers), AccountKind::Imap) => servers.clone(),
+            _ => {
+                return Err(NimbraError::invalid(
+                    "That account signs in with its provider, not a password.",
+                ));
+            }
+        };
+        if password.is_empty() {
+            return Err(NimbraError::invalid("The password is empty."));
+        }
+        accounts::check_password(&servers, &password)
+            .map_err(|e| NimbraError::from(e).for_account(&account_id))?;
+        servers::store_password(&account_id, &password)?;
+        // The connection opens again with it; the store stays as it is.
+        locked(&self.open).remove(&account_id);
+        self.accounts()
+            .into_iter()
+            .find(|a| a.id == account_id)
+            .ok_or_else(|| NimbraError::invalid("That account was removed meanwhile."))
     }
 
     /// Removes an account from this device: its sign-in, its stored mail and its
@@ -404,6 +446,12 @@ impl Engine {
     }
 
     /// Unread and total threads for these labels ("INBOX", "STARRED", label ids). Network.
+    ///
+    /// For a Gmail account, Gmail counts each label over all mail, as the Mac shows it:
+    /// a Split Inbox category (`CATEGORY_PERSONAL`, `CATEGORY_UPDATES`,
+    /// `CATEGORY_PROMOTIONS`, `CATEGORY_SOCIAL`) counts its threads archived out of the
+    /// inbox too, so a category's unread number can be more than its list in the inbox
+    /// shows. "INBOX" counts only the inbox.
     pub fn counts(&self, account_id: String, label_ids: Vec<String>) -> Result<Vec<LabelCount>> {
         let open = self.connect(&account_id)?;
         let counts = open.client.counts(&label_ids);
@@ -526,7 +574,7 @@ impl Engine {
     }
 
     /// When an opened thread counts as read (Preferences): at once (0), after a moment, or
-    /// only when the user says so (`None`).
+    /// only when the user says so (`None`). Memory only.
     pub fn mark_read_after_ms(&self) -> Option<u32> {
         let choice = locked(&self.settings).mark_read;
         nimbra_core::notifying::mark_read_after(choice).map(|after| after.as_millis() as u32)
@@ -582,7 +630,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Network.
     /// A new label, unless one is already called that (in any case): then that one, as on
     /// the Mac. Network (disk when it exists).
     pub fn create_label(&self, account_id: String, name: String) -> Result<Label> {
@@ -860,6 +907,7 @@ impl Engine {
 
     // -------------------------------------------------------------- signatures
 
+    /// The account's signatures, and which one is its default. Memory only.
     pub fn signatures(&self, account_id: String) -> Vec<SignatureInfo> {
         let settings = locked(&self.settings);
         let default = settings
@@ -877,7 +925,7 @@ impl Engine {
             .collect()
     }
 
-    /// A new, empty signature for the account. Its id.
+    /// A new, empty signature for the account. Its id. Disk.
     pub fn add_signature(&self, account_id: String) -> Result<String> {
         let mut made = None;
         self.change_settings(|settings| {
@@ -888,6 +936,7 @@ impl Engine {
     }
 
     /// Changes a signature. Its HTML is cleaned before it is kept (`signature::clean`).
+    /// Disk.
     pub fn update_signature(&self, signature_id: String, name: String, html: String) -> Result<()> {
         let html = signature::clean(&html);
         self.change_settings(|settings| {
@@ -902,6 +951,7 @@ impl Engine {
         })
     }
 
+    /// Deletes a signature, and its place as any default. Disk.
     pub fn delete_signature(&self, signature_id: String) -> Result<()> {
         self.change_settings(|settings| {
             settings.delete_signature(&signature_id);
@@ -909,7 +959,7 @@ impl Engine {
         })
     }
 
-    /// `None`: no signature by default.
+    /// `None`: no signature by default. Disk.
     pub fn set_default_signature(
         &self,
         account_id: String,
@@ -923,6 +973,7 @@ impl Engine {
 
     // -------------------------------------------------------------- preferences
 
+    /// The preferences, as set. Memory only.
     pub fn preferences(&self) -> Preferences {
         let settings = locked(&self.settings);
         Preferences {
@@ -939,6 +990,7 @@ impl Engine {
         }
     }
 
+    /// Changes the preferences and saves them. Disk.
     pub fn set_preferences(&self, preferences: Preferences) -> Result<()> {
         self.change_settings(|settings| {
             settings.notifications = preferences.notifications;
@@ -1054,7 +1106,7 @@ impl Engine {
             .account(account_id)?
             .ok_or_else(|| NimbraError::invalid("There is no such account."))?;
         let signed_out = || NimbraError::SignedOut {
-            account: account.id.clone(),
+            account_id: Some(account.id.clone()),
         };
         // As the Mac connects: the sign-in or password from the Keychain (`accounts`).
         let client: Arc<mail::Client> = match kind_of(&account) {
@@ -1232,6 +1284,11 @@ mod tests {
         let page = engine.refresh_mailbox(id.clone(), Mailbox::Inbox).unwrap();
         let ids: Vec<_> = page.threads.iter().map(|t| t.id.clone()).collect();
         assert_eq!(ids, ["a", "b"]);
+        assert_eq!(
+            page.threads[0].sender_address.as_deref(),
+            Some("a@example.com"),
+            "the row knows its sender's address before the thread is read"
+        );
         assert_eq!(
             engine.cached_threads(id.clone(), Mailbox::Inbox).unwrap(),
             page.threads
@@ -1471,6 +1528,108 @@ mod tests {
         assert_eq!(watch.wait(60), WatchOutcome::Cancelled);
         assert!((10..=3600).contains(&engine.check_interval_seconds()));
         engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn a_watch_cancelled_before_it_waits_returns_at_once_every_time() {
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "early@example.com");
+        let watch = engine.watch(id.clone()).unwrap();
+        watch.cancel();
+        // Even with a change to say: cancelled comes first.
+        fake.changed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let began = std::time::Instant::now();
+        assert_eq!(watch.wait(3600), WatchOutcome::Cancelled);
+        assert_eq!(watch.wait(3600), WatchOutcome::Cancelled);
+        assert!(began.elapsed() < std::time::Duration::from_millis(500));
+        // A new watch waits again.
+        assert_eq!(
+            engine.watch(id.clone()).unwrap().wait(5),
+            WatchOutcome::Changed
+        );
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn a_password_is_updated_only_for_an_account_with_its_own_servers() {
+        let engine = engine();
+        let refused = |result: Result<Account>| match result {
+            Err(NimbraError::Invalid { .. }) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        refused(engine.update_imap_password("nobody".into(), "secret".into()));
+        // A Gmail account signs in again in the browser.
+        let (gmail, _fake) = fake_account(&engine, "pw-gmail@example.com");
+        refused(engine.update_imap_password(gmail.clone(), "secret".into()));
+        engine.remove_account(gmail).unwrap();
+        let id = mail::new_account_id().unwrap();
+        let servers = servers::Servers {
+            username: "pw@example.com".into(),
+            imap: servers::Server::new("imap.example.com", 993, servers::Security::Tls),
+            smtp: servers::Server::new("smtp.example.com", 465, servers::Security::Tls),
+        };
+        engine
+            .change_settings(|settings| {
+                settings.accounts.push(AccountRef {
+                    id: id.clone(),
+                    email: "pw@example.com".into(),
+                    servers: Some(servers),
+                    oauth: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+        refused(engine.update_imap_password(id.clone(), String::new()));
+        engine.remove_account(id).unwrap();
+    }
+
+    /// Against the local test servers (docs/testing.md): `cargo test -p nimbra-ffi --
+    /// --ignored live`, with NIMBRA_TEST_CA set.
+    #[test]
+    #[ignore]
+    fn live_a_new_password_is_checked_with_both_servers_and_keeps_the_store() {
+        let engine = engine();
+        let user = format!("pw{}@example.org", std::process::id());
+        let servers = MailServers {
+            username: user.clone(),
+            imap: MailServer {
+                host: "localhost".into(),
+                port: 10993,
+                security: ServerSecurity::Tls,
+            },
+            smtp: MailServer {
+                host: "localhost".into(),
+                port: 10587,
+                security: ServerSecurity::StartTls,
+            },
+        };
+        let account = engine
+            .add_imap_account(user.clone(), servers, "pass".into())
+            .unwrap();
+        let open = engine.connect(&account.id).unwrap();
+        open.store.save("kept", &1u32).unwrap();
+        // A refused password names the account and leaves the old one.
+        assert!(matches!(
+            engine.update_imap_password(account.id.clone(), "wrong".into()),
+            Err(NimbraError::SignedOut { account_id: Some(id) }) if id == account.id
+        ));
+        assert_eq!(
+            servers::stored_password(&account.id).unwrap().as_deref(),
+            Some("pass")
+        );
+        let updated = engine
+            .update_imap_password(account.id.clone(), "pass".into())
+            .unwrap();
+        assert_eq!(updated, account);
+        let reopened = engine.connect(&account.id).unwrap();
+        assert!(!Arc::ptr_eq(&open, &reopened), "the connection opens again");
+        assert_eq!(
+            reopened.store.load::<u32>("kept"),
+            Some(1),
+            "the store stays"
+        );
+        engine.remove_account(account.id).unwrap();
     }
 
     #[test]

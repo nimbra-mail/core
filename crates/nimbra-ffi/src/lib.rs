@@ -32,7 +32,7 @@ pub use watching::ChangeWatch;
 
 use nimbra_core::{discover, mail, mime};
 
-/// The engine's version.
+/// The engine's version. Memory only.
 #[uniffi::export]
 pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -40,26 +40,28 @@ pub fn core_version() -> String {
 
 /// Parses one raw RFC 5322 message (a `.eml`): its people, body as text blocks and HTML,
 /// and attachments (whose ids are their position, for this message only). `None` when it
-/// is not a message.
+/// is not a message. Memory only.
 #[uniffi::export]
 pub fn parse_message(raw: Vec<u8>) -> Option<MailMessage> {
     mime::message(&raw, "local").map(|message| MailMessage::from(&message))
 }
 
 /// The servers of a well-known provider for this address, without the network. `None`
-/// when it is not one (then `Engine::discover_servers` asks around).
+/// when it is not one (then `Engine::discover_servers` asks around). Memory only.
 #[uniffi::export]
 pub fn known_servers(email: String) -> Option<Discovery> {
     discover::known(&email).map(Discovery::from)
 }
 
 /// The action that undoes `action`, if there is one (Undo after Done is Move to Inbox).
+/// Memory only.
 #[uniffi::export]
 pub fn undo_action(action: ThreadAction) -> Option<ThreadAction> {
     action.change().inverse().map(ThreadAction::from_change)
 }
 
 /// The times the Snooze menu offers from now: the quick times, then the two reminders.
+/// Memory only.
 #[uniffi::export]
 pub fn snooze_times() -> Vec<SnoozeTime> {
     use nimbra_core::snooze::{self, MenuTime, Quick};
@@ -97,14 +99,14 @@ pub fn snooze_times() -> Vec<SnoozeTime> {
 }
 
 /// A time typed in ("4:30 PM", "16:30", "430p", "noon"), as the Mac reads it: without AM
-/// or PM, 1 to 7 is the afternoon. `None` when it is not a time.
+/// or PM, 1 to 7 is the afternoon. `None` when it is not a time. Memory only.
 #[uniffi::export]
 pub fn parse_time(text: String) -> Option<TimeOfDay> {
     nimbra_core::snooze::parse_time(&text).map(|(hour, minute)| TimeOfDay { hour, minute })
 }
 
 /// When a day picked in a calendar comes back, at a time of day, in the device's time
-/// zone. `None` for a time already gone by (or not on the clock that day).
+/// zone. `None` for a time already gone by (or not on the clock that day). Memory only.
 #[uniffi::export]
 pub fn day_time(year: i32, month: u32, day: u32, time: TimeOfDay) -> Option<i64> {
     let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
@@ -113,13 +115,13 @@ pub fn day_time(year: i32, month: u32, day: u32, time: TimeOfDay) -> Option<i64>
 }
 
 /// How long to wait before each `Engine::learn_contacts` step, so learning addresses never
-/// competes with the mail being read.
+/// competes with the mail being read. Memory only.
 #[uniffi::export]
 pub fn contact_scan_pause_seconds() -> u32 {
     nimbra_core::contacts::SCAN_PAUSE.as_secs() as u32
 }
 
-/// Whether this is one email address, as the engine checks it.
+/// Whether this is one email address, as the engine checks it. Memory only.
 #[uniffi::export]
 pub fn is_email_address(text: String) -> bool {
     mail::is_address(text.trim())

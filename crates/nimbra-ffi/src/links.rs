@@ -29,7 +29,7 @@ pub enum Unsubscribe {
     },
 }
 
-/// A `mailto:` link as a new message, or `None` when it is not one.
+/// A `mailto:` link as a new message, or `None` when it is not one. Memory only.
 #[uniffi::export]
 pub fn parse_mailto(link: String) -> Option<MailtoDraft> {
     let found = mailto::parse(&link)?;
@@ -43,7 +43,7 @@ pub fn parse_mailto(link: String) -> Option<MailtoDraft> {
 }
 
 /// What a list's unsubscribe link asks for, or `None` when it is not valid. A `mailto:`
-/// link gives one address, a subject and a plain body: never a Cc or a Bcc.
+/// link gives one address, a subject and a plain body: never a Cc or a Bcc. Memory only.
 #[uniffi::export]
 pub fn unsubscribe_action(link: String) -> Option<Unsubscribe> {
     let link = link.trim();

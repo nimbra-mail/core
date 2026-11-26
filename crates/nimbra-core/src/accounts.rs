@@ -50,6 +50,18 @@ pub fn imap_connection(
     ))
 }
 
+/// Checks that both of an account's servers take this password, as adding an account
+/// does: IMAP, then SMTP. A refused password is `mail::SignedOut` (not yet any account's)
+/// from IMAP and `smtp::AuthFailed` from SMTP. Blocking (network).
+pub fn check_password(servers: &servers::Servers, password: &str) -> Result<()> {
+    crate::imap_mail::check_login(servers, Credential::Password(password.to_string()))?;
+    crate::smtp::check_login(
+        &servers.smtp,
+        &servers.username,
+        &servers::Secret::Password(password.to_string()),
+    )
+}
+
 /// The connection to a Gmail account from its saved sign-in.
 pub fn gmail_connection(
     config: gmail::Config,

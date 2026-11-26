@@ -59,7 +59,8 @@ impl Engine {
         Ok(entries)
     }
 
-    /// Unread and total threads by label, as last fetched. Disk.
+    /// Unread and total threads by label, as last fetched (see `counts` for what Gmail's
+    /// categories count). Disk.
     pub fn cached_counts(&self, account_id: String) -> Result<Vec<LabelCount>> {
         let open = self.connect(&account_id)?;
         let meta: Meta = open.store.load(listing::META).unwrap_or_default();
@@ -86,7 +87,15 @@ impl Engine {
 
     /// Brings a mailbox up to date and keeps it: from the change feed when the device
     /// knows where it was read last, else by listing its first page afresh (keeping the
-    /// messages already downloaded). Network.
+    /// messages already downloaded).
+    ///
+    /// `threads` is always the whole mailbox as it is now kept, newest first (what
+    /// `cached_threads` returns next): replace the list shown with it, never add it to
+    /// what is shown. After listing afresh, that is its first page; after the change feed,
+    /// every page kept so far (the first and those `load_more` added, up to 300 threads),
+    /// with the changes made. Snoozed and Reminders also have the snoozes kept here.
+    /// `next_page` is where the page after those threads starts: hand it to `load_more`;
+    /// `None` when the server has no more. Nothing is kept when it fails. Network.
     pub fn refresh_mailbox(&self, account_id: String, mailbox: Mailbox) -> Result<ThreadPage> {
         let open = self.connect(&account_id)?;
         let (view, label) = mailbox.view();
@@ -119,7 +128,8 @@ impl Engine {
     }
 
     /// The page after what is listed (`page` is the last `next_page`), kept after it.
-    /// Returns that page's threads. Network.
+    /// Returns only that page's threads, without any already kept: add them after the
+    /// list shown. Network.
     pub fn load_more(
         &self,
         account_id: String,

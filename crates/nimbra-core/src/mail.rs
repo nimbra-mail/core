@@ -901,7 +901,12 @@ pub struct Label {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Summary {
     pub id: String,
+    /// Who the row names: the latest message's sender, or in Sent and Drafts its first
+    /// recipient.
     pub sender: String,
+    /// The address of whoever `sender` names, as written (empty when the message has none).
+    #[serde(default)]
+    pub sender_address: String,
     pub subject: String,
     pub snippet: String,
     pub timestamp_ms: i64,

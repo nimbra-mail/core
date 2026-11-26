@@ -82,7 +82,7 @@ The Swift API, by area (each `Engine` method says in its doc whether it goes to 
 | Area | Calls |
 | --- | --- |
 | Setup | `Engine(config:dataDir:cacheDir:secrets:)`, `flush`, `useDnsResolver` (MX lookups through the system on iOS) |
-| Accounts | `accounts`, `setDefaultAccount`, `begin`/`finishGoogleSignIn`, `begin`/`finishMicrosoftSignIn`, `discoverServers`, `addImapAccount`, `removeAccount` |
+| Accounts | `accounts`, `setDefaultAccount`, `begin`/`finishGoogleSignIn`, `begin`/`finishMicrosoftSignIn`, `discoverServers`, `addImapAccount`, `updateImapPassword`, `removeAccount` |
 | Mailboxes | `mailboxes`, `cachedThreads`, `refreshMailbox`, `loadMore`, `cachedAllInboxes`, `allInboxes`, `search`, `labels`, `counts`, `cachedCounts` |
 | Reading | `readThread`, `cachedThread`, `downloadAttachment`, `fetchRemoteImage`, `parseMailto`, `unsubscribeAction` |
 | Actions | `apply` (queued when offline), `moveToInbox`, `moveToLabel`, `relabel`, label CRUD, `deleteThread`, `blockSender`, `unblockSender` |

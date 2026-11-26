@@ -63,6 +63,7 @@ impl nimbra_core::dns::Resolver for App {
 
 /// From now on, server discovery's MX lookups go to `resolver`. Once per process, before
 /// the first `discover_servers`; the Mac's resolver is used when this is never called.
+/// Memory only.
 #[uniffi::export]
 pub fn use_dns_resolver(resolver: Arc<dyn DnsResolver>) -> Result<()> {
     nimbra_core::dns::set_resolver(Box::new(App(resolver)))

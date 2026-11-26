@@ -13,7 +13,9 @@ use crate::types::*;
 
 /// Waits for an account's server to say something changed. One per watch; cancel it from
 /// any thread, and a wait under way ends within a moment (IMAP: within the current IDLE
-/// slice, at most 30 seconds).
+/// slice, at most 30 seconds). Cancelling is for good: a `wait` after `cancel` (or one
+/// begun before it) returns `Cancelled` at once, every time. To watch again, ask
+/// `Engine::watch` for a new one.
 #[derive(uniffi::Object)]
 pub struct ChangeWatch {
     client: Arc<mail::Client>,
@@ -36,7 +38,8 @@ impl ChangeWatch {
         }
     }
 
-    /// Ends the waiting (the app goes to the background, or the account is left).
+    /// Ends the waiting (the app goes to the background, or the account is left), now and
+    /// for every later `wait`. Never blocks.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
@@ -44,7 +47,8 @@ impl ChangeWatch {
 
 #[uniffi::export]
 impl Engine {
-    /// A watch on the account's server for live updates. Disk and Keychain (it connects).
+    /// A watch on the account's server for live updates. Disk and Keychain (it opens the
+    /// account; the server is first spoken to by `wait`).
     pub fn watch(&self, account_id: String) -> Result<Arc<ChangeWatch>> {
         let open = self.connect(&account_id)?;
         Ok(Arc::new(ChangeWatch {
@@ -54,7 +58,7 @@ impl Engine {
     }
 
     /// How long to wait between two checks for mail, as set in Preferences (10 seconds to
-    /// an hour).
+    /// an hour). Memory only.
     pub fn check_interval_seconds(&self) -> u32 {
         watching::check_interval(self.preferences().check_every_seconds).as_secs() as u32
     }

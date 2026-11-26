@@ -680,12 +680,15 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 /**
  * Waits for an account's server to say something changed. One per watch; cancel it from
  * any thread, and a wait under way ends within a moment (IMAP: within the current IDLE
- * slice, at most 30 seconds).
+ * slice, at most 30 seconds). Cancelling is for good: a `wait` after `cancel` (or one
+ * begun before it) returns `Cancelled` at once, every time. To watch again, ask
+ * `Engine::watch` for a new one.
  */
 public protocol ChangeWatchProtocol: AnyObject, Sendable {
     
     /**
-     * Ends the waiting (the app goes to the background, or the account is left).
+     * Ends the waiting (the app goes to the background, or the account is left), now and
+     * for every later `wait`. Never blocks.
      */
     func cancel() 
     
@@ -701,7 +704,9 @@ public protocol ChangeWatchProtocol: AnyObject, Sendable {
 /**
  * Waits for an account's server to say something changed. One per watch; cancel it from
  * any thread, and a wait under way ends within a moment (IMAP: within the current IDLE
- * slice, at most 30 seconds).
+ * slice, at most 30 seconds). Cancelling is for good: a `wait` after `cancel` (or one
+ * begun before it) returns `Cancelled` at once, every time. To watch again, ask
+ * `Engine::watch` for a new one.
  */
 open class ChangeWatch: ChangeWatchProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -757,7 +762,8 @@ open class ChangeWatch: ChangeWatchProtocol, @unchecked Sendable {
 
     
     /**
-     * Ends the waiting (the app goes to the background, or the account is left).
+     * Ends the waiting (the app goes to the background, or the account is left), now and
+     * for every later `wait`. Never blocks.
      */
 open func cancel()  {try! rustCall() {
         uniffiCallStatus in
@@ -1056,7 +1062,7 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func startAnswer(accountId: String, threadId: String, kind: AnswerKind, dateText: String) throws  -> DraftStart
     
     /**
-     * The accounts on this device, in their order.
+     * The accounts on this device, in their order. Memory only.
      */
     func accounts()  -> [Account]
     
@@ -1067,7 +1073,7 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func addImapAccount(email: String, servers: MailServers, password: String) throws  -> Account
     
     /**
-     * A new, empty signature for the account. Its id.
+     * A new, empty signature for the account. Its id. Disk.
      */
     func addSignature(accountId: String) throws  -> String
     
@@ -1087,14 +1093,14 @@ public protocol EngineProtocol: AnyObject, Sendable {
      * Starts a Google sign-in that comes back to `redirect_uri` (for an iOS client,
      * `com.googleusercontent.apps.<id>:/oauth2redirect`). `account_id` signs in to that
      * account again: no other Google account is then accepted. `full_access` also asks
-     * for deleting for good.
+     * for deleting for good. Memory only: the browser talks to Google.
      */
     func beginGoogleSignIn(redirectUri: String, accountId: String?, fullAccess: Bool) throws  -> SignInRequest
     
     /**
      * Starts a Microsoft sign-in that comes back to `redirect_uri` (for iOS,
      * `msauth.<bundle id>://auth`, as registered). `account_id` signs in to that account
-     * again. `hint` is an address to fill in.
+     * again. `hint` is an address to fill in. Memory only: the browser talks to Microsoft.
      */
     func beginMicrosoftSignIn(redirectUri: String, accountId: String?, hint: String?) throws  -> SignInRequest
     
@@ -1113,7 +1119,7 @@ public protocol EngineProtocol: AnyObject, Sendable {
     
     /**
      * Forgets a sign-in that was started and will not be finished (the user closed the
-     * browser).
+     * browser). Memory only.
      */
     func cancelSignIn(requestId: String) 
     
@@ -1127,11 +1133,16 @@ public protocol EngineProtocol: AnyObject, Sendable {
     
     /**
      * Unread and total threads for these labels ("INBOX", "STARRED", label ids). Network.
+     *
+     * For a Gmail account, Gmail counts each label over all mail, as the Mac shows it:
+     * a Split Inbox category (`CATEGORY_PERSONAL`, `CATEGORY_UPDATES`,
+     * `CATEGORY_PROMOTIONS`, `CATEGORY_SOCIAL`) counts its threads archived out of the
+     * inbox too, so a category's unread number can be more than its list in the inbox
+     * shows. "INBOX" counts only the inbox.
      */
     func counts(accountId: String, labelIds: [String]) throws  -> [LabelCount]
     
     /**
-     * Network.
      * A new label, unless one is already called that (in any case): then that one, as on
      * the Mac. Network (disk when it exists).
      */
@@ -1147,6 +1158,9 @@ public protocol EngineProtocol: AnyObject, Sendable {
      */
     func deleteLabel(accountId: String, labelId: String) throws 
     
+    /**
+     * Deletes a signature, and its place as any default. Disk.
+     */
     func deleteSignature(signatureId: String) throws 
     
     /**
@@ -1184,7 +1198,7 @@ public protocol EngineProtocol: AnyObject, Sendable {
     
     /**
      * Writes what is waiting to be written (settings, stores), for a few seconds at most:
-     * call it when the app goes to the background. Whether everything is on disk.
+     * call it when the app goes to the background. Whether everything is on disk. Disk.
      */
     func flush()  -> Bool
     
@@ -1203,7 +1217,7 @@ public protocol EngineProtocol: AnyObject, Sendable {
     
     /**
      * When an opened thread counts as read (Preferences): at once (0), after a moment, or
-     * only when the user says so (`None`).
+     * only when the user says so (`None`). Memory only.
      */
     func markReadAfterMs()  -> UInt32?
     
@@ -1220,6 +1234,9 @@ public protocol EngineProtocol: AnyObject, Sendable {
      */
     func moveToLabel(accountId: String, threadId: String, labelId: String, from: Mailbox) throws 
     
+    /**
+     * The preferences, as set. Memory only.
+     */
     func preferences()  -> Preferences
     
     /**
@@ -1249,15 +1266,24 @@ public protocol EngineProtocol: AnyObject, Sendable {
      */
     func search(accountId: String, query: String, page: String?, limit: UInt32) throws  -> ThreadPage
     
+    /**
+     * The account new messages are from unless another is picked. Disk.
+     */
     func setDefaultAccount(accountId: String) throws 
     
     /**
-     * `None`: no signature by default.
+     * `None`: no signature by default. Disk.
      */
     func setDefaultSignature(accountId: String, signatureId: String?) throws 
     
+    /**
+     * Changes the preferences and saves them. Disk.
+     */
     func setPreferences(preferences: Preferences) throws 
     
+    /**
+     * The account's signatures, and which one is its default. Memory only.
+     */
     func signatures(accountId: String)  -> [SignatureInfo]
     
     /**
@@ -1297,7 +1323,19 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func unsnooze(accountId: String, threadId: String) throws 
     
     /**
+     * Signs in to an account with its own servers again, with a new password (it was
+     * changed, or the server stopped taking the old one: `SignedOut`). Checks that both
+     * servers take it, as `add_imap_account` does, then keeps it in the Keychain in place
+     * of the old one; the account keeps its id, its stored mail, its signatures and
+     * whatever waits to be sent. A refused password is `SignedOut` for this account, and
+     * the old one is kept. Not for Gmail or Microsoft accounts, which sign in again in
+     * the browser. Network.
+     */
+    func updateImapPassword(accountId: String, password: String) throws  -> Account
+    
+    /**
      * Changes a signature. Its HTML is cleaned before it is kept (`signature::clean`).
+     * Disk.
      */
     func updateSignature(signatureId: String, name: String, html: String) throws 
     
@@ -1323,7 +1361,8 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func cachedAllInboxes() throws  -> [ThreadRow]
     
     /**
-     * Unread and total threads by label, as last fetched. Disk.
+     * Unread and total threads by label, as last fetched (see `counts` for what Gmail's
+     * categories count). Disk.
      */
     func cachedCounts(accountId: String) throws  -> [LabelCount]
     
@@ -1341,7 +1380,8 @@ public protocol EngineProtocol: AnyObject, Sendable {
     
     /**
      * The page after what is listed (`page` is the last `next_page`), kept after it.
-     * Returns that page's threads. Network.
+     * Returns only that page's threads, without any already kept: add them after the
+     * list shown. Network.
      */
     func loadMore(accountId: String, mailbox: Mailbox, page: String) throws  -> ThreadPage
     
@@ -1362,7 +1402,15 @@ public protocol EngineProtocol: AnyObject, Sendable {
     /**
      * Brings a mailbox up to date and keeps it: from the change feed when the device
      * knows where it was read last, else by listing its first page afresh (keeping the
-     * messages already downloaded). Network.
+     * messages already downloaded).
+     *
+     * `threads` is always the whole mailbox as it is now kept, newest first (what
+     * `cached_threads` returns next): replace the list shown with it, never add it to
+     * what is shown. After listing afresh, that is its first page; after the change feed,
+     * every page kept so far (the first and those `load_more` added, up to 300 threads),
+     * with the changes made. Snoozed and Reminders also have the snoozes kept here.
+     * `next_page` is where the page after those threads starts: hand it to `load_more`;
+     * `None` when the server has no more. Nothing is kept when it fails. Network.
      */
     func refreshMailbox(accountId: String, mailbox: Mailbox) throws  -> ThreadPage
     
@@ -1421,17 +1469,19 @@ public protocol EngineProtocol: AnyObject, Sendable {
     
     /**
      * A message `deliver` left waiting for the connection: `catch_up` sends it.
+     * Memory only.
      */
     func waitForConnection(send: OutgoingSend) 
     
     /**
      * How long to wait between two checks for mail, as set in Preferences (10 seconds to
-     * an hour).
+     * an hour). Memory only.
      */
     func checkIntervalSeconds()  -> UInt32
     
     /**
-     * A watch on the account's server for live updates. Disk and Keychain (it connects).
+     * A watch on the account's server for live updates. Disk and Keychain (it opens the
+     * account; the server is first spoken to by `wait`).
      */
     func watch(accountId: String) throws  -> ChangeWatch
     
@@ -1531,7 +1581,7 @@ open func startAnswer(accountId: String, threadId: String, kind: AnswerKind, dat
 }
     
     /**
-     * The accounts on this device, in their order.
+     * The accounts on this device, in their order. Memory only.
      */
 open func accounts() -> [Account]  {
     return try!  FfiConverterSequenceTypeAccount.lift(try! rustCall() {
@@ -1559,7 +1609,7 @@ open func addImapAccount(email: String, servers: MailServers, password: String)t
 }
     
     /**
-     * A new, empty signature for the account. Its id.
+     * A new, empty signature for the account. Its id. Disk.
      */
 open func addSignature(accountId: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -1604,7 +1654,7 @@ open func badgeCount()throws  -> UInt32  {
      * Starts a Google sign-in that comes back to `redirect_uri` (for an iOS client,
      * `com.googleusercontent.apps.<id>:/oauth2redirect`). `account_id` signs in to that
      * account again: no other Google account is then accepted. `full_access` also asks
-     * for deleting for good.
+     * for deleting for good. Memory only: the browser talks to Google.
      */
 open func beginGoogleSignIn(redirectUri: String, accountId: String?, fullAccess: Bool)throws  -> SignInRequest  {
     return try  FfiConverterTypeSignInRequest_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -1621,7 +1671,7 @@ open func beginGoogleSignIn(redirectUri: String, accountId: String?, fullAccess:
     /**
      * Starts a Microsoft sign-in that comes back to `redirect_uri` (for iOS,
      * `msauth.<bundle id>://auth`, as registered). `account_id` signs in to that account
-     * again. `hint` is an address to fill in.
+     * again. `hint` is an address to fill in. Memory only: the browser talks to Microsoft.
      */
 open func beginMicrosoftSignIn(redirectUri: String, accountId: String?, hint: String?)throws  -> SignInRequest  {
     return try  FfiConverterTypeSignInRequest_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -1668,7 +1718,7 @@ open func blockedSenders(accountId: String)throws  -> [String]  {
     
     /**
      * Forgets a sign-in that was started and will not be finished (the user closed the
-     * browser).
+     * browser). Memory only.
      */
 open func cancelSignIn(requestId: String)  {try! rustCall() {
         uniffiCallStatus in
@@ -1698,6 +1748,12 @@ open func checkForChanges(accountId: String, cursor: String?)throws  -> SyncResu
     
     /**
      * Unread and total threads for these labels ("INBOX", "STARRED", label ids). Network.
+     *
+     * For a Gmail account, Gmail counts each label over all mail, as the Mac shows it:
+     * a Split Inbox category (`CATEGORY_PERSONAL`, `CATEGORY_UPDATES`,
+     * `CATEGORY_PROMOTIONS`, `CATEGORY_SOCIAL`) counts its threads archived out of the
+     * inbox too, so a category's unread number can be more than its list in the inbox
+     * shows. "INBOX" counts only the inbox.
      */
 open func counts(accountId: String, labelIds: [String])throws  -> [LabelCount]  {
     return try  FfiConverterSequenceTypeLabelCount.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -1711,7 +1767,6 @@ open func counts(accountId: String, labelIds: [String])throws  -> [LabelCount]  
 }
     
     /**
-     * Network.
      * A new label, unless one is already called that (in any case): then that one, as on
      * the Mac. Network (disk when it exists).
      */
@@ -1752,6 +1807,9 @@ open func deleteLabel(accountId: String, labelId: String)throws   {try rustCallW
 }
 }
     
+    /**
+     * Deletes a signature, and its place as any default. Disk.
+     */
 open func deleteSignature(signatureId: String)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_delete_signature(
@@ -1849,7 +1907,7 @@ open func finishMicrosoftSignIn(requestId: String, callbackUrl: String)throws  -
     
     /**
      * Writes what is waiting to be written (settings, stores), for a few seconds at most:
-     * call it when the app goes to the background. Whether everything is on disk.
+     * call it when the app goes to the background. Whether everything is on disk. Disk.
      */
 open func flush() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -1891,7 +1949,7 @@ open func learnContacts(accountId: String)throws  -> Bool  {
     
     /**
      * When an opened thread counts as read (Preferences): at once (0), after a moment, or
-     * only when the user says so (`None`).
+     * only when the user says so (`None`). Memory only.
      */
 open func markReadAfterMs() -> UInt32?  {
     return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
@@ -1935,6 +1993,9 @@ open func moveToLabel(accountId: String, threadId: String, labelId: String, from
 }
 }
     
+    /**
+     * The preferences, as set. Memory only.
+     */
 open func preferences() -> Preferences  {
     return try!  FfiConverterTypePreferences_lift(try! rustCall() {
         uniffiCallStatus in
@@ -2018,6 +2079,9 @@ open func search(accountId: String, query: String, page: String?, limit: UInt32)
 })
 }
     
+    /**
+     * The account new messages are from unless another is picked. Disk.
+     */
 open func setDefaultAccount(accountId: String)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_set_default_account(
@@ -2028,7 +2092,7 @@ open func setDefaultAccount(accountId: String)throws   {try rustCallWithError(Ff
 }
     
     /**
-     * `None`: no signature by default.
+     * `None`: no signature by default. Disk.
      */
 open func setDefaultSignature(accountId: String, signatureId: String?)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
@@ -2040,6 +2104,9 @@ open func setDefaultSignature(accountId: String, signatureId: String?)throws   {
 }
 }
     
+    /**
+     * Changes the preferences and saves them. Disk.
+     */
 open func setPreferences(preferences: Preferences)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_set_preferences(
@@ -2049,6 +2116,9 @@ open func setPreferences(preferences: Preferences)throws   {try rustCallWithErro
 }
 }
     
+    /**
+     * The account's signatures, and which one is its default. Memory only.
+     */
 open func signatures(accountId: String) -> [SignatureInfo]  {
     return try!  FfiConverterSequenceTypeSignatureInfo.lift(try! rustCall() {
         uniffiCallStatus in
@@ -2150,7 +2220,28 @@ open func unsnooze(accountId: String, threadId: String)throws   {try rustCallWit
 }
     
     /**
+     * Signs in to an account with its own servers again, with a new password (it was
+     * changed, or the server stopped taking the old one: `SignedOut`). Checks that both
+     * servers take it, as `add_imap_account` does, then keeps it in the Keychain in place
+     * of the old one; the account keeps its id, its stored mail, its signatures and
+     * whatever waits to be sent. A refused password is `SignedOut` for this account, and
+     * the old one is kept. Not for Gmail or Microsoft accounts, which sign in again in
+     * the browser. Network.
+     */
+open func updateImapPassword(accountId: String, password: String)throws  -> Account  {
+    return try  FfiConverterTypeAccount_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_update_imap_password(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(password),uniffiCallStatus
+    )
+})
+}
+    
+    /**
      * Changes a signature. Its HTML is cleaned before it is kept (`signature::clean`).
+     * Disk.
      */
 open func updateSignature(signatureId: String, name: String, html: String)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
@@ -2208,7 +2299,8 @@ open func cachedAllInboxes()throws  -> [ThreadRow]  {
 }
     
     /**
-     * Unread and total threads by label, as last fetched. Disk.
+     * Unread and total threads by label, as last fetched (see `counts` for what Gmail's
+     * categories count). Disk.
      */
 open func cachedCounts(accountId: String)throws  -> [LabelCount]  {
     return try  FfiConverterSequenceTypeLabelCount.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -2252,7 +2344,8 @@ open func cachedThreads(accountId: String, mailbox: Mailbox)throws  -> [ThreadRo
     
     /**
      * The page after what is listed (`page` is the last `next_page`), kept after it.
-     * Returns that page's threads. Network.
+     * Returns only that page's threads, without any already kept: add them after the
+     * list shown. Network.
      */
 open func loadMore(accountId: String, mailbox: Mailbox, page: String)throws  -> ThreadPage  {
     return try  FfiConverterTypeThreadPage_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -2300,7 +2393,15 @@ open func readThread(accountId: String, threadId: String)throws  -> MailThread  
     /**
      * Brings a mailbox up to date and keeps it: from the change feed when the device
      * knows where it was read last, else by listing its first page afresh (keeping the
-     * messages already downloaded). Network.
+     * messages already downloaded).
+     *
+     * `threads` is always the whole mailbox as it is now kept, newest first (what
+     * `cached_threads` returns next): replace the list shown with it, never add it to
+     * what is shown. After listing afresh, that is its first page; after the change feed,
+     * every page kept so far (the first and those `load_more` added, up to 300 threads),
+     * with the changes made. Snoozed and Reminders also have the snoozes kept here.
+     * `next_page` is where the page after those threads starts: hand it to `load_more`;
+     * `None` when the server has no more. Nothing is kept when it fails. Network.
      */
 open func refreshMailbox(accountId: String, mailbox: Mailbox)throws  -> ThreadPage  {
     return try  FfiConverterTypeThreadPage_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -2437,6 +2538,7 @@ open func unsent(accountId: String)throws  -> UnsentReport  {
     
     /**
      * A message `deliver` left waiting for the connection: `catch_up` sends it.
+     * Memory only.
      */
 open func waitForConnection(send: OutgoingSend)  {try! rustCall() {
         uniffiCallStatus in
@@ -2449,7 +2551,7 @@ open func waitForConnection(send: OutgoingSend)  {try! rustCall() {
     
     /**
      * How long to wait between two checks for mail, as set in Preferences (10 seconds to
-     * an hour).
+     * an hour). Memory only.
      */
 open func checkIntervalSeconds() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
@@ -2461,7 +2563,8 @@ open func checkIntervalSeconds() -> UInt32  {
 }
     
     /**
-     * A watch on the account's server for live updates. Disk and Keychain (it connects).
+     * A watch on the account's server for live updates. Disk and Keychain (it opens the
+     * account; the server is first spoken to by `wait`).
      */
 open func watch(accountId: String)throws  -> ChangeWatch  {
     return try  FfiConverterTypeChangeWatch_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -2528,6 +2631,9 @@ public func FfiConverterTypeEngine_lift(_ handle: UInt64) throws -> Engine {
  */
 public protocol OutgoingSendProtocol: AnyObject, Sendable {
     
+    /**
+     * The account it is sent from. Memory only.
+     */
     func accountId()  -> String
     
     /**
@@ -2539,7 +2645,7 @@ public protocol OutgoingSendProtocol: AnyObject, Sendable {
     func deliver()  -> SendOutcome
     
     /**
-     * When the undo time is over and it is to be handed over (`deliver`).
+     * When the undo time is over and it is to be handed over (`deliver`). Memory only.
      */
     func deliverAtMs()  -> Int64
     
@@ -2549,12 +2655,12 @@ public protocol OutgoingSendProtocol: AnyObject, Sendable {
     func discard()  -> Bool
     
     /**
-     * Whether it is kept on the device (so quitting cannot lose it).
+     * Whether it is kept on the device (so quitting cannot lose it). Memory only.
      */
     func isKept()  -> Bool
     
     /**
-     * The message as it is now, to show again after Undo.
+     * The message as it is now, to show again after Undo. Memory only.
      */
     func message()  -> OutgoingMessage
     
@@ -2564,13 +2670,19 @@ public protocol OutgoingSendProtocol: AnyObject, Sendable {
      */
     func saveToDrafts()  -> String?
     
+    /**
+     * Where it is on its way. Memory only.
+     */
     func stage()  -> SendStage
     
+    /**
+     * Its subject, for a notice. Memory only.
+     */
     func subject()  -> String
     
     /**
      * Undo send, or taking a refused message back to edit: nothing is left of it on the
-     * device. Whether it was taken back (not once it has left).
+     * device. Whether it was taken back (not once it has left). Disk.
      */
     func undo()  -> Bool
     
@@ -2631,6 +2743,9 @@ open class OutgoingSend: OutgoingSendProtocol, @unchecked Sendable {
     
 
     
+    /**
+     * The account it is sent from. Memory only.
+     */
 open func accountId() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
         uniffiCallStatus in
@@ -2656,7 +2771,7 @@ open func deliver() -> SendOutcome  {
 }
     
     /**
-     * When the undo time is over and it is to be handed over (`deliver`).
+     * When the undo time is over and it is to be handed over (`deliver`). Memory only.
      */
 open func deliverAtMs() -> Int64  {
     return try!  FfiConverterInt64.lift(try! rustCall() {
@@ -2680,7 +2795,7 @@ open func discard() -> Bool  {
 }
     
     /**
-     * Whether it is kept on the device (so quitting cannot lose it).
+     * Whether it is kept on the device (so quitting cannot lose it). Memory only.
      */
 open func isKept() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -2692,7 +2807,7 @@ open func isKept() -> Bool  {
 }
     
     /**
-     * The message as it is now, to show again after Undo.
+     * The message as it is now, to show again after Undo. Memory only.
      */
 open func message() -> OutgoingMessage  {
     return try!  FfiConverterTypeOutgoingMessage_lift(try! rustCall() {
@@ -2716,6 +2831,9 @@ open func saveToDrafts() -> String?  {
 })
 }
     
+    /**
+     * Where it is on its way. Memory only.
+     */
 open func stage() -> SendStage  {
     return try!  FfiConverterTypeSendStage_lift(try! rustCall() {
         uniffiCallStatus in
@@ -2725,6 +2843,9 @@ open func stage() -> SendStage  {
 })
 }
     
+    /**
+     * Its subject, for a notice. Memory only.
+     */
 open func subject() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
         uniffiCallStatus in
@@ -2736,7 +2857,7 @@ open func subject() -> String  {
     
     /**
      * Undo send, or taking a refused message back to edit: nothing is left of it on the
-     * device. Whether it was taken back (not once it has left).
+     * device. Whether it was taken back (not once it has left). Disk.
      */
 open func undo() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -5521,17 +5642,27 @@ public func FfiConverterTypeTextSpan_lift(_ buf: RustBuffer) throws -> TextSpan 
 
 
 public struct ThreadPage: Equatable, Hashable {
+    /**
+     * `refresh_mailbox`: the whole list as kept, to show in place of the one shown.
+     * `load_more` and `search`: one page, to add after what is shown.
+     */
     public var threads: [ThreadRow]
     /**
-     * Hand back to get the next page; `None` at the end.
+     * Where the page after these threads starts: hand it to `load_more` (or `search`);
+     * `None` at the end.
      */
     public var nextPage: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(threads: [ThreadRow], 
+    public init(
         /**
-         * Hand back to get the next page; `None` at the end.
+         * `refresh_mailbox`: the whole list as kept, to show in place of the one shown.
+         * `load_more` and `search`: one page, to add after what is shown.
+         */threads: [ThreadRow], 
+        /**
+         * Where the page after these threads starts: hand it to `load_more` (or `search`);
+         * `None` at the end.
          */nextPage: String?) {
         self.threads = threads
         self.nextPage = nextPage
@@ -5589,7 +5720,17 @@ public struct ThreadRow: Equatable, Hashable {
      * The account it is in, when the list mixes accounts (All inboxes).
      */
     public var accountId: String?
+    /**
+     * Who the row names: the latest message's sender, or in Sent and Drafts its first
+     * recipient.
+     */
     public var sender: String
+    /**
+     * The address of whoever `sender` names, for the avatar's tone and a quick reply
+     * before the thread is read. `None` when it has none that is an address, and for a
+     * row kept by 0.1.0 until its thread changes.
+     */
+    public var senderAddress: String?
     public var subject: String
     public var snippet: String
     public var timestampMs: Int64
@@ -5614,7 +5755,16 @@ public struct ThreadRow: Equatable, Hashable {
     public init(id: String, 
         /**
          * The account it is in, when the list mixes accounts (All inboxes).
-         */accountId: String?, sender: String, subject: String, snippet: String, timestampMs: Int64, messageCount: UInt32, unread: Bool, starred: Bool, 
+         */accountId: String?, 
+        /**
+         * Who the row names: the latest message's sender, or in Sent and Drafts its first
+         * recipient.
+         */sender: String, 
+        /**
+         * The address of whoever `sender` names, for the avatar's tone and a quick reply
+         * before the thread is read. `None` when it has none that is an address, and for a
+         * row kept by 0.1.0 until its thread changes.
+         */senderAddress: String?, subject: String, snippet: String, timestampMs: Int64, messageCount: UInt32, unread: Bool, starred: Bool, 
         /**
          * Every label on any of its messages ("INBOX", "STARRED", label ids).
          */labels: [String], 
@@ -5627,6 +5777,7 @@ public struct ThreadRow: Equatable, Hashable {
         self.id = id
         self.accountId = accountId
         self.sender = sender
+        self.senderAddress = senderAddress
         self.subject = subject
         self.snippet = snippet
         self.timestampMs = timestampMs
@@ -5657,6 +5808,7 @@ public struct FfiConverterTypeThreadRow: FfiConverterRustBuffer {
                 id: FfiConverterString.read(from: &buf), 
                 accountId: FfiConverterOptionString.read(from: &buf), 
                 sender: FfiConverterString.read(from: &buf), 
+                senderAddress: FfiConverterOptionString.read(from: &buf), 
                 subject: FfiConverterString.read(from: &buf), 
                 snippet: FfiConverterString.read(from: &buf), 
                 timestampMs: FfiConverterInt64.read(from: &buf), 
@@ -5673,6 +5825,7 @@ public struct FfiConverterTypeThreadRow: FfiConverterRustBuffer {
         FfiConverterString.write(value.id, into: &buf)
         FfiConverterOptionString.write(value.accountId, into: &buf)
         FfiConverterString.write(value.sender, into: &buf)
+        FfiConverterOptionString.write(value.senderAddress, into: &buf)
         FfiConverterString.write(value.subject, into: &buf)
         FfiConverterString.write(value.snippet, into: &buf)
         FfiConverterInt64.write(value.timestampMs, into: &buf)
@@ -6743,9 +6896,14 @@ enum NimbraError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
     
     
     /**
-     * The account's sign-in is gone (revoked, expired): sign in again.
+     * A sign-in or password was not taken. `account_id` is the account on this device
+     * whose sign-in is gone (revoked, expired, the password changed): sign in to it again
+     * (`begin_google_sign_in` or `begin_microsoft_sign_in` with its id, or
+     * `update_imap_password`). `None` when it is not yet any account's: the address being
+     * added (`add_imap_account`, a new account's `finish_*_sign_in`) did not take it, and
+     * nothing was kept. Never an email address.
      */
-    case SignedOut(account: String
+    case SignedOut(accountId: String?
     )
     /**
      * No connection to the server.
@@ -6808,7 +6966,7 @@ public struct FfiConverterTypeNimbraError: FfiConverterRustBuffer {
 
         
         case 1: return .SignedOut(
-            account: try FfiConverterString.read(from: &buf)
+            accountId: try FfiConverterOptionString.read(from: &buf)
             )
         case 2: return .Offline
         case 3: return .NotFound
@@ -6835,9 +6993,9 @@ public struct FfiConverterTypeNimbraError: FfiConverterRustBuffer {
 
         
         
-        case let .SignedOut(account):
+        case let .SignedOut(accountId):
             writeInt(&buf, Int32(1))
-            FfiConverterString.write(account, into: &buf)
+            FfiConverterOptionString.write(accountId, into: &buf)
             
         
         case .Offline:
@@ -8672,7 +8830,7 @@ fileprivate struct FfiConverterSequenceTypeThreadRow: FfiConverterRustBuffer {
 }
 /**
  * How long to wait before each `Engine::learn_contacts` step, so learning addresses never
- * competes with the mail being read.
+ * competes with the mail being read. Memory only.
  */
 public func contactScanPauseSeconds() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
@@ -8682,7 +8840,7 @@ public func contactScanPauseSeconds() -> UInt32  {
 })
 }
 /**
- * The engine's version.
+ * The engine's version. Memory only.
  */
 public func coreVersion() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -8693,7 +8851,7 @@ public func coreVersion() -> String  {
 }
 /**
  * When a day picked in a calendar comes back, at a time of day, in the device's time
- * zone. `None` for a time already gone by (or not on the clock that day).
+ * zone. `None` for a time already gone by (or not on the clock that day). Memory only.
  */
 public func dayTime(year: Int32, month: UInt32, day: UInt32, time: TimeOfDay) -> Int64?  {
     return try!  FfiConverterOptionInt64.lift(try! rustCall() {
@@ -8707,7 +8865,7 @@ public func dayTime(year: Int32, month: UInt32, day: UInt32, time: TimeOfDay) ->
 })
 }
 /**
- * Whether this is one email address, as the engine checks it.
+ * Whether this is one email address, as the engine checks it. Memory only.
  */
 public func isEmailAddress(text: String) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -8719,7 +8877,7 @@ public func isEmailAddress(text: String) -> Bool  {
 }
 /**
  * The servers of a well-known provider for this address, without the network. `None`
- * when it is not one (then `Engine::discover_servers` asks around).
+ * when it is not one (then `Engine::discover_servers` asks around). Memory only.
  */
 public func knownServers(email: String) -> Discovery?  {
     return try!  FfiConverterOptionTypeDiscovery.lift(try! rustCall() {
@@ -8732,7 +8890,7 @@ public func knownServers(email: String) -> Discovery?  {
 /**
  * Parses one raw RFC 5322 message (a `.eml`): its people, body as text blocks and HTML,
  * and attachments (whose ids are their position, for this message only). `None` when it
- * is not a message.
+ * is not a message. Memory only.
  */
 public func parseMessage(raw: Data) -> MailMessage?  {
     return try!  FfiConverterOptionTypeMailMessage.lift(try! rustCall() {
@@ -8744,7 +8902,7 @@ public func parseMessage(raw: Data) -> MailMessage?  {
 }
 /**
  * A time typed in ("4:30 PM", "16:30", "430p", "noon"), as the Mac reads it: without AM
- * or PM, 1 to 7 is the afternoon. `None` when it is not a time.
+ * or PM, 1 to 7 is the afternoon. `None` when it is not a time. Memory only.
  */
 public func parseTime(text: String) -> TimeOfDay?  {
     return try!  FfiConverterOptionTypeTimeOfDay.lift(try! rustCall() {
@@ -8756,6 +8914,7 @@ public func parseTime(text: String) -> TimeOfDay?  {
 }
 /**
  * The times the Snooze menu offers from now: the quick times, then the two reminders.
+ * Memory only.
  */
 public func snoozeTimes() -> [SnoozeTime]  {
     return try!  FfiConverterSequenceTypeSnoozeTime.lift(try! rustCall() {
@@ -8766,6 +8925,7 @@ public func snoozeTimes() -> [SnoozeTime]  {
 }
 /**
  * The action that undoes `action`, if there is one (Undo after Done is Move to Inbox).
+ * Memory only.
  */
 public func undoAction(action: ThreadAction) -> ThreadAction?  {
     return try!  FfiConverterOptionTypeThreadAction.lift(try! rustCall() {
@@ -8778,7 +8938,7 @@ public func undoAction(action: ThreadAction) -> ThreadAction?  {
 /**
  * The HTML part of an outgoing message, as the Mac sends it: what was written, the
  * signature (already cleaned: a `SignatureInfo`'s HTML) in its own block, then the quoted
- * earlier message (as text) in the usual quote block.
+ * earlier message (as text) in the usual quote block. Memory only.
  */
 public func messageHtml(written: String, signature: String?, quoted: String?) -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -8793,7 +8953,7 @@ public func messageHtml(written: String, signature: String?, quoted: String?) ->
 /**
  * A saved draft's HTML taken apart again: what was written (without the quote) and the
  * signature it was saved with. `None` for what was written when the HTML has no quote
- * block: then all of it was written.
+ * block: then all of it was written. Memory only.
  */
 public func splitDraftHtml(html: String) -> DraftParts  {
     return try!  FfiConverterTypeDraftParts_lift(try! rustCall() {
@@ -8804,7 +8964,7 @@ public func splitDraftHtml(html: String) -> DraftParts  {
 })
 }
 /**
- * Text as the editor's HTML: escaped, a `<div>` per line.
+ * Text as the editor's HTML: escaped, a `<div>` per line. Memory only.
  */
 public func textToHtml(text: String) -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -8817,6 +8977,7 @@ public func textToHtml(text: String) -> String  {
 /**
  * From now on, server discovery's MX lookups go to `resolver`. Once per process, before
  * the first `discover_servers`; the Mac's resolver is used when this is never called.
+ * Memory only.
  */
 public func useDnsResolver(resolver: DnsResolver)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
@@ -8839,7 +9000,7 @@ public func fetchRemoteImage(url: String)throws  -> Data  {
 })
 }
 /**
- * A `mailto:` link as a new message, or `None` when it is not one.
+ * A `mailto:` link as a new message, or `None` when it is not one. Memory only.
  */
 public func parseMailto(link: String) -> MailtoDraft?  {
     return try!  FfiConverterOptionTypeMailtoDraft.lift(try! rustCall() {
@@ -8851,7 +9012,7 @@ public func parseMailto(link: String) -> MailtoDraft?  {
 }
 /**
  * What a list's unsubscribe link asks for, or `None` when it is not valid. A `mailto:`
- * link gives one address, a subject and a plain body: never a Cc or a Bcc.
+ * link gives one address, a subject and a plain body: never a Cc or a Bcc. Memory only.
  */
 public func unsubscribeAction(link: String) -> Unsubscribe?  {
     return try!  FfiConverterOptionTypeUnsubscribe.lift(try! rustCall() {
@@ -8862,7 +9023,7 @@ public func unsubscribeAction(link: String) -> Unsubscribe?  {
 })
 }
 /**
- * The times Send later offers from now.
+ * The times Send later offers from now. Memory only.
  */
 public func sendLaterTimes() -> [SendLaterTime]  {
     return try!  FfiConverterSequenceTypeSendLaterTime.lift(try! rustCall() {
@@ -8887,55 +9048,55 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_contact_scan_pause_seconds() != 20255) {
+    if (uniffi_nimbra_ffi_checksum_func_contact_scan_pause_seconds() != 37713) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_core_version() != 64925) {
+    if (uniffi_nimbra_ffi_checksum_func_core_version() != 19305) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_day_time() != 38562) {
+    if (uniffi_nimbra_ffi_checksum_func_day_time() != 16230) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_is_email_address() != 5953) {
+    if (uniffi_nimbra_ffi_checksum_func_is_email_address() != 2153) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_known_servers() != 14124) {
+    if (uniffi_nimbra_ffi_checksum_func_known_servers() != 39027) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_parse_message() != 28834) {
+    if (uniffi_nimbra_ffi_checksum_func_parse_message() != 48980) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_parse_time() != 13730) {
+    if (uniffi_nimbra_ffi_checksum_func_parse_time() != 53058) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_snooze_times() != 57400) {
+    if (uniffi_nimbra_ffi_checksum_func_snooze_times() != 49777) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_undo_action() != 45541) {
+    if (uniffi_nimbra_ffi_checksum_func_undo_action() != 19290) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_message_html() != 46899) {
+    if (uniffi_nimbra_ffi_checksum_func_message_html() != 47596) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_split_draft_html() != 41520) {
+    if (uniffi_nimbra_ffi_checksum_func_split_draft_html() != 17313) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_text_to_html() != 31354) {
+    if (uniffi_nimbra_ffi_checksum_func_text_to_html() != 625) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_use_dns_resolver() != 28685) {
+    if (uniffi_nimbra_ffi_checksum_func_use_dns_resolver() != 11421) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_func_fetch_remote_image() != 62596) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_parse_mailto() != 46464) {
+    if (uniffi_nimbra_ffi_checksum_func_parse_mailto() != 14637) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_unsubscribe_action() != 10339) {
+    if (uniffi_nimbra_ffi_checksum_func_unsubscribe_action() != 44116) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_send_later_times() != 47842) {
+    if (uniffi_nimbra_ffi_checksum_func_send_later_times() != 41834) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_dnsresolver_mx() != 59546) {
@@ -8944,13 +9105,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_start_answer() != 5046) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_accounts() != 65131) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_accounts() != 52599) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_add_imap_account() != 59495) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_add_signature() != 55864) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_add_signature() != 16943) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_apply() != 56858) {
@@ -8959,10 +9120,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_badge_count() != 44853) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_begin_google_sign_in() != 46043) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_begin_google_sign_in() != 22136) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_begin_microsoft_sign_in() != 16895) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_begin_microsoft_sign_in() != 55953) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_block_sender() != 32514) {
@@ -8971,16 +9132,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_blocked_senders() != 59366) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_cancel_sign_in() != 60203) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_cancel_sign_in() != 46164) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_check_for_changes() != 59707) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_counts() != 64508) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_counts() != 59907) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_create_label() != 43678) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_create_label() != 16857) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_delete_draft() != 54643) {
@@ -8989,7 +9150,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_delete_label() != 31199) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_delete_signature() != 47881) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_delete_signature() != 58118) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_delete_thread() != 47410) {
@@ -9010,7 +9171,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_finish_microsoft_sign_in() != 54643) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_flush() != 23334) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_flush() != 63158) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_labels() != 15581) {
@@ -9019,7 +9180,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_learn_contacts() != 29216) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_mark_read_after_ms() != 6291) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_mark_read_after_ms() != 11725) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_move_to_inbox() != 33154) {
@@ -9028,7 +9189,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_move_to_label() != 36179) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_preferences() != 64449) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_preferences() != 26919) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_relabel() != 26244) {
@@ -9046,16 +9207,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_search() != 49027) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_set_default_account() != 19574) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_set_default_account() != 47931) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_set_default_signature() != 9013) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_set_default_signature() != 485) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_set_preferences() != 10557) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_set_preferences() != 18405) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_signatures() != 25188) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_signatures() != 3737) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_snooze() != 32435) {
@@ -9076,7 +9237,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_unsnooze() != 7764) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_update_signature() != 31573) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_update_imap_password() != 12633) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_update_signature() != 53585) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_wake_due() != 52554) {
@@ -9088,7 +9252,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_cached_all_inboxes() != 43383) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_cached_counts() != 59691) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_cached_counts() != 424) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_cached_thread() != 43404) {
@@ -9097,7 +9261,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_cached_threads() != 14555) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_load_more() != 56523) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_load_more() != 24459) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_mailboxes() != 9049) {
@@ -9106,7 +9270,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_read_thread() != 31198) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_refresh_mailbox() != 56207) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_refresh_mailbox() != 59008) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_cancel_scheduled() != 22653) {
@@ -9133,13 +9297,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_unsent() != 21657) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_wait_for_connection() != 12110) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_wait_for_connection() != 47733) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_check_interval_seconds() != 63096) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_check_interval_seconds() != 15347) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_watch() != 30987) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_watch() != 41545) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_secretstore_get() != 9776) {
@@ -9151,37 +9315,37 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_secretstore_delete() != 31798) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_account_id() != 29045) {
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_account_id() != 23719) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_outgoingsend_deliver() != 5310) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_deliver_at_ms() != 23423) {
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_deliver_at_ms() != 41948) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_outgoingsend_discard() != 39897) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_is_kept() != 14266) {
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_is_kept() != 15055) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_message() != 24415) {
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_message() != 46139) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_outgoingsend_save_to_drafts() != 8694) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_stage() != 24829) {
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_stage() != 57493) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_subject() != 50854) {
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_subject() != 39023) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_undo() != 61894) {
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_undo() != 64646) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_changewatch_cancel() != 30065) {
+    if (uniffi_nimbra_ffi_checksum_method_changewatch_cancel() != 12391) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_changewatch_wait() != 26448) {

@@ -1002,18 +1002,20 @@ impl Client {
         )?;
         let first = thread.messages.first();
         let last = thread.messages.last();
+        // Who the row names: the first recipient is enough for a list row.
+        let named = last
+            .map(|m| {
+                if recipient {
+                    m.header("To").split(',').next().unwrap_or("")
+                } else {
+                    m.header("From")
+                }
+            })
+            .unwrap_or("");
         Ok(Summary {
             id: thread.id,
-            sender: last
-                .map(|m| {
-                    if recipient {
-                        // First recipient is enough for a list row.
-                        sender_name(m.header("To").split(',').next().unwrap_or(""))
-                    } else {
-                        sender_name(m.header("From"))
-                    }
-                })
-                .unwrap_or_default(),
+            sender: sender_name(named),
+            sender_address: address_of(named),
             subject: first
                 .map(|m| m.header("Subject").trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -2186,6 +2188,7 @@ mod tests {
         let thread = |messages: &[&[&str]]| Summary {
             id: "t".into(),
             sender: String::new(),
+            sender_address: String::new(),
             subject: String::new(),
             snippet: String::new(),
             timestamp_ms: 0,

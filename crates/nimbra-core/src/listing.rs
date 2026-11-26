@@ -158,6 +158,9 @@ pub struct Row {
     /// The provider's thread id; `None` for built-in sample data.
     pub id: Option<String>,
     pub sender: String,
+    /// The address of whoever `sender` names (`Summary::sender_address`). Empty for rows
+    /// kept before it was (until the thread changes) and for sample data.
+    pub sender_address: String,
     pub subject: String,
     pub snippet: String,
     /// How many messages, as shown beside the row when there is more than one.
@@ -195,6 +198,7 @@ impl Row {
             id: Some(summary.id),
             participants: summary.sender.clone(),
             sender: summary.sender,
+            sender_address: summary.sender_address,
             subject: summary.subject,
             snippet: summary.snippet,
             timestamp_ms: summary.timestamp_ms,
@@ -547,9 +551,11 @@ pub fn apply_updates<T: Listed>(
 
 /// A mailbox brought up to date in the store (`refresh`).
 pub struct Refreshed {
-    /// What it lists now, newest first, as kept.
+    /// The whole mailbox as it is kept now, newest first: what `stored` returns next. After
+    /// listing afresh, its first page; after the change feed, every page kept so far (the
+    /// first and those `more` added), with the changes made.
     pub rows: Vec<Row>,
-    /// Where the next page starts, when there is one.
+    /// Where the page after `rows` starts, for `more`; `None`: the server has no more.
     pub next_page: Option<String>,
     /// It was listed afresh rather than patched from the change feed.
     pub relisted: bool,
@@ -567,7 +573,8 @@ pub fn stored(store: &crate::store::Store, view: View, label_id: Option<&str>) -
 /// Brings a kept mailbox up to date, as the macOS app does for the one it shows: from the
 /// change feed when the store knows where it was last read and the mailbox can follow it,
 /// else by listing its first page afresh, keeping the messages already downloaded. The
-/// store is written (`kept`) and its sync point and counts with it. Blocking (network).
+/// store is written (`kept`) and its sync point and counts with it, only once all of it
+/// was read (a failure keeps nothing). Blocking (network).
 pub fn refresh(
     client: &mail::Client,
     store: &crate::store::Store,
@@ -583,31 +590,37 @@ pub fn refresh(
         && !cached.is_empty()
         && let Some(start) = start
     {
+        // The page after is found once the changes are made: as many threads as are kept
+        // then, so that `more` starts right after them.
         match sync(
             client,
             &start,
             view,
             label_id,
-            true,
+            false,
             cached.len(),
             true,
             &ids,
         ) {
             Ok(synced) => {
-                let mut rows = cached;
+                let mut rows = cached.clone();
                 apply_updates(&mut rows, synced.updates, view, label_id);
-                meta.synced_to.insert(name.clone(), synced.latest);
-                if let Some(counts) = synced.counts.filter(|c| !c.is_empty()) {
-                    meta.counts = counts;
-                }
                 let rows = kept(&rows);
-                store.save(&name, &rows)?;
-                store.save(META, &meta)?;
-                return Ok(Refreshed {
-                    rows,
-                    next_page: synced.page.flatten(),
-                    relisted: false,
-                });
+                // Everything left: the first page is listed afresh below.
+                if !rows.is_empty() {
+                    let next_page = client.page_after(view, label_id, rows.len())?;
+                    meta.synced_to.insert(name.clone(), synced.latest);
+                    if let Some(counts) = synced.counts.filter(|c| !c.is_empty()) {
+                        meta.counts = counts;
+                    }
+                    store.save(&name, &rows)?;
+                    store.save(META, &meta)?;
+                    return Ok(Refreshed {
+                        rows,
+                        next_page,
+                        relisted: false,
+                    });
+                }
             }
             Err(error) if error.is::<mail::HistoryExpired>() => {}
             Err(error) => return Err(error),
@@ -1126,6 +1139,7 @@ mod tests {
         Summary {
             id: id.into(),
             sender: "Ana".into(),
+            sender_address: String::new(),
             subject: "s".into(),
             snippet: "s".into(),
             timestamp_ms: at,
@@ -1259,6 +1273,52 @@ mod tests {
         assert_eq!(ids(&second.rows), ["c", "b"]);
         let meta: Meta = store.load(META).unwrap();
         assert_eq!(meta.synced_to.get("view-0").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn after_the_change_feed_every_kept_page_comes_back_and_more_starts_after_them() {
+        let fake = Fake::new("me@example.com");
+        for i in 0..(PAGE * 2 + 5) {
+            fake.add(Fake::thread(&format!("t{i}"), &["INBOX"], i as i64 + 10));
+        }
+        let client: Arc<mail::Client> = fake.clone();
+        let store = Store::temp();
+        let first = refresh(&*client, &store, View::Inbox, None).unwrap();
+        assert_eq!(first.rows.len(), PAGE);
+        let (second, _) = more(
+            &*client,
+            &store,
+            View::Inbox,
+            None,
+            first.next_page.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second.len(), PAGE);
+        // One new thread, and two of the first page archived: one fewer is kept.
+        fake.add(Fake::thread("new", &["INBOX"], 1000));
+        client.change("t60", mail::Change::Archive).unwrap();
+        client.change("t61", mail::Change::Archive).unwrap();
+        *fake.changes.lock().unwrap() = mail::Changes {
+            latest: "5".into(),
+            threads: vec!["new".into(), "t60".into(), "t61".into()],
+            new_unread_inbox: Vec::new(),
+        };
+        let synced = refresh(&*client, &store, View::Inbox, None).unwrap();
+        assert!(!synced.relisted);
+        assert_eq!(synced.rows.len(), PAGE * 2 - 1, "both pages, changed");
+        assert_eq!(ids(&synced.rows)[..2], ["new", "t64"]);
+        assert_eq!(ids(&synced.rows), ids(&stored(&store, View::Inbox, None)));
+        // The page after starts right after them: nothing listed twice, nothing missed.
+        let (rest, next) = more(
+            &*client,
+            &store,
+            View::Inbox,
+            None,
+            synced.next_page.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ids(&rest), ["t4", "t3", "t2", "t1", "t0"]);
+        assert!(next.is_none());
     }
 
     #[test]

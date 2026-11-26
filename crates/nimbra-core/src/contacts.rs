@@ -793,6 +793,7 @@ mod tests {
         Summary {
             id: "t".into(),
             sender: "Ana".into(),
+            sender_address: String::new(),
             subject: String::new(),
             snippet: String::new(),
             timestamp_ms: 0,

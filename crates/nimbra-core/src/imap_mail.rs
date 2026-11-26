@@ -2432,6 +2432,15 @@ fn summary(id: &str, copies: &[(&Folder, &Entry)], recipient: bool) -> Summary {
             sent: labels.iter().any(|l| l == "SENT"),
         })
         .collect();
+    let sender_address = latest
+        .and_then(|m| {
+            if recipient {
+                m.to.first().map(|p| p.address.trim().to_string())
+            } else {
+                Some(m.from.address.trim().to_string())
+            }
+        })
+        .unwrap_or_default();
     let sender = latest.map_or_else(String::new, |m| {
         if recipient {
             m.to.iter()
@@ -2449,6 +2458,7 @@ fn summary(id: &str, copies: &[(&Folder, &Entry)], recipient: bool) -> Summary {
     Summary {
         id: id.to_string(),
         sender,
+        sender_address,
         subject: messages
             .first()
             .map(|m| m.subject.clone())

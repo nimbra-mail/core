@@ -1,12 +1,17 @@
 //! The one error Swift sees. Core errors are made to be shown: they never carry a token,
 //! a password or a secret, and this keeps it that way (nothing is added to them).
 
-use nimbra_core::{gmail, mail};
+use nimbra_core::{gmail, mail, smtp};
 
 #[derive(Debug, uniffi::Error)]
 pub enum NimbraError {
-    /// The account's sign-in is gone (revoked, expired): sign in again.
-    SignedOut { account: String },
+    /// A sign-in or password was not taken. `account_id` is the account on this device
+    /// whose sign-in is gone (revoked, expired, the password changed): sign in to it again
+    /// (`begin_google_sign_in` or `begin_microsoft_sign_in` with its id, or
+    /// `update_imap_password`). `None` when it is not yet any account's: the address being
+    /// added (`add_imap_account`, a new account's `finish_*_sign_in`) did not take it, and
+    /// nothing was kept. Never an email address.
+    SignedOut { account_id: Option<String> },
     /// No connection to the server.
     Offline,
     /// The thread, message, draft or label is gone.
@@ -48,14 +53,31 @@ impl NimbraError {
             message: message.into(),
         }
     }
+
+    /// A refused sign-in for an account that is already here (signing in to it again):
+    /// it names that account.
+    pub(crate) fn for_account(self, account_id: &str) -> Self {
+        match self {
+            NimbraError::SignedOut { account_id: None } => NimbraError::SignedOut {
+                account_id: Some(account_id.to_string()),
+            },
+            other => other,
+        }
+    }
 }
 
 impl From<anyhow::Error> for NimbraError {
     fn from(error: anyhow::Error) -> Self {
         if let Some(out) = error.downcast_ref::<mail::SignedOut>() {
+            // Empty while a sign-in is not yet any account's (`mail::SignedOut`).
             return NimbraError::SignedOut {
-                account: out.account.clone(),
+                account_id: Some(out.account.clone()).filter(|id| !id.is_empty()),
             };
+        }
+        // Only checking a password gives it bare (`smtp::check_login`): a connection's
+        // sending turns it into `SignedOut` for its account.
+        if error.is::<smtp::AuthFailed>() {
+            return NimbraError::SignedOut { account_id: None };
         }
         if error.is::<mail::Offline>() {
             return NimbraError::Offline;
@@ -78,3 +100,41 @@ impl From<anyhow::Error> for NimbraError {
 }
 
 pub type Result<T> = std::result::Result<T, NimbraError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_out_names_an_account_id_or_none() {
+        let theirs = anyhow::Error::from(mail::SignedOut {
+            account: "a1b2".into(),
+        });
+        assert!(matches!(
+            NimbraError::from(theirs),
+            NimbraError::SignedOut { account_id: Some(id) } if id == "a1b2"
+        ));
+        // A password checked while adding an account: no account yet.
+        let adding = anyhow::Error::from(mail::SignedOut {
+            account: String::new(),
+        });
+        assert!(matches!(
+            NimbraError::from(adding),
+            NimbraError::SignedOut { account_id: None }
+        ));
+        let smtp = anyhow::Error::from(smtp::AuthFailed);
+        let refused = NimbraError::from(smtp);
+        assert!(matches!(
+            refused,
+            NimbraError::SignedOut { account_id: None }
+        ));
+        assert!(matches!(
+            refused.for_account("c3"),
+            NimbraError::SignedOut { account_id: Some(id) } if id == "c3"
+        ));
+        assert!(matches!(
+            NimbraError::Offline.for_account("c3"),
+            NimbraError::Offline
+        ));
+    }
+}

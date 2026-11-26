@@ -67,6 +67,7 @@ impl Fake {
         Summary {
             id: id.into(),
             sender: format!("Sender {id}"),
+            sender_address: format!("{id}@example.com"),
             subject: format!("Subject {id}"),
             snippet: format!("Snippet {id}"),
             timestamp_ms: at,

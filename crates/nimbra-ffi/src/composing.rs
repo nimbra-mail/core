@@ -80,7 +80,7 @@ impl Engine {
 
 /// The HTML part of an outgoing message, as the Mac sends it: what was written, the
 /// signature (already cleaned: a `SignatureInfo`'s HTML) in its own block, then the quoted
-/// earlier message (as text) in the usual quote block.
+/// earlier message (as text) in the usual quote block. Memory only.
 #[uniffi::export]
 pub fn message_html(written: String, signature: Option<String>, quoted: Option<String>) -> String {
     composing::message_html(&written, signature.as_deref(), quoted.as_deref())
@@ -88,7 +88,7 @@ pub fn message_html(written: String, signature: Option<String>, quoted: Option<S
 
 /// A saved draft's HTML taken apart again: what was written (without the quote) and the
 /// signature it was saved with. `None` for what was written when the HTML has no quote
-/// block: then all of it was written.
+/// block: then all of it was written. Memory only.
 #[uniffi::export]
 pub fn split_draft_html(html: String) -> DraftParts {
     let own = composing::own_html(&html);
@@ -96,7 +96,7 @@ pub fn split_draft_html(html: String) -> DraftParts {
     DraftParts { written, signature }
 }
 
-/// Text as the editor's HTML: escaped, a `<div>` per line.
+/// Text as the editor's HTML: escaped, a `<div>` per line. Memory only.
 #[uniffi::export]
 pub fn text_to_html(text: String) -> String {
     nimbra_core::rich::text_to_html(&text)

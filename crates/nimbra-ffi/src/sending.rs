@@ -29,30 +29,33 @@ impl OutgoingSend {
 
 #[uniffi::export]
 impl OutgoingSend {
+    /// The account it is sent from. Memory only.
     pub fn account_id(&self) -> String {
         self.job.account.clone()
     }
 
+    /// Its subject, for a notice. Memory only.
     pub fn subject(&self) -> String {
         self.job.subject()
     }
 
+    /// Where it is on its way. Memory only.
     pub fn stage(&self) -> SendStage {
         self.job.stage().into()
     }
 
-    /// When the undo time is over and it is to be handed over (`deliver`).
+    /// When the undo time is over and it is to be handed over (`deliver`). Memory only.
     pub fn deliver_at_ms(&self) -> i64 {
         self.deliver_at_ms
     }
 
-    /// The message as it is now, to show again after Undo.
+    /// The message as it is now, to show again after Undo. Memory only.
     pub fn message(&self) -> OutgoingMessage {
         let (_, outgoing) = self.job.mail();
         OutgoingMessage::from(outgoing.as_ref())
     }
 
-    /// Whether it is kept on the device (so quitting cannot lose it).
+    /// Whether it is kept on the device (so quitting cannot lose it). Memory only.
     pub fn is_kept(&self) -> bool {
         self.job.kept()
     }
@@ -84,7 +87,7 @@ impl OutgoingSend {
     }
 
     /// Undo send, or taking a refused message back to edit: nothing is left of it on the
-    /// device. Whether it was taken back (not once it has left).
+    /// device. Whether it was taken back (not once it has left). Disk.
     pub fn undo(&self) -> bool {
         if !matches!(self.job.stage(), Stage::Held | Stage::Refused) {
             return false;
@@ -192,6 +195,7 @@ impl Engine {
     }
 
     /// A message `deliver` left waiting for the connection: `catch_up` sends it.
+    /// Memory only.
     pub fn wait_for_connection(&self, send: Arc<OutgoingSend>) {
         let mut waiting = locked(&self.waiting);
         let queue = waiting.entry(send.job.account.clone()).or_default();
@@ -326,7 +330,7 @@ impl Engine {
     }
 }
 
-/// The times Send later offers from now.
+/// The times Send later offers from now. Memory only.
 #[uniffi::export]
 pub fn send_later_times() -> Vec<SendLaterTime> {
     use nimbra_core::scheduled::Later;

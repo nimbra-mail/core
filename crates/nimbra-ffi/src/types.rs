@@ -133,7 +133,13 @@ pub struct ThreadRow {
     pub id: String,
     /// The account it is in, when the list mixes accounts (All inboxes).
     pub account_id: Option<String>,
+    /// Who the row names: the latest message's sender, or in Sent and Drafts its first
+    /// recipient.
     pub sender: String,
+    /// The address of whoever `sender` names, for the avatar's tone and a quick reply
+    /// before the thread is read. `None` when it has none that is an address, and for a
+    /// row kept by 0.1.0 until its thread changes.
+    pub sender_address: Option<String>,
     pub subject: String,
     pub snippet: String,
     pub timestamp_ms: i64,
@@ -150,8 +156,11 @@ pub struct ThreadRow {
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct ThreadPage {
+    /// `refresh_mailbox`: the whole list as kept, to show in place of the one shown.
+    /// `load_more` and `search`: one page, to add after what is shown.
     pub threads: Vec<ThreadRow>,
-    /// Hand back to get the next page; `None` at the end.
+    /// Where the page after these threads starts: hand it to `load_more` (or `search`);
+    /// `None` at the end.
     pub next_page: Option<String>,
 }
 
@@ -702,6 +711,9 @@ impl From<&listing::Row> for ThreadRow {
             id: row.id.clone().unwrap_or_default(),
             account_id: row.account.clone(),
             sender: row.sender.clone(),
+            sender_address: Some(row.sender_address.trim())
+                .filter(|address| mail::is_address(address))
+                .map(String::from),
             subject: row.subject.clone(),
             snippet: row.snippet.clone(),
             timestamp_ms: row.timestamp_ms,
