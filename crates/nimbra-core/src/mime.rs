@@ -31,6 +31,7 @@ pub struct Headers {
     pub references: Vec<String>,
     pub from: Person,
     pub to: Vec<Person>,
+    pub cc: Vec<Person>,
     pub subject: String,
     pub timestamp_ms: i64,
 }
@@ -135,6 +136,7 @@ pub fn headers(raw_header_bytes: &[u8]) -> Option<Headers> {
         references,
         from: from_of(&parsed),
         to: people_of(parsed.all_to()),
+        cc: people_of(parsed.all_cc()),
         subject: parsed.subject().map(clean_header).unwrap_or_default(),
         timestamp_ms: timestamp_ms(&parsed),
     })

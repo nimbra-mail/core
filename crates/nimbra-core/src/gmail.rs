@@ -927,6 +927,7 @@ impl Client {
                 .query("format", "metadata")
                 .query("metadataHeaders", "From")
                 .query("metadataHeaders", "To")
+                .query("metadataHeaders", "Cc")
                 .query("metadataHeaders", "Subject"),
             None,
         )?;
@@ -980,7 +981,91 @@ impl Client {
                 .iter()
                 .map(|m| address_of(m.header("From")).to_lowercase())
                 .collect(),
+            people: thread.messages.iter().map(met).collect(),
         })
+    }
+
+    /// A page of the newest messages' people: in Sent, or of what came in that a person
+    /// may have written (not Promotions, Social, Updates or Forums). The ids, then each
+    /// message's From, To and Cc only: 5 units for the page and 5 a message.
+    pub fn people_page(
+        &self,
+        sent: bool,
+        page: Option<&str>,
+    ) -> Result<(Vec<Met>, Option<String>)> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase")]
+        struct Ids {
+            #[serde(default)]
+            messages: Vec<Id>,
+            next_page_token: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Id {
+            id: String,
+        }
+        let mut request =
+            ureq::get(&format!("{API}/messages")).query("maxResults", &PEOPLE_PAGE.to_string());
+        if let Some(page) = page {
+            if page.len() > 512 || !page.chars().all(|c| c.is_ascii_graphic()) {
+                bail!("unexpected page token");
+            }
+            request = request.query("pageToken", page);
+        }
+        let request = if sent {
+            request.query("labelIds", "SENT")
+        } else {
+            request.query(
+                "q",
+                "-in:sent -in:drafts -in:chats -category:promotions -category:social \
+                 -category:updates -category:forums",
+            )
+        };
+        let listing: Ids = self.send(request, None)?;
+        let ids: Vec<&str> = listing
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .filter(|id| is_id(id))
+            .collect();
+        self.access_token()?;
+        let mut found: Vec<Option<Result<RawMessage>>> = Vec::new();
+        found.resize_with(ids.len(), || None);
+        let workers = 4.min(ids.len().max(1));
+        std::thread::scope(|scope| {
+            let chunk = ids.len().div_ceil(workers).max(1);
+            for (ids, out) in ids.chunks(chunk).zip(found.chunks_mut(chunk)) {
+                scope.spawn(move || {
+                    for (id, slot) in ids.iter().zip(out) {
+                        *slot = Some(
+                            self.send(
+                                ureq::get(&format!("{API}/messages/{id}"))
+                                    .query("format", "metadata")
+                                    .query("metadataHeaders", "From")
+                                    .query("metadataHeaders", "To")
+                                    .query("metadataHeaders", "Cc"),
+                                None,
+                            ),
+                        );
+                    }
+                });
+            }
+        });
+        let mut people = Vec::new();
+        let mut failed = None;
+        for result in found.into_iter().flatten() {
+            match result {
+                Ok(message) => people.push(met(&message)),
+                // Deleted since it was listed, most likely: the rest are still good.
+                Err(error) => failed = Some(error),
+            }
+        }
+        if let Some(error) = failed
+            && people.is_empty()
+        {
+            return Err(error);
+        }
+        Ok((people, listing.next_page_token))
     }
 
     /// Every message in a thread, oldest first, as plain text.
@@ -1556,6 +1641,9 @@ impl Provider for Client {
     fn keep_rows_in(&self, store: &Arc<Store>) {
         Client::keep_rows_in(self, store)
     }
+    fn people_page(&self, sent: bool, page: Option<&str>) -> Result<(Vec<Met>, Option<String>)> {
+        Client::people_page(self, sent, page)
+    }
     fn history(&self, start: &str) -> Result<Changes> {
         Client::history(self, start)
     }
@@ -1807,6 +1895,20 @@ fn is_attachment_id(id: &str) -> bool {
 }
 
 /// Thread ids go into request paths, so only accept what Gmail actually issues.
+/// Messages a page of `people_page` asks for.
+const PEOPLE_PAGE: usize = 100;
+
+/// Who a message was from and to.
+fn met(message: &RawMessage) -> Met {
+    Met {
+        from: person(message.header("From")),
+        to: people(message.header("To")),
+        cc: people(message.header("Cc")),
+        timestamp_ms: message.timestamp_ms(),
+        sent: message.label_ids.iter().any(|l| l == "SENT"),
+    }
+}
+
 fn is_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric())
 }
@@ -1966,6 +2068,35 @@ mod tests {
     }
 
     #[test]
+    fn a_metadata_message_gives_its_people_and_whether_it_was_sent() {
+        let message: RawMessage = serde_json::from_value(serde_json::json!({
+            "id": "18c",
+            "labelIds": ["SENT"],
+            "internalDate": "1764000000000",
+            "payload": { "headers": [
+                { "name": "From", "value": "Me <me@example.com>" },
+                { "name": "To", "value": "\"Lima, Ana\" <ana@example.com>, bo@example.com" },
+                { "name": "Cc", "value": "Cy <cy@example.com>" },
+            ]},
+        }))
+        .unwrap();
+        let met = met(&message);
+        assert!(met.sent);
+        assert_eq!(met.timestamp_ms, 1_764_000_000_000);
+        assert_eq!(met.from.address, "me@example.com");
+        let to: Vec<(&str, &str)> = met
+            .to
+            .iter()
+            .map(|p| (p.name.as_str(), p.address.as_str()))
+            .collect();
+        assert_eq!(
+            to,
+            [("Lima, Ana", "ana@example.com"), ("", "bo@example.com")]
+        );
+        assert_eq!(met.cc[0].address, "cy@example.com");
+    }
+
+    #[test]
     fn html_past_the_size_cap_is_not_read() {
         let payload = html_payload(&format!(
             "{}<p>late</p>",
@@ -2001,6 +2132,7 @@ mod tests {
                 .map(|m| m.iter().map(|l| l.to_string()).collect())
                 .collect(),
             senders: Vec::new(),
+            people: Vec::new(),
         };
         let done = |messages: &[&[&str]]| View::Done.takes(&thread(messages), None);
         assert!(done(&[&["CATEGORY_UPDATES"]]) && done(&[&[]]));

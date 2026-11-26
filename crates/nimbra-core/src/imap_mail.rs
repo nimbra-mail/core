@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::mail::{
-    Change, Changes, Draft, HistoryExpired, Label, MayHaveArrived, Message, Offline, Outgoing,
+    Change, Changes, Draft, HistoryExpired, Label, MayHaveArrived, Message, Met, Offline, Outgoing,
     OutgoingFile, Person, Provider, SignedOut, Summary, View,
 };
 use crate::servers::{Secret, Security, Servers};
@@ -67,6 +67,10 @@ const RAW_KEPT_BYTES: usize = 64 * 1024 * 1024;
 const INDEX: &str = "imap-index";
 /// What a list row needs: flags, date, the header, and the start of the text for a snippet.
 const ROW_FETCH: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.2048>)";
+/// What address suggestions need of a message: who it was from and to, and when.
+const PEOPLE_FETCH: &str = "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE)])";
+/// Messages a page of `people_page` fetches.
+const PEOPLE_PAGE: usize = 200;
 /// How long one IDLE lasts before it is ended and started again. RFC 2177: servers may
 /// drop a client idle for 30 minutes, and routers forget quiet connections sooner.
 const IDLE_RENEW: Duration = Duration::from_secs(10 * 60);
@@ -127,6 +131,9 @@ struct Entry {
     thread: String,
     from: Person,
     to: Vec<Person>,
+    /// (Indexes saved before this was kept still load.)
+    #[serde(default)]
+    cc: Vec<Person>,
     subject: String,
     timestamp_ms: i64,
     snippet: String,
@@ -744,6 +751,7 @@ impl Client {
                         message_id,
                         from: headers.from,
                         to: headers.to,
+                        cc: headers.cc,
                         subject: headers.subject,
                         timestamp_ms,
                         snippet: crate::mime::snippet(&partial),
@@ -1461,6 +1469,57 @@ impl Provider for Client {
         Ok((rows.len() > count).then(|| count.to_string()))
     }
 
+    /// The newest messages of Sent or the inbox, a page at a time, older than the UID in
+    /// `page`. Only their From, To, Cc and Date, read without marking anything read.
+    fn people_page(&self, sent: bool, page: Option<&str>) -> Result<(Vec<Met>, Option<String>)> {
+        let below: u32 = match page {
+            Some(page) => page.parse().context("unexpected page token")?,
+            None => u32::MAX,
+        };
+        self.with(true, |connection| {
+            let role = if sent { Role::Sent } else { Role::Inbox };
+            let Some(folder) = self.folder(connection, role)? else {
+                return Ok((Vec::new(), None));
+            };
+            Self::select(connection, &folder.name)?;
+            let mut uids: Vec<u32> = connection
+                .session
+                .uid_search("ALL")?
+                .into_iter()
+                .filter(|uid| *uid < below)
+                .collect();
+            uids.sort_unstable_by(|a, b| b.cmp(a));
+            let more = uids.len() > PEOPLE_PAGE;
+            uids.truncate(PEOPLE_PAGE);
+            let mut people = Vec::new();
+            for batch in uids.chunks(100) {
+                let set = uid_set(batch);
+                if set.is_empty() {
+                    continue;
+                }
+                for fetch in connection.session.uid_fetch(&set, PEOPLE_FETCH)?.iter() {
+                    let Some(headers) = fetch.header().and_then(crate::mime::headers) else {
+                        continue;
+                    };
+                    let timestamp_ms = if headers.timestamp_ms > 0 {
+                        headers.timestamp_ms
+                    } else {
+                        fetch.internal_date().map_or(0, |d| d.timestamp_millis())
+                    };
+                    people.push(Met {
+                        from: headers.from,
+                        to: headers.to,
+                        cc: headers.cc,
+                        timestamp_ms,
+                        sent,
+                    });
+                }
+            }
+            let next = uids.last().filter(|_| more).map(u32::to_string);
+            Ok((people, next))
+        })
+    }
+
     fn summary(&self, id: &str, recipient: bool) -> Result<Summary> {
         if !is_thread_id(id) {
             bail!("unexpected thread id");
@@ -1693,6 +1752,7 @@ impl Provider for Client {
                 thread: String::new(),
                 from: Person::default(),
                 to: Vec::new(),
+                cc: Vec::new(),
                 subject: String::new(),
                 timestamp_ms: 0,
                 snippet: String::new(),
@@ -2361,6 +2421,17 @@ fn summary(id: &str, copies: &[(&Folder, &Entry)], recipient: bool) -> Summary {
             labels.push(label.clone());
         }
     }
+    let people = messages
+        .iter()
+        .zip(&message_labels)
+        .map(|(m, labels)| Met {
+            from: m.from.clone(),
+            to: m.to.clone(),
+            cc: m.cc.clone(),
+            timestamp_ms: m.timestamp_ms,
+            sent: labels.iter().any(|l| l == "SENT"),
+        })
+        .collect();
     let sender = latest.map_or_else(String::new, |m| {
         if recipient {
             m.to.iter()
@@ -2393,6 +2464,7 @@ fn summary(id: &str, copies: &[(&Folder, &Entry)], recipient: bool) -> Summary {
             .iter()
             .map(|m| m.from.address.trim().to_lowercase())
             .collect(),
+        people,
     }
 }
 
@@ -2955,6 +3027,7 @@ mod tests {
                 address: "ana@example.com".into(),
             },
             to: vec![],
+            cc: vec![],
             subject: "Trip".into(),
             timestamp_ms: at,
             snippet: format!("snippet {id}"),
@@ -3043,6 +3116,60 @@ mod live {
              Date: Mon, 23 Nov 2026 10:00:00 +0000\r\nMessage-ID: {id}\r\n{extra}\
              MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}\r\n"
         )
+    }
+
+    #[test]
+    #[ignore]
+    fn live_people_of_sent_and_received_mail_a_page_at_a_time() {
+        let user = format!("p{}@example.org", std::process::id());
+        let c = client(&user);
+        for i in 0..PEOPLE_PAGE + 5 {
+            let raw = format!(
+                "From: {user}\r\nTo: \"Lima, Ana\" <ana{i}@example.com>\r\nCc: Bo <bo@example.com>\r\n\
+                 Subject: s\r\nDate: Mon, 23 Nov 2026 10:00:00 +0000\r\nMessage-ID: <s{i}@x>\r\n\r\nHi\r\n"
+            );
+            put(&c, "Sent", &raw, true);
+        }
+        put(
+            &c,
+            "INBOX",
+            &mail("<r1@x>", "Hello", "Cc: Cy <cy@example.com>\r\n", "Hi"),
+            false,
+        );
+
+        let (first, next) = c.people_page(true, None).unwrap();
+        assert_eq!(first.len(), PEOPLE_PAGE);
+        assert!(first.iter().all(|m| m.sent));
+        assert_eq!(first[0].to[0].name, "Lima, Ana");
+        assert_eq!(first[0].cc[0].address, "bo@example.com");
+        assert!(first[0].timestamp_ms > 0);
+        let (rest, after) = c.people_page(true, next.as_deref()).unwrap();
+        assert_eq!(rest.len(), 5);
+        assert_eq!(after, None);
+        let mut every: Vec<String> = first
+            .iter()
+            .chain(&rest)
+            .map(|m| m.to[0].address.clone())
+            .collect();
+        every.sort();
+        every.dedup();
+        assert_eq!(
+            every.len(),
+            PEOPLE_PAGE + 5,
+            "no message twice, none left out"
+        );
+
+        let (received, next) = c.people_page(false, None).unwrap();
+        assert_eq!(next, None);
+        assert_eq!(received.len(), 1);
+        assert!(!received[0].sent);
+        assert_eq!(received[0].from.address, "ana@example.com");
+        assert_eq!(received[0].cc[0].address, "cy@example.com");
+        // Read without marking it read.
+        let (rows, _) = c.threads_page(View::Inbox, None, 30, None).unwrap();
+        assert!(rows[0].unread);
+        assert_eq!(rows[0].people[0].cc[0].address, "cy@example.com");
+        assert!(c.people_page(true, Some("not a uid")).is_err());
     }
 
     #[test]

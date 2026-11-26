@@ -915,6 +915,22 @@ pub struct Summary {
     /// Each message's sender, as a bare lowercase address (for blocked senders).
     #[serde(default)]
     pub senders: Vec<String>,
+    /// Who each message was from and to, for address suggestions (`contacts.rs`), which
+    /// learn them as the row is fetched. Not kept with the row: what was learnt is kept.
+    #[serde(skip)]
+    pub people: Vec<Met>,
+}
+
+/// The people of one message, for address suggestions (`contacts.rs`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Met {
+    pub from: Person,
+    pub to: Vec<Person>,
+    pub cc: Vec<Person>,
+    pub timestamp_ms: i64,
+    /// Sent from the account (in Sent). One from its own address counts as well.
+    #[serde(default)]
+    pub sent: bool,
 }
 
 pub struct Message {
@@ -1099,6 +1115,16 @@ pub trait Provider: Send + Sync {
     fn relabel(&self, id: &str, add: &[&str], remove: &[&str]) -> Result<()>;
     /// Unread and total threads for these label ids (for the sidebar).
     fn counts(&self, label_ids: &[String]) -> std::collections::HashMap<String, (u32, u32)>;
+    /// A page of the newest messages' people, in Sent (`sent`) or of the mail that came in,
+    /// and where the next page starts: only the headers that name people. Nothing where
+    /// the provider has no way to ask.
+    fn people_page(&self, _sent: bool, _page: Option<&str>) -> Result<(Vec<Met>, Option<String>)> {
+        Ok((Vec::new(), None))
+    }
+    /// The people this connection has learnt the account writes with (`contacts.rs`).
+    fn contacts(&self) -> Option<&std::sync::Arc<crate::contacts::Contacts>> {
+        None
+    }
 }
 
 /// The connection the app holds for an account.

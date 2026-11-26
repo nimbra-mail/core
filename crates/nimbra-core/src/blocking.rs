@@ -193,6 +193,7 @@ mod tests {
                 .map(|(_, l)| l.iter().map(|s| s.to_string()).collect())
                 .collect(),
             senders: messages.iter().map(|(s, _)| s.to_string()).collect(),
+            people: Vec::new(),
         }
     }
 
