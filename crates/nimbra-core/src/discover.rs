@@ -17,6 +17,11 @@
 //! - Asking Thunderbird's ISPDB sends Mozilla the domain only, never the full address; a
 //!   domain whose mail server is Google, Microsoft or Zoho is not sent at all. The lookup
 //!   by mail server sends only the mail server's domain.
+//! - Last, the usual host names are tried directly (`mail.<domain>`, the domain's own MX
+//!   host, `imap.`/`smtp.<domain>`), as Apple Mail and Outlook do, which finds most
+//!   cPanel and shared hosting. Only a secure handshake is made (nothing is sent, no
+//!   password), only to hosts under the address's own domain, and a host counts only when
+//!   its certificate is valid for that very name.
 //! - A server that is only reached in plain text is never offered, and POP3 is ignored.
 //!   Host names from the network are checked like typed ones, so a hostile file cannot
 //!   carry anything else into a connection.
@@ -117,10 +122,101 @@ pub fn discover(email: &str) -> Result<Found> {
     if let Some(host) = &mx {
         lookups.extend(mx_domains(host).into_iter().filter(|name| *name != domain));
     }
-    Ok(lookups
+    if let Some(found) = lookups
         .iter()
         .find_map(|name| from(&format!("https://autoconfig.thunderbird.net/v1.1/{name}")))
-        .unwrap_or(Found::Unknown))
+    {
+        return Ok(found);
+    }
+    Ok(probe(&domain, mx.as_deref(), email).unwrap_or(Found::Unknown))
+}
+
+/// The host names to try for a domain with nothing published: `mail.<domain>` (what cPanel
+/// and most shared hosting use for both), the domain's MX host when it is the domain's own,
+/// then `imap.` and `smtp.<domain>`. (IMAP hosts, SMTP hosts.)
+fn candidates(domain: &str, mx: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut shared = vec![format!("mail.{domain}")];
+    if let Some(mx) = mx {
+        let mx = mx.trim_end_matches('.').to_ascii_lowercase();
+        if (mx == domain || under(&mx, domain)) && is_host(&mx) && !shared.contains(&mx) {
+            shared.push(mx);
+        }
+    }
+    let with = |own: String| {
+        let mut hosts = shared.clone();
+        if !hosts.contains(&own) {
+            hosts.push(own);
+        }
+        hosts
+    };
+    (
+        with(format!("imap.{domain}")),
+        with(format!("smtp.{domain}")),
+    )
+}
+
+/// Tries the usual host names (see `candidates`): IMAP over TLS on 993, SMTP over TLS on
+/// 465 or with STARTTLS on 587. A host counts only when its certificate is valid for it.
+fn probe(domain: &str, mx: Option<&str>, email: &str) -> Option<Found> {
+    let (imap_hosts, smtp_hosts) = candidates(domain, mx);
+    let imap = imap_hosts
+        .into_iter()
+        .find(|host| crate::tls::connect(host, 993).is_ok())?;
+    let smtp = smtp_hosts.into_iter().find_map(|host| {
+        if crate::tls::connect(&host, 465).is_ok() {
+            Some(Server::new(&host, 465, Security::Tls))
+        } else if starttls_ok(&host) {
+            Some(Server::new(&host, 587, Security::StartTls))
+        } else {
+            None
+        }
+    })?;
+    Some(Found::Servers(Servers {
+        username: email.to_string(),
+        imap: Server::new(&imap, 993, Security::Tls),
+        smtp,
+    }))
+}
+
+/// Whether `host` takes mail on 587 and turns secure there (STARTTLS) with a certificate
+/// valid for it. Only the greeting, EHLO and STARTTLS are exchanged.
+fn starttls_ok(host: &str) -> bool {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let check = || -> Result<()> {
+        let tcp = crate::tls::tcp(host, 587)?;
+        let mut reader = BufReader::new(tcp.try_clone()?);
+        // A reply: lines until the one with a space after its code ("250 …").
+        let reply = |reader: &mut BufReader<std::net::TcpStream>| -> Result<String> {
+            let mut all = String::new();
+            for _ in 0..64 {
+                let mut line = String::new();
+                if reader.by_ref().take(1024).read_line(&mut line)? == 0 {
+                    bail!("closed");
+                }
+                all.push_str(&line);
+                if line.as_bytes().get(3) != Some(&b'-') {
+                    return Ok(all);
+                }
+            }
+            bail!("too long")
+        };
+        let mut tcp_w = tcp.try_clone()?;
+        if !reply(&mut reader)?.starts_with("220") {
+            bail!("no greeting");
+        }
+        tcp_w.write_all(b"EHLO nimbra\r\n")?;
+        let ehlo = reply(&mut reader)?;
+        if !ehlo.starts_with("250") || !ehlo.to_ascii_uppercase().contains("STARTTLS") {
+            bail!("no STARTTLS");
+        }
+        tcp_w.write_all(b"STARTTLS\r\n")?;
+        if !reply(&mut reader)?.starts_with("220") {
+            bail!("STARTTLS refused");
+        }
+        crate::tls::upgrade(tcp, host)?;
+        Ok(())
+    };
+    check().is_ok()
 }
 
 /// The provider behind a mail server (MX host) that is known without asking anyone:
@@ -581,6 +677,24 @@ mod tests {
             Some(Found::Servers(servers)) => servers,
             other => panic!("expected servers, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn usual_hosts_are_tried_mail_first_and_only_on_the_domain() {
+        let (imap, smtp) = candidates("mdsnet.me", Some("mail.mdsnet.me."));
+        assert_eq!(imap, vec!["mail.mdsnet.me", "imap.mdsnet.me"]);
+        assert_eq!(smtp, vec!["mail.mdsnet.me", "smtp.mdsnet.me"]);
+        let (imap, _) = candidates("example.com", Some("mx1.example.com"));
+        assert_eq!(
+            imap,
+            vec!["mail.example.com", "mx1.example.com", "imap.example.com"]
+        );
+        // Another company's mail server is never tried with this address's password.
+        let (imap, smtp) = candidates("example.com", Some("mx.hostingco.net"));
+        assert_eq!(imap, vec!["mail.example.com", "imap.example.com"]);
+        assert_eq!(smtp, vec!["mail.example.com", "smtp.example.com"]);
+        let (imap, _) = candidates("example.com", Some("notexample.com"));
+        assert!(!imap.contains(&"notexample.com".to_string()));
     }
 
     #[test]
