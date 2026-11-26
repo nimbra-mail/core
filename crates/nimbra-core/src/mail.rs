@@ -587,10 +587,12 @@ pub(crate) fn people(list: &str) -> Vec<Person> {
 }
 
 /// A file name that is safe to create in a folder: no path separators, no leading dots,
-/// no control characters, and not too long.
+/// no control characters, nothing invisible that reorders or hides its letters (a
+/// right-to-left override turns "fdp.app" into "ppa.pdf"), and not too long.
 pub fn safe_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
+        .filter(|&c| !is_format(c))
         .map(|c| {
             if c.is_control() || "/\\:".contains(c) {
                 '_'
@@ -606,6 +608,77 @@ pub fn safe_file_name(name: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Unicode's invisible format characters (category Cf), except the joiners some scripts
+/// and emoji need to be spelled right.
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{AD}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61C}'
+            | '\u{6DD}'
+            | '\u{70F}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8E2}'
+            | '\u{180E}'
+            | '\u{200B}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Larger HTML bodies stay in the native reader only, and only this much of one is read.
+pub const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// How much embedded images (`cid:` links) may add to a message's HTML.
+pub const INLINE_IMAGE_BUDGET: usize = 6 * 1024 * 1024;
+
+/// At most `max` bytes of `text`, cut at a character boundary.
+pub fn prefix(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or_default()
+}
+
+/// Replaces every `cid:` link to one embedded image with its data, when what that adds fits
+/// in `budget`, which it then takes from. Counted per link: one image linked a thousand
+/// times would otherwise grow the HTML a thousandfold.
+pub fn inline_image(
+    html: &mut String,
+    cid: &str,
+    mime: &str,
+    bytes: &[u8],
+    budget: &mut usize,
+) -> bool {
+    let reference = format!("cid:{cid}");
+    let links = html.matches(&reference).count();
+    let data_len = base64::encoded_len(bytes.len(), true)
+        .unwrap_or(usize::MAX)
+        .saturating_add(format!("data:{mime};base64,").len());
+    let Some(cost) = data_len.checked_mul(links).filter(|cost| *cost <= *budget) else {
+        return false;
+    };
+    *budget -= cost;
+    let data = format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+    *html = html.replace(&reference, &data);
+    true
 }
 
 /// The message a `mailto:` unsubscribe link asks for.
@@ -992,6 +1065,59 @@ pub type Client = dyn Provider;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_file_name_drops_a_right_to_left_override() {
+        assert_eq!(safe_file_name("Invoice\u{202E}fdp.app"), "Invoicefdp.app");
+    }
+
+    #[test]
+    fn safe_file_name_drops_bidi_isolates_and_marks() {
+        assert_eq!(
+            safe_file_name("a\u{2066}b\u{2067}c\u{2068}d\u{2069}e\u{200E}f\u{200F}g\u{061C}h.pdf"),
+            "abcdefgh.pdf"
+        );
+    }
+
+    #[test]
+    fn safe_file_name_drops_invisible_format_characters() {
+        assert_eq!(
+            safe_file_name("re\u{200B}port\u{FEFF}\u{2060}\u{00AD}\u{E0041}.pdf"),
+            "report.pdf"
+        );
+    }
+
+    #[test]
+    fn safe_file_name_keeps_joiners_that_spell_words() {
+        assert_eq!(safe_file_name("می\u{200C}خواهم.pdf"), "می\u{200C}خواهم.pdf");
+    }
+
+    #[test]
+    fn inline_image_replaces_every_link_within_the_budget() {
+        let mut html = "<img src=cid:a><img src=cid:a>".to_string();
+        let mut budget = INLINE_IMAGE_BUDGET;
+        inline_image(&mut html, "a", "image/png", b"png", &mut budget);
+        assert_eq!(
+            html,
+            "<img src=data:image/png;base64,cG5n><img src=data:image/png;base64,cG5n>"
+        );
+    }
+
+    #[test]
+    fn inline_image_charges_the_budget_for_each_link() {
+        let mut html = "<img src=cid:a>".repeat(3);
+        let mut budget = 1_000;
+        inline_image(&mut html, "a", "image/png", b"png", &mut budget);
+        assert_eq!(budget, 1_000 - 3 * "data:image/png;base64,cG5n".len());
+    }
+
+    #[test]
+    fn inline_image_leaves_the_html_alone_when_the_links_do_not_fit() {
+        let mut html = "<img src=cid:a>".repeat(1_000);
+        let mut budget = 100_000;
+        let inlined = inline_image(&mut html, "a", "image/png", &[0; 1_000], &mut budget);
+        assert_eq!((inlined, html.len(), budget), (false, 15_000, 100_000));
+    }
 
     #[test]
     fn a_sent_message_has_its_own_headers_and_no_bcc() {

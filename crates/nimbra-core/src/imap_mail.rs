@@ -61,6 +61,8 @@ const LOG_KEEP: usize = 5000;
 const SLOW_SYNC: Duration = Duration::from_secs(300);
 /// Raw messages kept in memory (for attachments of a thread just opened).
 const RAW_KEPT: usize = 40;
+/// At most this much of them: one with large attachments is fetched again instead.
+const RAW_KEPT_BYTES: usize = 64 * 1024 * 1024;
 /// The store record of the index.
 const INDEX: &str = "imap-index";
 /// What a list row needs: flags, date, the header, and the start of the text for a snippet.
@@ -1182,11 +1184,7 @@ impl Client {
                 })
         })?;
         let raw = Arc::new(raw);
-        let mut kept = self.raw.lock().unwrap();
-        kept.push_back((key.to_string(), raw.clone()));
-        while kept.len() > RAW_KEPT {
-            kept.pop_front();
-        }
+        keep_raw(&mut self.raw.lock().unwrap(), key, raw.clone());
         Ok(raw)
     }
 
@@ -2519,6 +2517,17 @@ fn search_criteria(query: &str) -> Result<String> {
 }
 
 /// The Message-ID header of a raw message.
+/// Adds a message to those kept in memory, dropping the oldest past the count or the size.
+fn keep_raw(kept: &mut VecDeque<(String, Arc<Vec<u8>>)>, key: &str, raw: Arc<Vec<u8>>) {
+    kept.push_back((key.to_string(), raw));
+    let mut size: usize = kept.iter().map(|(_, raw)| raw.len()).sum();
+    while kept.len() > RAW_KEPT || (kept.len() > 1 && size > RAW_KEPT_BYTES) {
+        if let Some((_, oldest)) = kept.pop_front() {
+            size -= oldest.len();
+        }
+    }
+}
+
 fn header_message_id(raw: &[u8]) -> Option<String> {
     crate::mime::headers(raw)
         .map(|h| h.message_id)
@@ -2609,6 +2618,29 @@ impl From<SignedOut> for MayHaveArrived {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kept_raw_messages_stay_under_the_size_budget() {
+        let mut kept = VecDeque::new();
+        for n in 0..4 {
+            keep_raw(
+                &mut kept,
+                &n.to_string(),
+                Arc::new(vec![0; RAW_KEPT_BYTES / 3]),
+            );
+        }
+        let size: usize = kept.iter().map(|(_, raw)| raw.len()).sum();
+        assert!(size <= RAW_KEPT_BYTES, "{size}");
+    }
+
+    #[test]
+    fn the_newest_raw_message_is_kept_even_when_larger_than_the_budget() {
+        let mut kept = VecDeque::new();
+        keep_raw(&mut kept, "old", Arc::new(vec![0; 10]));
+        keep_raw(&mut kept, "big", Arc::new(vec![0; RAW_KEPT_BYTES + 1]));
+        let keys: Vec<_> = kept.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["big"]);
+    }
 
     /// A server that answers with what it was given, keeping what it is sent where the test
     /// can see it after the stream is gone.
