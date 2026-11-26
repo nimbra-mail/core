@@ -29,7 +29,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 
-use crate::gmail::{oauth_setting, pkce_challenge, random_token, respond};
+use crate::gmail::{oauth_setting, pkce_challenge, random_token, respond, respond_page};
 use crate::mail::{Offline, SignedOut, is_account_id, is_address, sanitize};
 use crate::servers::{Security, Server, Servers};
 
@@ -519,19 +519,11 @@ impl SignIn {
                 None
             }
             Redirect::Failed(reason) => {
-                respond(
-                    &stream,
-                    "200 OK",
-                    "Sign-in was cancelled. You can close this tab.",
-                );
+                respond_page(&stream, crate::signin_page::Outcome::Cancelled);
                 Some(Err(anyhow!(reason)))
             }
             Redirect::Code(code) => {
-                respond(
-                    &stream,
-                    "200 OK",
-                    "Nimbra is connected. You can close this tab and return to the app.",
-                );
+                respond_page(&stream, crate::signin_page::Outcome::Connected);
                 Some(Ok(code))
             }
         }

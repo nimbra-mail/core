@@ -337,11 +337,7 @@ impl SignIn {
             return None;
         }
         if let Some(error) = param("error") {
-            respond(
-                &stream,
-                "200 OK",
-                "Sign-in was cancelled. You can close this tab.",
-            );
+            respond_page(&stream, crate::signin_page::Outcome::Cancelled);
             let reason = if error == "access_denied" {
                 "Sign-in was cancelled.".to_string()
             } else {
@@ -350,26 +346,35 @@ impl SignIn {
             return Some(Err(anyhow!(reason)));
         }
         let code = param("code")?;
-        respond(
-            &stream,
-            "200 OK",
-            "Nimbra is connected. You can close this tab and return to the app.",
-        );
+        respond_page(&stream, crate::signin_page::Outcome::Connected);
         Some(Ok(code))
     }
 }
 
-pub(crate) fn respond(mut stream: &TcpStream, status: &str, message: &str) {
+/// A plain answer to a request that is not the sign-in coming back.
+pub(crate) fn respond(stream: &TcpStream, status: &str, message: &str) {
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>Nimbra</title>\
          <body style=\"font:16px system-ui;background:#0e0e14;color:#f5f3ef;display:grid;\
          place-items:center;height:100vh;margin:0\"><p>{message}</p>"
     );
+    send(stream, status, &body);
+}
+
+/// The page the sign-in comes back to (see `signin_page`).
+pub(crate) fn respond_page(stream: &TcpStream, outcome: crate::signin_page::Outcome) {
+    send(stream, "200 OK", &crate::signin_page::html(outcome));
+}
+
+fn send(mut stream: &TcpStream, status: &str, body: &str) {
     let _ = write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+         Content-Length: {}\r\nCache-Control: no-store\r\n\
+         Content-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\n\
+         Referrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+        crate::signin_page::POLICY,
     );
 }
 
