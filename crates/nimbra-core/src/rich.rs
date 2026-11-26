@@ -481,6 +481,7 @@ fn clean(text: &str) -> String {
 
 // ------------------------------------------------------------------ images
 
+#[derive(Clone, Copy)]
 pub enum ImageKind {
     Png,
     Jpeg,
@@ -621,7 +622,7 @@ fn is_public(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn sniff(bytes: &[u8]) -> Option<ImageKind> {
+pub fn sniff(bytes: &[u8]) -> Option<ImageKind> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(ImageKind::Png)
     } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {

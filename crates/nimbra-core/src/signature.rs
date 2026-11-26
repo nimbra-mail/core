@@ -213,7 +213,82 @@ pub fn clean_simple(html: &str) -> String {
 /// For the composer and the Preview, which load nothing remote: clean, and each image a
 /// small placeholder with its description.
 pub fn for_display(html: &str) -> String {
-    sanitize(html, Profile::Display)
+    for_display_with(html, crate::signature_images::data_uri)
+}
+
+/// `for_display`, with each image whose copy `image` has (as a `data:` address) shown as
+/// that picture; the others stay placeholders.
+pub fn for_display_with(html: &str, image: impl Fn(&str) -> Option<String>) -> String {
+    const OPEN: &str = "<span class=\"nimbra-image\" data-src=\"";
+    let shown = sanitize(html, Profile::Display);
+    let mut out = String::with_capacity(shown.len());
+    let mut rest = shown.as_str();
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        // The placeholder runs to its own end tag (its label is escaped text).
+        let Some(end) = tail.find("</span>").map(|i| i + "</span>".len()) else {
+            break;
+        };
+        let placeholder = &tail[..end];
+        let attr = |name: &str| {
+            let key = format!(" {name}=\"");
+            let from = placeholder.find(&key)? + key.len();
+            let len = placeholder[from..].find('"')?;
+            Some(unescape(&placeholder[from..from + len]))
+        };
+        let label = placeholder
+            .find('>')
+            .map(|i| &placeholder[i + 1..placeholder.len() - "</span>".len()])
+            .unwrap_or("");
+        match attr("data-src").and_then(|src| image(&src)) {
+            Some(data) if data.starts_with("data:image/") => {
+                out.push_str(&format!(
+                    "<img class=\"nimbra-picture\" src=\"{}\" alt=\"{}\"",
+                    escape_attr(&data),
+                    label.replace('"', "&quot;")
+                ));
+                for (data_attr, attr_name) in [("data-w", "width"), ("data-h", "height")] {
+                    if let Some(value) = attr(data_attr).filter(|v| dimension(v)) {
+                        out.push_str(&format!(" {attr_name}=\"{value}\""));
+                    }
+                }
+                out.push('>');
+            }
+            _ => out.push_str(placeholder),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The web addresses of the signature's images (those it keeps), in order, at most 10.
+pub fn image_sources(html: &str) -> Vec<String> {
+    let html = clean(html);
+    let fragment = Html::parse_fragment(&html);
+    let mut sources: Vec<String> = Vec::new();
+    for element in fragment
+        .root_element()
+        .descendants()
+        .filter_map(ElementRef::wrap)
+    {
+        if element.value().name() == "img"
+            && let Some(src) = element.value().attr("src")
+            && !sources.iter().any(|s| s == src)
+        {
+            sources.push(src.to_string());
+        }
+    }
+    sources.truncate(10);
+    sources
+}
+
+fn unescape(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// Whether the formatted text editor can edit this signature without dropping anything
@@ -528,9 +603,21 @@ fn open_tag(name: &str, element: &scraper::node::Element, profile: Profile) -> O
         let src = element.attr("src").and_then(|s| safe_url(s, false))?;
         let alt = element.attr("alt").unwrap_or("").trim();
         if profile == Profile::Display {
+            // A placeholder that keeps the address and size, for `for_display_with` to
+            // swap for the downloaded copy. Written by us only: class is never kept from
+            // the signature itself, so a signature cannot forge one.
             let label = if alt.is_empty() { "Image" } else { alt };
+            let mut tag = format!(
+                "<span class=\"nimbra-image\" data-src=\"{}\"",
+                escape_attr(&src)
+            );
+            for (attr, data) in [("width", "data-w"), ("height", "data-h")] {
+                if let Some(value) = element.attr(attr).filter(|v| dimension(v)) {
+                    tag.push_str(&format!(" {data}=\"{value}\""));
+                }
+            }
             return Some(format!(
-                "<span class=\"nimbra-image\">{}</span>",
+                "{tag}>{}</span>",
                 escape_text(&label.chars().take(80).collect::<String>())
             ));
         }
@@ -915,19 +1002,49 @@ mod tests {
     }
 
     #[test]
+    fn kept_images_show_as_their_copy() {
+        let html = "<div><img src=\"https://x.co/logo.png\" alt=\"Logo\" width=\"120\"> \
+            <img src=\"https://x.co/other.png\"></div>";
+        let shown = for_display_with(html, |src| {
+            (src == "https://x.co/logo.png").then(|| "data:image/png;base64,AAAA".to_string())
+        });
+        assert!(shown.contains(
+            "<img class=\"nimbra-picture\" src=\"data:image/png;base64,AAAA\" alt=\"Logo\" width=\"120\">"
+        ));
+        // The other is still a placeholder, and nothing remote is left to load.
+        assert!(shown.contains(">Image</span>"));
+        assert_eq!(shown.matches("<img").count(), 1);
+        assert!(!shown.contains(" src=\"https"));
+        // Only data: images are ever written.
+        let bad = for_display_with(html, |_| Some("https://evil.example/x.png".to_string()));
+        assert!(!bad.contains("<img"));
+        assert_eq!(
+            image_sources(html),
+            vec!["https://x.co/logo.png", "https://x.co/other.png"]
+        );
+    }
+
+    #[test]
+    fn a_signature_cannot_forge_a_picture() {
+        let html = "<span class=\"nimbra-image\" data-src=\"https://x.co/a.png\">x</span>";
+        let shown = for_display_with(html, |_| Some("data:image/png;base64,AAAA".into()));
+        assert!(!shown.contains("<img"));
+    }
+
+    #[test]
     fn images_are_placeholders_for_display() {
         let html = "<div><img src=\"https://x.co/logo.png\" alt=\"Nimbra logo\"> <img src=\"https://x.co/b.png\"> <img src=\"javascript:x\" alt=\"bad\"></div>";
         assert_eq!(
-            for_display(html),
-            "<div><span class=\"nimbra-image\">Nimbra logo</span> <span class=\"nimbra-image\">Image</span> </div>"
+            for_display_with(html, |_| None),
+            "<div><span class=\"nimbra-image\" data-src=\"https://x.co/logo.png\">Nimbra logo</span> <span class=\"nimbra-image\" data-src=\"https://x.co/b.png\">Image</span> </div>"
         );
         assert_eq!(
-            for_display("<img src=\"https://x.co/a.png\" alt=\"<b>&\">"),
-            "<span class=\"nimbra-image\">&lt;b&gt;&amp;</span>"
+            for_display_with("<img src=\"https://x.co/a.png\" alt=\"<b>&\">", |_| None),
+            "<span class=\"nimbra-image\" data-src=\"https://x.co/a.png\">&lt;b&gt;&amp;</span>"
         );
         // A class is only ever set by this: the signature's own are dropped.
         assert_eq!(
-            for_display("<span class=\"nimbra-image\">x</span>"),
+            for_display_with("<span class=\"nimbra-image\">x</span>", |_| None),
             "<span>x</span>"
         );
     }
