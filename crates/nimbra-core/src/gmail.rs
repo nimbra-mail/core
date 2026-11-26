@@ -110,19 +110,39 @@ impl Config {
     }
 }
 
-/// One OAuth setting: from the environment, falling back to `~/.config/nimbra/oauth.env`.
-/// `None` when it is not there or empty.
+/// One OAuth setting: from the environment, then `~/.config/nimbra/oauth.env`, then the
+/// one a release build was made with (see `built_in`). `None` when none has it.
 pub(crate) fn oauth_setting(key: &str) -> Option<String> {
-    let value = std::env::var(key).ok().or_else(|| {
-        let file = std::env::var_os("HOME")
-            .map(|home| std::path::Path::new(&home).join(".config/nimbra/oauth.env"))
-            .and_then(|path| std::fs::read_to_string(path).ok())?;
-        file.lines().find_map(|line| {
-            let (name, value) = line.split_once('=')?;
-            (name.trim() == key).then(|| value.trim().trim_matches('"').to_string())
+    let set = |value: String| (!value.is_empty()).then_some(value);
+    std::env::var(key)
+        .ok()
+        .and_then(set)
+        .or_else(|| {
+            let file = std::env::var_os("HOME")
+                .map(|home| std::path::Path::new(&home).join(".config/nimbra/oauth.env"))
+                .and_then(|path| std::fs::read_to_string(path).ok())?;
+            file.lines().find_map(|line| {
+                let (name, value) = line.split_once('=')?;
+                (name.trim() == key)
+                    .then(|| value.trim().trim_matches('"').to_string())
+                    .and_then(set)
+            })
         })
-    })?;
-    (!value.is_empty()).then_some(value)
+        .or_else(|| built_in(key).map(str::to_string).and_then(set))
+}
+
+/// The OAuth clients a release build carries, so that anyone can sign in without setting
+/// up their own (`scripts/bundle-macos.sh` passes them in from `oauth.env` when
+/// `NIMBRA_RELEASE=1`). None of them is secret: Google treats a desktop app's client secret
+/// as public, as anyone can read it from the app, and the sign-in itself is protected by
+/// PKCE and a loopback redirect.
+fn built_in(key: &str) -> Option<&'static str> {
+    match key {
+        "NIMBRA_GOOGLE_CLIENT_ID" => option_env!("NIMBRA_BUILTIN_GOOGLE_CLIENT_ID"),
+        "NIMBRA_GOOGLE_CLIENT_SECRET" => option_env!("NIMBRA_BUILTIN_GOOGLE_CLIENT_SECRET"),
+        "NIMBRA_MICROSOFT_CLIENT_ID" => option_env!("NIMBRA_BUILTIN_MICROSOFT_CLIENT_ID"),
+        _ => None,
+    }
 }
 
 // ------------------------------------------------------------------ keychain
