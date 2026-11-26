@@ -62,6 +62,9 @@ pub struct Settings {
     pub quote_replies: bool,
     /// New-mail notifications play a sound.
     pub notify_sound: bool,
+    /// The first screen's hello has played (it plays once, ever).
+    #[serde(default)]
+    pub welcomed: bool,
     /// The Dock icon shows the inbox's unread count.
     pub dock_badge: bool,
     /// The size of text in the reader.
@@ -160,6 +163,7 @@ impl Default for Settings {
             undo_send: 6,
             quote_replies: true,
             notify_sound: true,
+            welcomed: false,
             dock_badge: true,
             reader_text: TextSize::Default,
             usage_counts: true,
