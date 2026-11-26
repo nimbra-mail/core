@@ -4,7 +4,9 @@
 //!
 //! Security notes:
 //! - Sign-in is the OAuth "installed app" flow with PKCE (S256) and a random `state`,
-//!   redirecting to a listener bound to 127.0.0.1 only.
+//!   redirecting to a listener bound to 127.0.0.1 only (`SignIn`). Where there is no
+//!   listener (iOS), the app's browser session comes back to its own custom-scheme redirect,
+//!   which is checked as strictly (`Authorization::finish`, `oauth::code`).
 //! - The refresh token lives in the OS keychain. Access tokens stay in memory.
 //! - Tokens and the client secret are never logged or put into error messages.
 //! - HTML mail is converted to text; no remote content is ever fetched.
@@ -94,19 +96,46 @@ impl std::error::Error for NeedsFullAccess {}
 #[derive(Clone)]
 pub struct Config {
     client_id: String,
-    client_secret: String,
+    /// A desktop client's secret. An iOS client has none.
+    client_secret: Option<String>,
 }
 
 impl Config {
     /// Reads the OAuth client from the environment, falling back to
-    /// `~/.config/nimbra/oauth.env`. Returns `None` when it is not configured.
+    /// `~/.config/nimbra/oauth.env`. Returns `None` when it is not configured. This is the
+    /// desktop client, which has a secret.
     pub fn load() -> Option<Self> {
         let client_id = oauth_setting("NIMBRA_GOOGLE_CLIENT_ID")?;
         let client_secret = oauth_setting("NIMBRA_GOOGLE_CLIENT_SECRET")?;
         Some(Self {
             client_id,
-            client_secret,
+            client_secret: Some(client_secret),
         })
+    }
+
+    /// The client the app was given: an iOS client passes no secret. `None` when the id is
+    /// empty.
+    pub fn new(client_id: &str, client_secret: Option<&str>) -> Option<Self> {
+        let client_id = client_id.trim();
+        if client_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            client_id: client_id.to_string(),
+            client_secret: client_secret
+                .map(str::trim)
+                .filter(|secret| !secret.is_empty())
+                .map(String::from),
+        })
+    }
+
+    /// The form fields that say which client this is.
+    fn fields(&self) -> Vec<(&'static str, &str)> {
+        let mut fields = vec![("client_id", self.client_id.as_str())];
+        if let Some(secret) = &self.client_secret {
+            fields.push(("client_secret", secret.as_str()));
+        }
+        fields
     }
 }
 
@@ -230,10 +259,11 @@ fn check_same_account(expected: &str, signed_in: &str) -> Result<()> {
     Ok(())
 }
 
-/// A sign-in in progress: the browser has been pointed at `url` and we are waiting for
-/// Google to redirect back to our loopback listener.
-pub struct SignIn {
-    listener: TcpListener,
+/// A sign-in asked of Google and not back yet: what the code exchange needs (the PKCE
+/// verifier, the redirect) and what the redirect is checked against (`state`). Whoever
+/// started it brings the code back: the loopback listener (`SignIn`), or the app's own
+/// browser session with a custom-scheme redirect (`finish`, on iOS).
+pub struct Authorization {
     redirect_uri: String,
     verifier: String,
     state: String,
@@ -241,17 +271,25 @@ pub struct SignIn {
     expected: Option<String>,
 }
 
-impl SignIn {
-    /// Starts listening and returns the URL to open in the user's browser.
+/// A sign-in in progress: the browser has been pointed at `url` and we are waiting for
+/// Google to redirect back to our loopback listener.
+pub struct SignIn {
+    listener: TcpListener,
+    authorization: Authorization,
+}
+
+impl Authorization {
+    /// The URL to open in the browser, for a sign-in that comes back to `redirect_uri`.
     /// `full` also asks for permanent deletion (see `FULL_SCOPE`). `expected` is the address
     /// of the account being signed in to again: the browser is pointed at it, and no other
-    /// is accepted (see `finish`).
-    pub fn start(config: &Config, full: bool, expected: Option<&str>) -> Result<(Self, String)> {
-        // Loopback only, on a port picked by the OS.
-        let listener =
-            TcpListener::bind(("127.0.0.1", 0)).context("opening a local port for sign-in")?;
-        listener.set_nonblocking(true)?;
-        let redirect_uri = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+    /// is accepted (see `exchange`).
+    pub fn start(
+        config: &Config,
+        redirect_uri: &str,
+        full: bool,
+        expected: Option<&str>,
+    ) -> Result<(Self, String)> {
+        let redirect_uri = redirect_uri.to_string();
         let verifier = random_token()?;
         let state = random_token()?;
         let mut url = url::Url::parse_with_params(
@@ -274,7 +312,6 @@ impl SignIn {
         }
         Ok((
             Self {
-                listener,
                 redirect_uri,
                 verifier,
                 state,
@@ -284,18 +321,23 @@ impl SignIn {
         ))
     }
 
-    /// Blocks until the browser comes back (or the timeout passes), exchanges the code and
-    /// stores the refresh token in the keychain.
-    pub fn finish(self, config: &Config, account: &str) -> Result<Client> {
-        let code = self.wait_for_code()?;
-        let tokens = token_request(&[
+    /// The address the browser came back to (`callback`) is read for its code, which is
+    /// exchanged as `exchange` does. Blocking.
+    pub fn finish(self, config: &Config, account: &str, callback: &str) -> Result<Client> {
+        let code = crate::oauth::code(&self.redirect_uri, callback, &self.state, "Google")?;
+        self.exchange(config, account, &code)
+    }
+
+    /// Exchanges the code and stores the refresh token in the keychain. Blocking.
+    pub fn exchange(self, config: &Config, account: &str, code: &str) -> Result<Client> {
+        let mut form = vec![
             ("grant_type", "authorization_code"),
-            ("code", &code),
+            ("code", code),
             ("code_verifier", &self.verifier),
-            ("client_id", &config.client_id),
-            ("client_secret", &config.client_secret),
-            ("redirect_uri", &self.redirect_uri),
-        ])?;
+        ];
+        form.extend(config.fields());
+        form.push(("redirect_uri", &self.redirect_uri));
+        let tokens = token_request(&form)?;
         let refresh = tokens
             .refresh_token
             .ok_or_else(|| anyhow!("Google did not return a long-lived sign-in"))?;
@@ -312,6 +354,33 @@ impl SignIn {
         }
         store_refresh_token(account, &refresh)?;
         Ok(client)
+    }
+}
+
+impl SignIn {
+    /// Starts listening and returns the URL to open in the user's browser. `full` and
+    /// `expected` are as for `Authorization::start`.
+    pub fn start(config: &Config, full: bool, expected: Option<&str>) -> Result<(Self, String)> {
+        // Loopback only, on a port picked by the OS.
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).context("opening a local port for sign-in")?;
+        listener.set_nonblocking(true)?;
+        let redirect_uri = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+        let (authorization, url) = Authorization::start(config, &redirect_uri, full, expected)?;
+        Ok((
+            Self {
+                listener,
+                authorization,
+            },
+            url,
+        ))
+    }
+
+    /// Blocks until the browser comes back (or the timeout passes), exchanges the code and
+    /// stores the refresh token in the keychain.
+    pub fn finish(self, config: &Config, account: &str) -> Result<Client> {
+        let code = self.wait_for_code()?;
+        self.authorization.exchange(config, account, &code)
     }
 
     fn wait_for_code(&self) -> Result<String> {
@@ -352,7 +421,8 @@ impl SignIn {
                 .map(|(_, value)| value.into_owned())
         };
 
-        if url.path() != "/" || param("state").as_deref() != Some(self.state.as_str()) {
+        if url.path() != "/" || param("state").as_deref() != Some(self.authorization.state.as_str())
+        {
             respond(&stream, "404 Not Found", "Not found.");
             return None;
         }
@@ -482,13 +552,12 @@ impl Client {
         {
             return Ok(token.clone());
         }
-        let tokens = token_request(&[
+        let mut form = vec![
             ("grant_type", "refresh_token"),
-            ("refresh_token", &self.refresh_token),
-            ("client_id", &self.config.client_id),
-            ("client_secret", &self.config.client_secret),
-        ])
-        .map_err(|e| {
+            ("refresh_token", self.refresh_token.as_str()),
+        ];
+        form.extend(self.config.fields());
+        let tokens = token_request(&form).map_err(|e| {
             if !e.is::<SignedOut>() {
                 return e;
             }
@@ -2510,7 +2579,7 @@ mod tests {
     fn sign_in_url_has_pkce_and_loopback_redirect() {
         let config = Config {
             client_id: "id.apps.googleusercontent.com".into(),
-            client_secret: "secret".into(),
+            client_secret: Some("secret".into()),
         };
         let (sign_in, url) = SignIn::start(&config, false, None).unwrap();
         let url = url::Url::parse(&url).unwrap();
@@ -2523,8 +2592,11 @@ mod tests {
         };
         assert!(get("redirect_uri").starts_with("http://127.0.0.1:"));
         assert_eq!(get("code_challenge_method"), "S256");
-        assert_eq!(get("code_challenge"), pkce_challenge(&sign_in.verifier));
-        assert_eq!(get("state"), sign_in.state);
+        assert_eq!(
+            get("code_challenge"),
+            pkce_challenge(&sign_in.authorization.verifier)
+        );
+        assert_eq!(get("state"), sign_in.authorization.state);
         assert!(!url.as_str().contains("secret"));
         // Full mail access (permanent delete) is only asked for when it is needed.
         assert_eq!(get("scope"), SCOPE);
@@ -2542,11 +2614,11 @@ mod tests {
     fn redirect_with_wrong_state_is_ignored() {
         let config = Config {
             client_id: "id".into(),
-            client_secret: "secret".into(),
+            client_secret: Some("secret".into()),
         };
         let (sign_in, _) = SignIn::start(&config, false, None).unwrap();
         let port = sign_in.listener.local_addr().unwrap().port();
-        let state = sign_in.state.clone();
+        let state = sign_in.authorization.state.clone();
         let waiter = std::thread::spawn(move || sign_in.wait_for_code());
         let hit = |path: String| {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();

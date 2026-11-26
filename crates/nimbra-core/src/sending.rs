@@ -192,7 +192,8 @@ impl Job {
         self.state().outgoing.subject.clone()
     }
 
-    fn mail(&self) -> (Option<String>, Arc<mail::Outgoing>) {
+    /// Its draft (when saved) and the message, as it is now.
+    pub fn mail(&self) -> (Option<String>, Arc<mail::Outgoing>) {
         let state = self.state();
         (state.draft_id.clone(), state.outgoing.clone())
     }

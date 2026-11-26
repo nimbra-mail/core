@@ -308,7 +308,7 @@ impl Settings {
         if old.trim().is_empty() || !self.signatures.is_empty() || self.accounts.is_empty() {
             return;
         }
-        let html = crate::signature::clean(&crate::editor::text_to_html(old));
+        let html = crate::signature::clean(&crate::rich::text_to_html(old));
         let accounts: Vec<String> = self.accounts.iter().map(|a| a.id.clone()).collect();
         for account in accounts {
             let id = self.new_signature_id();
@@ -325,6 +325,9 @@ impl Settings {
 }
 
 fn path() -> Option<PathBuf> {
+    if let Some(dir) = crate::paths::data_dir() {
+        return Some(dir.join("settings.json"));
+    }
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join("Library/Application Support/Nimbra/settings.json"))
 }

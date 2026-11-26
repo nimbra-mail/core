@@ -1,0 +1,35 @@
+[package]
+name = "nimbra-core"
+version = "0.1.0"
+edition = "2024"
+description = "Nimbra's mail engine, without any UI: providers (Gmail, Microsoft, IMAP and SMTP), MIME, discovery, the encrypted store, sending, contacts, signatures and preferences."
+license = "MIT"
+publish = false
+
+[features]
+# Temporary stores and the like, for the app's own tests.
+test-support = []
+
+[dependencies]
+anyhow = "1.0.105"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+chrono = "0.4.45"
+futures = "0.3"
+getrandom = "0.2"
+html2text = "0.17.4"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+# IMAP for accounts that are not Gmail. Without its own TLS: `tls.rs` gives it rustls.
+imap = { version = "=3.0.0-alpha.15", default-features = false }
+# Its protocol types (folder attributes, appended UIDs), which it does not re-export.
+imap-proto = "0.16"
+mail-parser = { version = "0.11", features = ["full_encoding"] }
+# The same TLS stack ureq uses, for IMAP and SMTP.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+scraper = "0.29.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.2"
+ureq = { version = "2", features = ["json"] }
+url = "2.5.9"
+webpki-roots = "1"

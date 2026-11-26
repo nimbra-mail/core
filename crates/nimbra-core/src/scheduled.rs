@@ -50,6 +50,14 @@ pub fn add_soon(
     })
 }
 
+/// Takes one off the list without sending it (its draft stays). Blocking.
+pub fn remove(store: &Store, draft_id: &str) -> anyhow::Result<()> {
+    store.update(LIST, |list: &mut Vec<Scheduled>| {
+        list.retain(|kept| kept.draft_id != draft_id);
+    })?;
+    Ok(())
+}
+
 /// Sends one, unless someone else is on it or has sent it. `None`: nothing came of it.
 /// Blocking.
 pub fn send(store: &Store, client: &mail::Client, draft_id: &str) -> Option<Outcome> {

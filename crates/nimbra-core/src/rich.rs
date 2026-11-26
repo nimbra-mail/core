@@ -636,6 +636,26 @@ pub fn sniff(bytes: &[u8]) -> Option<ImageKind> {
     }
 }
 
+/// Text for the editor: escaped, one line per `<div>` (as the page itself writes them).
+pub fn text_to_html(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.is_empty() {
+                "<div><br></div>".to_string()
+            } else {
+                format!("<div>{}</div>", escape(line))
+            }
+        })
+        .collect()
+}
+
+pub fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

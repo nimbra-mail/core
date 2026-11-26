@@ -83,7 +83,7 @@ impl Writer {
         WRITER.get_or_init(Writer::new).clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn hand_over(self: &Arc<Self>, task: Task) {
         self.hand_over_marked(|_| {}, task);
     }
@@ -165,7 +165,7 @@ pub fn flush(deadline: Instant) -> bool {
 }
 
 /// `flush` for the writer of one store (tests have writers of their own).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn flush_store(store: &Store, deadline: Instant) -> bool {
     store.writer.flush(deadline)
 }
@@ -257,7 +257,7 @@ impl Store {
     }
 
     /// A store in a fresh temporary folder, for tests elsewhere.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn temp() -> Self {
         let mut id = [0u8; 8];
         getrandom::getrandom(&mut id).unwrap();
@@ -271,7 +271,7 @@ impl Store {
 
     /// A store in a fresh temporary folder with a writer of its own, which waits to start
     /// until the sender is used or dropped.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn temp_held() -> (Arc<Self>, mpsc::Sender<()>) {
         let dir = std::env::temp_dir().join(format!("nimbra-test-{}", random_suffix().unwrap()));
         let store = Arc::new(Store::open_with(dir, &[9; 32], Writer::new()).unwrap());
@@ -284,7 +284,7 @@ impl Store {
 
     /// Another store over the same folder and key, with nothing handed to its writer: what
     /// a later launch would read.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn temp_like(other: &Store) -> Self {
         Store::open_with(other.dir.clone(), &[9; 32], Writer::new()).unwrap()
     }
@@ -686,6 +686,9 @@ fn default_dir(account: &str) -> Result<PathBuf> {
 }
 
 fn base_dir() -> Result<PathBuf> {
+    if let Some(dir) = crate::paths::data_dir() {
+        return Ok(dir.to_path_buf());
+    }
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("no home folder"))?;
     let base = if cfg!(target_os = "macos") {
         PathBuf::from(home).join("Library/Application Support/Nimbra")

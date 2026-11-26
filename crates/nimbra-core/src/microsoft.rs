@@ -8,7 +8,9 @@
 //! Security notes:
 //! - Nimbra is a public client: there is no client secret. Sign-in is the OAuth
 //!   authorization code flow with PKCE (S256) and a random `state`, redirecting to a
-//!   listener on the loopback addresses only (127.0.0.1 and ::1, one port).
+//!   listener on the loopback addresses only (127.0.0.1 and ::1, one port). Where there is
+//!   no listener (iOS), the app's browser session comes back to its own custom-scheme
+//!   redirect, checked as strictly (`Authorization::finish`, `oauth::code`).
 //! - Only the expected path with the expected `state` is taken from the browser; anything
 //!   else is answered with 404 and ignored.
 //! - The refresh token lives in the OS keychain, under its account's id. Microsoft hands out
@@ -411,15 +413,74 @@ fn redirect(request_line: &str, state: &str) -> Redirect {
     }
 }
 
+/// A sign-in asked of Microsoft and not back yet: the PKCE verifier and the redirect for
+/// the code exchange, and the `state` the redirect is checked against. The code comes back
+/// through the loopback listeners (`SignIn`), or to the app's custom-scheme redirect from its
+/// own browser session (`finish`, on iOS).
+pub struct Authorization {
+    redirect_uri: String,
+    verifier: String,
+    state: String,
+}
+
 /// A sign-in in progress: the browser has been pointed at Microsoft, and the listeners wait
 /// for it to come back.
 pub struct SignIn {
     /// 127.0.0.1 and, where it could be had on the same port, ::1: "localhost" can be
     /// either in the browser.
     listeners: Vec<TcpListener>,
-    redirect_uri: String,
-    verifier: String,
-    state: String,
+    authorization: Authorization,
+}
+
+impl Authorization {
+    /// The URL to open in the browser, for a sign-in that comes back to `redirect_uri`.
+    /// `hint` (an address) is filled in on Microsoft's page.
+    pub fn start(
+        config: &Config,
+        redirect_uri: &str,
+        hint: Option<&str>,
+    ) -> Result<(Self, String)> {
+        let verifier = random_token()?;
+        let state = random_token()?;
+        let url = authorize_url(config, redirect_uri, &verifier, &state, hint)?;
+        Ok((
+            Self {
+                redirect_uri: redirect_uri.to_string(),
+                verifier,
+                state,
+            },
+            url,
+        ))
+    }
+
+    /// The address the browser came back to (`callback`) is read for its code, which is
+    /// exchanged as `exchange` does. Blocking.
+    pub fn finish(self, config: &Config, callback: &str) -> Result<(String, Tokens)> {
+        let code = crate::oauth::code(&self.redirect_uri, callback, &self.state, "Microsoft")?;
+        self.exchange(config, &code)
+    }
+
+    /// Exchanges the code. Returns the address that signed in and its sign-in, which is not
+    /// saved anywhere yet (see `Tokens::saved_as`). Blocking.
+    pub fn exchange(self, config: &Config, code: &str) -> Result<(String, Tokens)> {
+        let reply = token_request(&[
+            ("client_id", &config.client_id),
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", &self.redirect_uri),
+            ("code_verifier", &self.verifier),
+            ("scope", SCOPE),
+        ])?;
+        let email = address_from_id_token(reply.id_token.as_deref().unwrap_or_default())?;
+        let refresh = reply
+            .refresh_token
+            .clone()
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| anyhow!("Microsoft did not return a long-lived sign-in"))?;
+        let tokens = Tokens::new(config.clone(), refresh, String::new());
+        tokens.remember(&reply.access_token, reply.expires_in);
+        Ok((email, tokens))
+    }
 }
 
 /// Both loopback addresses on one port picked by the OS. IPv4 alone when ::1 cannot be
@@ -449,15 +510,11 @@ impl SignIn {
         }
         // The app's registration has `http://localhost`, which takes any port.
         let redirect_uri = format!("http://localhost:{}", listeners[0].local_addr()?.port());
-        let verifier = random_token()?;
-        let state = random_token()?;
-        let url = authorize_url(config, &redirect_uri, &verifier, &state, hint)?;
+        let (authorization, url) = Authorization::start(config, &redirect_uri, hint)?;
         Ok((
             Self {
                 listeners,
-                redirect_uri,
-                verifier,
-                state,
+                authorization,
             },
             url,
         ))
@@ -468,23 +525,7 @@ impl SignIn {
     /// (see `Tokens::saved_as`).
     pub fn finish(self, config: &Config) -> Result<(String, Tokens)> {
         let code = self.wait_for_code()?;
-        let reply = token_request(&[
-            ("client_id", &config.client_id),
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", &self.redirect_uri),
-            ("code_verifier", &self.verifier),
-            ("scope", SCOPE),
-        ])?;
-        let email = address_from_id_token(reply.id_token.as_deref().unwrap_or_default())?;
-        let refresh = reply
-            .refresh_token
-            .clone()
-            .filter(|r| !r.is_empty())
-            .ok_or_else(|| anyhow!("Microsoft did not return a long-lived sign-in"))?;
-        let tokens = Tokens::new(config.clone(), refresh, String::new());
-        tokens.remember(&reply.access_token, reply.expires_in);
-        Ok((email, tokens))
+        self.authorization.exchange(config, &code)
     }
 
     fn wait_for_code(&self) -> Result<String> {
@@ -520,7 +561,7 @@ impl SignIn {
         BufReader::new(std::io::Read::take(&stream, 8 * 1024))
             .read_line(&mut request_line)
             .ok()?;
-        match redirect(&request_line, &self.state) {
+        match redirect(&request_line, &self.authorization.state) {
             Redirect::Ignore => {
                 respond(&stream, "404 Not Found", "Not found.");
                 None
@@ -758,13 +799,14 @@ mod tests {
     fn the_listener_waits_through_stray_requests_for_the_redirect() {
         let (pending, url) = SignIn::start(&config(), None).unwrap();
         let port: u16 = pending
+            .authorization
             .redirect_uri
             .strip_prefix("http://localhost:")
             .unwrap()
             .parse()
             .unwrap();
         assert!(url.contains(&format!("localhost%3A{port}")));
-        let state = pending.state.clone();
+        let state = pending.authorization.state.clone();
         let browser = std::thread::spawn(move || {
             let ask = |host: &str, target: &str| {
                 let mut stream = TcpStream::connect((host, port)).unwrap();

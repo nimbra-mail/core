@@ -1,0 +1,32 @@
+[package]
+name = "nimbra-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "Nimbra's mail engine for Swift: a UniFFI facade over nimbra-core."
+license = "MIT"
+publish = false
+
+[lib]
+# `lib` for Rust tests, `staticlib` for the iOS XCFramework, `cdylib` for generating the
+# Swift bindings from the library's metadata.
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "nimbra_ffi"
+
+[[bin]]
+# Generates the Swift bindings (`scripts/build-ios-core.sh`). Host only.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+nimbra-core = { path = "../nimbra-core" }
+anyhow = "1.0.105"
+keyring = "3"
+uniffi = "0.33"
+
+[dev-dependencies]
+nimbra-core = { path = "../nimbra-core", features = ["test-support"] }
+url = "2.5.9"

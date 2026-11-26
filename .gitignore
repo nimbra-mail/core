@@ -1,0 +1,18 @@
+/target
+.DS_Store
+
+# Built by scripts/build-ios-core.sh: the XCFramework (and its zip for a release).
+/NimbraFFI.xcframework/
+/NimbraFFI.xcframework.zip
+
+# Swift Package Manager and Xcode
+.build/
+.swiftpm/
+xcuserdata/
+DerivedData/
+
+# Plans and notes kept locally
+tasks/
+
+# Local notes, kept outside the repo
+CLAUDE.md

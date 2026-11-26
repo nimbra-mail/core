@@ -1,0 +1,6 @@
+# How the Swift bindings are generated (scripts/build-ios-core.sh).
+[bindings.swift]
+# The Swift module the app imports, and the C module the XCFramework carries under it.
+module_name = "NimbraCore"
+ffi_module_name = "NimbraFFI"
+ffi_module_filename = "NimbraFFI"

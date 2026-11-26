@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/nimbra-core", "crates/nimbra-ffi"]
+resolver = "3"

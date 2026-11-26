@@ -328,7 +328,7 @@ pub fn mime_for(name: &str) -> &'static str {
     }
 }
 
-pub(crate) fn random_hex(bytes: usize) -> Result<String> {
+pub fn random_hex(bytes: usize) -> Result<String> {
     let mut buffer = vec![0u8; bytes];
     getrandom::getrandom(&mut buffer).map_err(|e| anyhow!("no secure random source: {e}"))?;
     Ok(buffer.iter().map(|b| format!("{b:02x}")).collect())
@@ -797,7 +797,7 @@ pub(crate) fn unsubscribe_link(header: &str) -> Option<String> {
         .map(|l| l.to_string())
 }
 
-pub(crate) fn address_of(value: &str) -> String {
+pub fn address_of(value: &str) -> String {
     let value = value.trim();
     match (value.rfind('<'), value.rfind('>')) {
         (Some(open), Some(close)) if open < close => value[open + 1..close].trim().to_string(),
@@ -807,7 +807,7 @@ pub(crate) fn address_of(value: &str) -> String {
 
 /// A deliberately strict address check: one `@`, a dotted domain, and only characters
 /// that cannot break out of a header.
-pub(crate) fn is_address(address: &str) -> bool {
+pub fn is_address(address: &str) -> bool {
     let Some((local, domain)) = address.split_once('@') else {
         return false;
     };
