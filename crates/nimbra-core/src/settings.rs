@@ -139,6 +139,25 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Moves an account to another place in the list. The default account stays the
+    /// default: without one chosen it is the first, so it is pinned before anything moves.
+    /// Returns whether anything moved.
+    pub fn move_account(&mut self, id: &str, to: usize) -> bool {
+        let Some(from) = self.accounts.iter().position(|a| a.id == id) else {
+            return false;
+        };
+        let to = to.min(self.accounts.len() - 1);
+        if from == to {
+            return false;
+        }
+        if self.default_account.is_none() {
+            self.default_account = self.default_account().map(str::to_string);
+        }
+        let account = self.accounts.remove(from);
+        self.accounts.insert(to, account);
+        true
+    }
+
     /// The default account's id, when any account is signed in. The first account's id is
     /// "", so this is never tested for emptiness.
     pub fn default_account(&self) -> Option<&str> {
@@ -324,6 +343,54 @@ impl<T: Send + 'static> Latest<T> {
 
 #[cfg(test)]
 mod tests {
+
+    fn three() -> Settings {
+        let account = |id: &str| AccountRef {
+            id: id.into(),
+            email: format!("{id}@example.com"),
+            servers: None,
+            oauth: None,
+        };
+        Settings {
+            accounts: vec![account("a"), account("b"), account("c")],
+            ..Settings::default()
+        }
+    }
+
+    fn order(settings: &Settings) -> Vec<&str> {
+        settings.accounts.iter().map(|a| a.id.as_str()).collect()
+    }
+
+    #[test]
+    fn an_account_moves_to_where_it_is_dropped() {
+        let mut settings = three();
+        assert!(settings.move_account("a", 2));
+        assert_eq!(order(&settings), ["b", "c", "a"]);
+        assert!(settings.move_account("a", 0));
+        assert_eq!(order(&settings), ["a", "b", "c"]);
+        assert!(settings.move_account("c", 1));
+        assert_eq!(order(&settings), ["a", "c", "b"]);
+    }
+
+    #[test]
+    fn moving_the_first_account_keeps_it_the_default() {
+        let mut settings = three();
+        assert_eq!(settings.default_account(), Some("a"));
+        settings.move_account("b", 0);
+        assert_eq!(order(&settings), ["b", "a", "c"]);
+        assert_eq!(settings.default_account(), Some("a"));
+    }
+
+    #[test]
+    fn a_move_to_the_same_place_or_of_an_unknown_account_changes_nothing() {
+        let mut settings = three();
+        assert!(!settings.move_account("b", 1));
+        assert!(!settings.move_account("z", 0));
+        assert!(!settings.move_account("c", 9));
+        assert_eq!(order(&settings), ["a", "b", "c"]);
+        assert_eq!(settings.default_account, None);
+    }
+
     use super::*;
     use std::sync::mpsc;
 
