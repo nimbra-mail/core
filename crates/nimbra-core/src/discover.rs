@@ -19,9 +19,9 @@
 //!   by mail server sends only the mail server's domain.
 //! - Last, the usual host names are tried directly (`mail.<domain>`, the domain's own MX
 //!   host, `imap.`/`smtp.<domain>`), as Apple Mail and Outlook do, which finds most
-//!   cPanel and shared hosting. Only a secure handshake is made (nothing is sent, no
-//!   password), only to hosts under the address's own domain, and a host counts only when
-//!   its certificate is valid for that very name.
+//!   cPanel and shared hosting. Only a secure handshake is made (on 587, after SMTP's
+//!   EHLO and STARTTLS; no address, no password), only to hosts under the address's own
+//!   domain, and a host counts only when its certificate is valid for that very name.
 //! - A server that is only reached in plain text is never offered, and POP3 is ignored.
 //!   Host names from the network are checked like typed ones, so a hostile file cannot
 //!   carry anything else into a connection.
