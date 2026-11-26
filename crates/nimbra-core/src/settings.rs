@@ -34,6 +34,11 @@ pub struct Settings {
     pub default_account: Option<String>,
     /// Sidebar sections folded away ("split", "mailbox", "labels").
     pub collapsed: Vec<String>,
+    /// The sidebar's order, by section ("split", "mailbox", "labels:<account>"): mailbox
+    /// names or label ids, as dragged (`keyboard::Sidebar::section`).
+    pub sidebar_order: std::collections::HashMap<String, Vec<String>>,
+    /// Mailboxes hidden from the sidebar, by name (`keyboard::view_name`).
+    pub sidebar_hidden: Vec<String>,
     /// The sidebar was left in auto-hide (⌘B).
     pub sidebar_auto_hide: bool,
     /// The sidebar's width, as its right edge was dragged to (docked and floating alike).
@@ -125,6 +130,8 @@ impl Default for Settings {
             active: String::new(),
             default_account: None,
             collapsed: Vec::new(),
+            sidebar_order: Default::default(),
+            sidebar_hidden: Vec::new(),
             sidebar_auto_hide: false,
             sidebar_width: 236.,
             recent_searches: Vec::new(),
