@@ -11,16 +11,13 @@ use base64::Engine as _;
 use mail_parser::{Addr, Address, HeaderValue, MessageParser, MessagePart, MimeHeaders, PartType};
 
 use crate::mail::{
-    self, Attachment, Draft, MAX_BODY_CHARS, Message, Person, ReplyTo, clean_header, is_address,
-    is_message_id, paragraphs, safe_file_name, split_quote, unsubscribe_link,
+    self, Attachment, Draft, INLINE_IMAGE_BUDGET, MAX_BODY_CHARS, MAX_HTML_BYTES, Message, Person,
+    ReplyTo, clean_header, inline_image, is_address, is_message_id, paragraphs, prefix,
+    safe_file_name, split_quote, unsubscribe_link,
 };
 
 type Parsed<'a> = mail_parser::Message<'a>;
 
-/// Larger HTML bodies stay in the native reader only, as with Gmail.
-const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
-/// How many images embedded in a message (`cid:` links) are inlined into its HTML.
-const INLINE_IMAGE_BUDGET: usize = 4 * 1024 * 1024;
 const SNIPPET_CHARS: usize = 200;
 /// A list row needs the first and the latest few, not a whole long chain.
 const MAX_REFERENCES: usize = 200;
@@ -317,15 +314,6 @@ fn address_text<'a>(lists: impl IntoIterator<Item = &'a Address<'a>>) -> String 
         .join(", ")
 }
 
-/// At most `max` bytes of `text`, cut at a character boundary.
-fn prefix(text: &str, max: usize) -> &str {
-    let mut end = max.min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.get(..end).unwrap_or_default()
-}
-
 /// The first HTML body, unless it is too large for the web view.
 fn html_of(parsed: &Parsed) -> Option<String> {
     first_html(parsed)
@@ -464,7 +452,7 @@ fn attachments(parsed: &Parsed, message_key: &str) -> Vec<Attachment> {
 
 /// Replaces `cid:` image links in `html` with the image data from the message's parts.
 fn inline_images(html: &mut String, parsed: &Parsed) {
-    let mut used = 0;
+    let mut budget = INLINE_IMAGE_BUDGET;
     for part in &parsed.parts {
         let Some(cid) = part
             .content_id()
@@ -480,23 +468,16 @@ fn inline_images(html: &mut String, parsed: &Parsed) {
         ) {
             continue;
         }
-        let reference = format!("cid:{cid}");
-        if !html.contains(&reference) {
+        if !html.contains(&format!("cid:{cid}")) {
             continue;
         }
         let bytes = match &part.body {
             PartType::Binary(bytes) | PartType::InlineBinary(bytes) => bytes.as_ref(),
             _ => continue,
         };
-        used += bytes.len();
-        if used > INLINE_IMAGE_BUDGET {
+        if !inline_image(html, &cid, &mime, bytes, &mut budget) {
             break;
         }
-        let data = format!(
-            "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        );
-        *html = html.replace(&reference, &data);
     }
 }
 
@@ -634,6 +615,34 @@ mod tests {
         for id in ["", "0", "1", "-2", "+2", " 2", "99", "99999999999999", "2a"] {
             assert_eq!(attachment(&raw, id), None, "{id:?}");
         }
+    }
+
+    #[test]
+    fn one_image_linked_many_times_does_not_multiply_the_html() {
+        let image = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 100_000]);
+        let raw = crlf(&format!(
+            "From: ana@example.com\n\
+             Content-Type: multipart/related; boundary=\"rel\"\n\
+             \n\
+             --rel\n\
+             Content-Type: text/html; charset=utf-8\n\
+             \n\
+             <p>{}</p>\n\
+             --rel\n\
+             Content-Type: image/png\n\
+             Content-ID: <a>\n\
+             Content-Transfer-Encoding: base64\n\
+             \n\
+             {image}\n\
+             --rel--\n",
+            "<img src=\"cid:a\">".repeat(200)
+        ));
+        let html = message(&raw, "uid-1").unwrap().html.unwrap();
+        assert!(
+            html.len() <= MAX_HTML_BYTES + INLINE_IMAGE_BUDGET,
+            "{} bytes",
+            html.len()
+        );
     }
 
     #[test]

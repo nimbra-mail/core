@@ -124,9 +124,29 @@ fn find_urls(text: &str) -> Vec<Range<usize>> {
 pub fn from_html(html: &str) -> Vec<Block> {
     let document = Html::parse_document(html);
     let mut builder = Builder::default();
-    builder.walk_children(document.root_element());
+    builder.walk(document.root_element());
     builder.flush();
     builder.blocks
+}
+
+/// What is left to do, the next step last. A stack, not recursion: a message can nest
+/// elements deeper than a thread's stack can follow.
+enum Step<'a> {
+    Text(&'a str),
+    Element(ElementRef<'a>),
+    Leave(Leave),
+}
+
+/// What closing an element undoes.
+enum Leave {
+    Link(Option<String>),
+    Styled(fn(&mut Builder) -> &mut u32),
+    Heading,
+    Quote(u8),
+    Pre,
+    List,
+    Item,
+    Block,
 }
 
 #[derive(Default)]
@@ -194,24 +214,20 @@ impl Builder {
         self.blocks.len() >= MAX_BLOCKS || self.chars >= MAX_CHARS
     }
 
-    fn walk_children(&mut self, element: ElementRef) {
-        for child in element.children() {
-            if self.full() {
-                return;
-            }
-            match child.value() {
-                Node::Text(text) => self.push_text(text),
-                Node::Element(_) => {
-                    if let Some(child) = ElementRef::wrap(child) {
-                        self.element(child);
-                    }
-                }
-                _ => {}
+    fn walk(&mut self, root: ElementRef) {
+        let mut steps = Vec::new();
+        push_children(&mut steps, root);
+        while let Some(step) = steps.pop() {
+            match step {
+                Step::Leave(leave) => self.leave(leave),
+                _ if self.full() => {}
+                Step::Text(text) => self.push_text(text),
+                Step::Element(element) => self.element(element, &mut steps),
             }
         }
     }
 
-    fn element(&mut self, element: ElementRef) {
+    fn element<'a>(&mut self, element: ElementRef<'a>, steps: &mut Vec<Step<'a>>) {
         let value = element.value();
         let name = value.name();
         if SKIPPED.contains(&name) || is_hidden(value.attr("style")) {
@@ -225,11 +241,12 @@ impl Builder {
         {
             return;
         }
-        match name {
+        let leave = match name {
             "br" => {
                 if !self.text.is_empty() {
                     self.text.push('\n');
                 }
+                return;
             }
             "hr" => {
                 self.flush();
@@ -237,54 +254,54 @@ impl Builder {
                     quote: self.quote,
                     ..Block::plain(Kind::Rule, String::new())
                 });
+                return;
             }
-            "img" => self.image(element),
-            "b" | "strong" => self.styled(element, |b| &mut b.bold),
-            "i" | "em" => self.styled(element, |b| &mut b.italic),
-            "code" | "tt" | "kbd" => self.styled(element, |b| &mut b.code),
+            "img" => {
+                self.image(element);
+                return;
+            }
+            "b" | "strong" => self.styled(|b| &mut b.bold),
+            "i" | "em" => self.styled(|b| &mut b.italic),
+            "code" | "tt" | "kbd" => self.styled(|b| &mut b.code),
             "a" => {
                 let previous = self.link.take();
                 self.link = value.attr("href").and_then(safe_link).or(previous.clone());
-                self.walk_children(element);
-                self.link = previous;
+                Leave::Link(previous)
             }
-            _ if BLOCKS.contains(&name) => self.block(name, element),
-            _ => self.walk_children(element),
-        }
+            _ if BLOCKS.contains(&name) => self.block(name),
+            _ => {
+                push_children(steps, element);
+                return;
+            }
+        };
+        steps.push(Step::Leave(leave));
+        push_children(steps, element);
     }
 
-    fn styled(&mut self, element: ElementRef, counter: fn(&mut Self) -> &mut u32) {
+    fn styled(&mut self, counter: fn(&mut Self) -> &mut u32) -> Leave {
         *counter(self) += 1;
-        self.walk_children(element);
-        *counter(self) -= 1;
+        Leave::Styled(counter)
     }
 
-    fn block(&mut self, name: &str, element: ElementRef) {
+    fn block(&mut self, name: &str) -> Leave {
         self.flush();
         match name {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 self.heading = Some(name.as_bytes()[1] - b'0');
-                self.walk_children(element);
-                self.flush();
-                self.heading = None;
+                Leave::Heading
             }
             "blockquote" => {
-                self.quote = self.quote.saturating_add(1);
-                self.walk_children(element);
-                self.flush();
-                self.quote -= 1;
+                let outer = self.quote;
+                self.quote = outer.saturating_add(1);
+                Leave::Quote(outer)
             }
             "pre" => {
                 self.preformatted = true;
-                self.walk_children(element);
-                self.flush();
-                self.preformatted = false;
+                Leave::Pre
             }
             "ul" | "ol" => {
                 self.lists.push((name == "ol").then_some(1));
-                self.walk_children(element);
-                self.flush();
-                self.lists.pop();
+                Leave::List
             }
             "li" => {
                 self.marker = Some(match self.lists.last_mut() {
@@ -294,14 +311,37 @@ impl Builder {
                     }
                     _ => "•".to_string(),
                 });
-                self.walk_children(element);
+                Leave::Item
+            }
+            _ => Leave::Block,
+        }
+    }
+
+    fn leave(&mut self, leave: Leave) {
+        match leave {
+            Leave::Link(outer) => self.link = outer,
+            Leave::Styled(counter) => *counter(self) -= 1,
+            Leave::Heading => {
+                self.flush();
+                self.heading = None;
+            }
+            Leave::Quote(outer) => {
+                self.flush();
+                self.quote = outer;
+            }
+            Leave::Pre => {
+                self.flush();
+                self.preformatted = false;
+            }
+            Leave::List => {
+                self.flush();
+                self.lists.pop();
+            }
+            Leave::Item => {
                 self.flush();
                 self.marker = None;
             }
-            _ => {
-                self.walk_children(element);
-                self.flush();
-            }
+            Leave::Block => self.flush(),
         }
     }
 
@@ -387,7 +427,7 @@ impl Builder {
         } else if let Some(marker) = self.marker.take() {
             Kind::Item {
                 marker,
-                depth: self.lists.len().saturating_sub(1) as u8,
+                depth: u8::try_from(self.lists.len().saturating_sub(1)).unwrap_or(u8::MAX),
             }
         } else {
             Kind::Paragraph
@@ -399,6 +439,19 @@ impl Builder {
             spans,
         });
     }
+}
+
+/// An element's text and elements, queued so the first comes off the stack first.
+fn push_children<'a>(steps: &mut Vec<Step<'a>>, element: ElementRef<'a>) {
+    let first = steps.len();
+    for child in element.children() {
+        match child.value() {
+            Node::Text(text) => steps.push(Step::Text(text)),
+            Node::Element(_) => steps.extend(ElementRef::wrap(child).map(Step::Element)),
+            _ => {}
+        }
+    }
+    steps[first..].reverse();
 }
 
 fn is_hidden(style: Option<&str>) -> bool {
@@ -437,29 +490,38 @@ pub enum ImageKind {
 
 /// Downloads one remote image, on the user's request.
 ///
-/// Limited to https on a public host name (no IP literals or localhost, so a message
-/// cannot make the app probe the local network), with a size cap and a timeout. The
-/// format is taken from the bytes, not from what the server claims.
+/// Limited to https on a public host name, at every redirect, and to hosts whose
+/// addresses are all public, so a message cannot make the app probe the local network.
+/// With a size cap and a timeout. The format is taken from the bytes, not from what the
+/// server claims.
 pub fn fetch_image(url: &str) -> Result<(ImageKind, Vec<u8>)> {
-    let parsed = url::Url::parse(url)?;
-    let host = match (parsed.scheme(), parsed.host()) {
-        ("https", Some(url::Host::Domain(host))) => host.to_ascii_lowercase(),
-        _ => bail!("only https images on a named host are loaded"),
-    };
-    if host == "localhost"
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || !host.contains('.')
-    {
-        bail!("local addresses are not loaded");
-    }
-    let response = ureq::AgentBuilder::new()
-        .redirects(3)
+    const MAX_REDIRECTS: usize = 3;
+    let mut url = image_url(url)?;
+    // The checked addresses are the ones connected to: no second lookup can swap them.
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .https_only(true)
+        .resolver(public_addresses)
         .timeout(Duration::from_secs(10))
-        .build()
-        .get(parsed.as_str())
-        .call()
-        .map_err(|_| anyhow::anyhow!("image could not be loaded"))?;
+        .build();
+    let mut redirects = 0;
+    let response = loop {
+        let response = agent
+            .get(url.as_str())
+            .call()
+            .map_err(|_| anyhow::anyhow!("image could not be loaded"))?;
+        if !(300..400).contains(&response.status()) {
+            break response;
+        }
+        redirects += 1;
+        if redirects > MAX_REDIRECTS {
+            bail!("image could not be loaded");
+        }
+        let Some(location) = response.header("location") else {
+            bail!("image could not be loaded");
+        };
+        url = image_url(url.join(location)?.as_str())?;
+    };
     let mut bytes = Vec::new();
     response
         .into_reader()
@@ -470,6 +532,93 @@ pub fn fetch_image(url: &str) -> Result<(ImageKind, Vec<u8>)> {
     }
     let kind = sniff(&bytes).ok_or_else(|| anyhow::anyhow!("not a supported image"))?;
     Ok((kind, bytes))
+}
+
+/// An https URL on a public-looking host name: no IP literals, no names for this Mac or
+/// its local network.
+fn image_url(url: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(url)?;
+    let host = match (parsed.scheme(), parsed.host()) {
+        ("https", Some(url::Host::Domain(host))) => host.to_ascii_lowercase(),
+        _ => bail!("only https images on a named host are loaded"),
+    };
+    let host = host.trim_end_matches('.');
+    if host == "localhost"
+        || [".localhost", ".local", ".internal", ".home.arpa", ".lan"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+        || !host.contains('.')
+    {
+        bail!("local addresses are not loaded");
+    }
+    Ok(parsed)
+}
+
+/// The addresses of `netloc` ("host:port"), refused unless every one is public.
+fn public_addresses(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs as _;
+    let addresses: Vec<_> = netloc.to_socket_addrs()?.collect();
+    if addresses.is_empty() || addresses.iter().any(|a| !is_public(a.ip())) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "local addresses are not loaded",
+        ));
+    }
+    Ok(addresses)
+}
+
+/// Reachable on the internet: not this machine, a private or shared network, link-local,
+/// multicast or reserved. IPv6 forms that carry an IPv4 address are judged by it.
+fn is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+    let v4 = |ip: Ipv4Addr| {
+        let [a, b, c, _] = ip.octets();
+        !(a == 0
+            || a == 10
+            || a == 127
+            || (a == 100 && (64..128).contains(&b))
+            || (a == 169 && b == 254)
+            || (a == 172 && (16..32).contains(&b))
+            || (a == 192 && b == 168)
+            || (a == 192 && b == 0 && (c == 0 || c == 2))
+            || (a == 198 && (b == 18 || b == 19))
+            || (a == 198 && b == 51 && c == 100)
+            || (a == 203 && b == 0 && c == 113)
+            || a >= 224)
+    };
+    match ip {
+        IpAddr::V4(ip) => v4(ip),
+        IpAddr::V6(ip) => {
+            let s = ip.segments();
+            let embedded = |high: u16, low: u16| {
+                Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8)
+            };
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return v4(mapped);
+            }
+            match s {
+                // Unspecified, loopback and the old IPv4-compatible form.
+                [0, 0, 0, 0, 0, 0, _, _] => false,
+                // IPv4-translated.
+                [0, 0, 0, 0, 0xffff, 0, _, _] => false,
+                // NAT64.
+                [0x64, 0xff9b, 0, 0, 0, 0, high, low] => v4(embedded(high, low)),
+                // Local NAT64 and Teredo: what they lead to cannot be told from here.
+                [0x64, 0xff9b, 1, ..] | [0x2001, 0, ..] => false,
+                // 6to4.
+                [0x2002, high, low, ..] => v4(embedded(high, low)),
+                // Documentation.
+                [0x2001, 0xdb8, ..] => false,
+                // Unique local, link-local and site-local, multicast.
+                [first, ..] => {
+                    !((first & 0xfe00) == 0xfc00
+                        || (first & 0xffc0) == 0xfe80
+                        || (first & 0xffc0) == 0xfec0
+                        || (first & 0xff00) == 0xff00)
+                }
+            }
+        }
+    }
 }
 
 fn sniff(bytes: &[u8]) -> Option<ImageKind> {
@@ -620,10 +769,90 @@ mod tests {
             "https://localhost/a.png",
             "https://router/a.png",
             "https://printer.local/a.png",
+            "https://localhost./a.png",
+            "https://2130706433/a.png",
             "file:///etc/passwd",
         ] {
             assert!(fetch_image(url).is_err(), "{url} should be refused");
         }
+    }
+
+    #[test]
+    fn image_url_refuses_hosts_that_name_this_machine_or_its_network() {
+        for url in [
+            "https://2130706433/a.png",
+            "https://0x7f.1/a.png",
+            "https://[::ffff:127.0.0.1]/a.png",
+            "https://localhost./a.png",
+            "https://LOCALHOST/a.png",
+            "https://app.localhost/a.png",
+            "https://nas.home.arpa/a.png",
+            "https://printer.local./a.png",
+            "http://cdn.example.com/a.png",
+        ] {
+            assert!(image_url(url).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn image_url_accepts_a_public_https_name() {
+        let url = image_url("https://cdn.example.com/a.png");
+        assert!(url.is_ok(), "{:?}", url.err());
+    }
+
+    #[test]
+    fn non_public_addresses_are_recognised() {
+        for ip in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "100.127.255.255",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a00:1",
+            "2002:c0a8:101::1",
+            "::ffff:0:7f00:1",
+            "::ffff:0:5db8:d70e",
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1:ffff::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!is_public(ip), "{ip} should not count as public");
+        }
+    }
+
+    #[test]
+    fn public_addresses_are_allowed() {
+        for ip in [
+            "93.184.215.14",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2606:4700::1111",
+            "::ffff:93.184.215.14",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(is_public(ip), "{ip} should count as public");
+        }
+    }
+
+    #[test]
+    fn resolver_refuses_a_name_for_this_machine() {
+        assert!(public_addresses("localhost:443").is_err());
     }
 
     #[test]
@@ -637,6 +866,45 @@ mod tests {
             Some(ImageKind::Jpeg)
         ));
         assert!(sniff(b"<svg onload=alert(1)>").is_none());
+    }
+
+    #[test]
+    fn deep_nesting_does_not_overflow_a_small_stack() {
+        let html = format!("{}deep", "<span>".repeat(100_000));
+        let blocks = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || from_html(&html))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(texts(&blocks), ["deep"]);
+    }
+
+    #[test]
+    fn quote_depth_returns_to_zero_after_more_than_255_nested_quotes() {
+        let html = format!(
+            "{}deep{}<p>after</p>",
+            "<blockquote>".repeat(300),
+            "</blockquote>".repeat(300)
+        );
+        let blocks = from_html(&html);
+        assert_eq!(
+            blocks.last().map(|b| (b.text.as_str(), b.quote)),
+            Some(("after", 0))
+        );
+    }
+
+    #[test]
+    fn list_depth_saturates_instead_of_wrapping() {
+        let html = format!("{}<li>deep</li>", "<ul>".repeat(300));
+        let blocks = from_html(&html);
+        assert_eq!(
+            blocks[0].kind,
+            Kind::Item {
+                marker: "•".into(),
+                depth: u8::MAX
+            }
+        );
     }
 
     #[test]

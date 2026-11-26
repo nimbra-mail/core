@@ -998,7 +998,7 @@ impl Client {
                     .and_then(|payload| find_part(payload, "text/html"))
                     .and_then(decode_part)
                     // Very large bodies stay in the native reader only.
-                    .filter(|bytes| bytes.len() <= 2 * 1024 * 1024)
+                    .filter(|bytes| bytes.len() <= crate::mail::MAX_HTML_BYTES)
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             })
             .collect();
@@ -1016,8 +1016,7 @@ impl Client {
 
     /// Replaces `cid:` image links in `html` with the image data from the message's parts.
     fn inline_images(&self, html: &mut String, payload: &Part, message_id: &str) {
-        const BUDGET: usize = 4 * 1024 * 1024;
-        let mut used = 0;
+        let mut budget = crate::mail::INLINE_IMAGE_BUDGET;
         let mut parts = Vec::new();
         collect_parts(payload, &mut parts);
         for part in parts {
@@ -1035,8 +1034,7 @@ impl Client {
             ) {
                 continue;
             }
-            let reference = format!("cid:{cid}");
-            if !html.contains(&reference) {
+            if !html.contains(&format!("cid:{cid}")) {
                 continue;
             }
             let bytes = match decode_part(part) {
@@ -1048,15 +1046,9 @@ impl Client {
                     .and_then(|att| self.download(message_id, att).ok()),
             };
             let Some(bytes) = bytes else { continue };
-            used += bytes.len();
-            if used > BUDGET {
+            if !crate::mail::inline_image(html, &cid, &mime, &bytes, &mut budget) {
                 break;
             }
-            let data = format!(
-                "data:{mime};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(&bytes)
-            );
-            *html = html.replace(&reference, &data);
         }
     }
 
@@ -1913,16 +1905,22 @@ fn body_text(payload: &Part) -> String {
         return String::from_utf8_lossy(&bytes).into_owned();
     }
     if let Some(bytes) = find_part(payload, "text/html").and_then(decode_part) {
-        return html2text::from_read(bytes.as_slice(), 10_000).unwrap_or_default();
+        let html = String::from_utf8_lossy(&bytes);
+        return html2text::from_read(html_prefix(&html).as_bytes(), 10_000).unwrap_or_default();
     }
     String::new()
+}
+
+/// As much of an HTML body as is read, as for IMAP mail.
+fn html_prefix(html: &str) -> &str {
+    crate::mail::prefix(html, crate::mail::MAX_HTML_BYTES)
 }
 
 /// The message as styled blocks: the HTML alternative when it has one (it carries
 /// the formatting), otherwise the plain text.
 fn body_blocks(payload: &Part) -> Vec<crate::rich::Block> {
     if let Some(bytes) = find_part(payload, "text/html").and_then(decode_part) {
-        let blocks = crate::rich::from_html(&String::from_utf8_lossy(&bytes));
+        let blocks = crate::rich::from_html(html_prefix(&String::from_utf8_lossy(&bytes)));
         if !blocks.is_empty() {
             return blocks;
         }
@@ -1933,6 +1931,30 @@ fn body_blocks(payload: &Part) -> Vec<crate::rich::Block> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn html_payload(html: &str) -> Part {
+        serde_json::from_value(serde_json::json!({
+            "mimeType": "text/html",
+            "body": { "data": URL_SAFE_NO_PAD.encode(html) },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn html_past_the_size_cap_is_not_read() {
+        let payload = html_payload(&format!(
+            "{}<p>late</p>",
+            " ".repeat(crate::mail::MAX_HTML_BYTES)
+        ));
+        let blocks = body_blocks(&payload);
+        assert!(blocks.iter().all(|b| !b.text.contains("late")));
+    }
+
+    #[test]
+    fn html_within_the_size_cap_is_read() {
+        let blocks = body_blocks(&html_payload("<p>early</p>"));
+        assert_eq!(blocks[0].text, "early");
+    }
 
     #[test]
     fn done_and_all_mail_go_message_by_message_as_gmail_does() {

@@ -38,6 +38,18 @@ pub fn add(store: &Store, item: Scheduled) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The same, handed to the store's writer: on disk before quitting ends. The answer says
+/// whether it was written.
+pub fn add_soon(
+    store: &std::sync::Arc<Store>,
+    item: Scheduled,
+) -> futures::channel::oneshot::Receiver<anyhow::Result<()>> {
+    store.update_soon(LIST, move |list: &mut Vec<Scheduled>| {
+        list.retain(|kept| kept.draft_id != item.draft_id);
+        list.push(item);
+    })
+}
+
 /// Sends one, unless someone else is on it or has sent it. `None`: nothing came of it.
 /// Blocking.
 pub fn send(store: &Store, client: &mail::Client, draft_id: &str) -> Option<Outcome> {
