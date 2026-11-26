@@ -12,7 +12,7 @@ with a key kept there, and nothing secret is logged or put into an error.
 
 | Path | What |
 | --- | --- |
-| `crates/nimbra-core` | The engine. `mail.rs` is the model and the `Provider` interface; `gmail.rs`, `microsoft.rs`, `imap_mail.rs`, `smtp.rs` and `tls.rs` the providers; `store.rs` the encrypted store; `oauth.rs` a sign-in that comes back to an app's own redirect; `paths.rs` where an app other than the Mac's keeps its files. Its `lib.rs` lists them all. |
+| `crates/nimbra-core` | The engine. `mail.rs` is the model and the `Provider` interface; `gmail.rs`, `microsoft.rs`, `imap_mail.rs`, `smtp.rs` and `tls.rs` the providers; `store.rs` the encrypted store and `listing.rs` the mailboxes kept in it (rows, change-feed sync, All inboxes, the Split Inbox, labels); `snooze.rs`, `outbox.rs`, `sending.rs`, `scheduled.rs` and `leaving.rs` snooze, the offline queue and sending; `composing.rs` the HTML sent and replies; `accounts.rs`, `notifying.rs`, `watching.rs` and `contacts.rs` accounts, notifications and the badge, live updates and address suggestions; `oauth.rs` a sign-in that comes back to an app's own redirect; `paths.rs` where an app other than the Mac's keeps its files. Its `lib.rs` lists them all. |
 | `crates/nimbra-ffi` | The engine for Swift, through [UniFFI](https://mozilla.github.io/uniffi-rs): one `Engine` object, a `SecretStore` the app implements, and a few free functions. |
 | `Package.swift`, `Sources/NimbraCore` | The Swift package iOS uses: the generated Swift API (kept in git, never edited by hand) over `NimbraFFI.xcframework`. |
 | `scripts/build-ios-core.sh` | Builds the XCFramework (iPhone and Apple silicon simulator) and generates the Swift API. |
@@ -63,6 +63,19 @@ The generated types are `Sendable`. Sign-in runs in `ASWebAuthenticationSession`
 `beginMicrosoftSignIn`) gives the authorize URL (PKCE) for the app's custom-scheme redirect, and
 `finishGoogleSignIn` takes the address the session came back to. An iOS Google client has no secret, and client
 ids are passed in, never built in.
+
+The Swift API, by area (each `Engine` method says in its doc whether it goes to the network):
+
+| Area | Calls |
+| --- | --- |
+| Setup | `Engine(config:dataDir:cacheDir:secrets:)`, `flush`, `useDnsResolver` (MX lookups through the system on iOS) |
+| Accounts | `accounts`, `setDefaultAccount`, `begin`/`finishGoogleSignIn`, `begin`/`finishMicrosoftSignIn`, `discoverServers`, `addImapAccount`, `removeAccount` |
+| Mailboxes | `mailboxes`, `cachedThreads`, `refreshMailbox`, `loadMore`, `cachedAllInboxes`, `allInboxes`, `search`, `labels`, `counts`, `cachedCounts` |
+| Reading | `readThread`, `cachedThread`, `downloadAttachment`, `fetchRemoteImage`, `parseMailto`, `unsubscribeAction` |
+| Actions | `apply` (queued when offline), `moveToInbox`, `moveToLabel`, `relabel`, label CRUD, `deleteThread`, `blockSender`, `unblockSender` |
+| Snooze | `snooze`, `snoozed`, `unsnooze`, `wakeDue`, `snoozeTimes`, `parseTime`, `dayTime` |
+| Writing | `startAnswer`, `messageHtml`, `splitDraftHtml`, `saveDraft`, `queueSend` then `OutgoingSend.deliver`/`undo`, `unsent`, `catchUp`, `scheduleSend`, `sendDue`, `sendLaterTimes`, `suggestContacts`, `learnContacts` |
+| Staying current | `checkForChanges` (what to notify about), `watch` (`ChangeWatch`), `checkIntervalSeconds`, `pendingWork` (the next deadline for a timer or background task), `badgeCount`, `markReadAfterMs` |
 
 ## Building for iOS
 

@@ -83,6 +83,60 @@ pub fn send(store: &Store, client: &mail::Client, draft_id: &str) -> Option<Outc
     Some(outcome)
 }
 
+/// The times Send later offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Later {
+    /// An hour from now, on the minute.
+    InAnHour,
+    /// 18:00 today, before 17:00.
+    ThisEvening,
+    /// 8:00 tomorrow.
+    TomorrowMorning,
+    /// 8:00 next Monday, unless that is tomorrow.
+    MondayMorning,
+}
+
+/// The times Send later offers from `now`, in order.
+pub fn later_times(
+    now: chrono::DateTime<chrono::Local>,
+) -> Vec<(Later, chrono::DateTime<chrono::Local>)> {
+    use chrono::{Datelike, Duration as Days, Local, TimeZone, Timelike, Weekday};
+    let at = |date: chrono::NaiveDate, hour: u32| {
+        Local
+            .from_local_datetime(&date.and_hms_opt(hour, 0, 0).unwrap_or_default())
+            .single()
+    };
+    let mut choices = Vec::new();
+    choices.push((
+        Later::InAnHour,
+        (now + Days::hours(1)).with_second(0).unwrap_or(now),
+    ));
+    if now.hour() < 17
+        && let Some(when) = at(now.date_naive(), 18)
+    {
+        choices.push((Later::ThisEvening, when));
+    }
+    let tomorrow = now.date_naive() + Days::days(1);
+    if let Some(when) = at(tomorrow, 8) {
+        choices.push((Later::TomorrowMorning, when));
+    }
+    let mut monday = now.date_naive() + Days::days(1);
+    while monday.weekday() != Weekday::Mon {
+        monday += Days::days(1);
+    }
+    if monday != tomorrow
+        && let Some(when) = at(monday, 8)
+    {
+        choices.push((Later::MondayMorning, when));
+    }
+    choices
+}
+
+/// When the next one is due, if any: when to look again.
+pub fn next_due(store: &Store) -> Option<i64> {
+    list(store).iter().map(|item| item.at_ms).min()
+}
+
 fn claim_name(draft_id: &str) -> String {
     let id: String = draft_id
         .chars()

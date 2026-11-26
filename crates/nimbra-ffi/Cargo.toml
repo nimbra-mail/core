@@ -24,6 +24,7 @@ bindgen = ["uniffi/cli"]
 [dependencies]
 nimbra-core = { path = "../nimbra-core" }
 anyhow = "1.0.105"
+chrono = "0.4.45"
 keyring = "3"
 uniffi = "0.33"
 

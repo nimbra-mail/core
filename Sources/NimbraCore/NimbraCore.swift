@@ -541,6 +541,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -661,7 +677,383 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 
+/**
+ * Waits for an account's server to say something changed. One per watch; cancel it from
+ * any thread, and a wait under way ends within a moment (IMAP: within the current IDLE
+ * slice, at most 30 seconds).
+ */
+public protocol ChangeWatchProtocol: AnyObject, Sendable {
+    
+    /**
+     * Ends the waiting (the app goes to the background, or the account is left).
+     */
+    func cancel() 
+    
+    /**
+     * Waits up to `seconds` (the check interval from `Engine::check_interval_seconds`).
+     * `Changed`: check now (`check_for_changes`, `refresh_mailbox`); `TimedOut`: the
+     * interval is over, check now too; `Cancelled`: stop. Blocks: call it from a
+     * background task.
+     */
+    func wait(seconds: UInt32)  -> WatchOutcome
+    
+}
+/**
+ * Waits for an account's server to say something changed. One per watch; cancel it from
+ * any thread, and a wait under way ends within a moment (IMAP: within the current IDLE
+ * slice, at most 30 seconds).
+ */
+open class ChangeWatch: ChangeWatchProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_nimbra_ffi_fn_clone_changewatch(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_nimbra_ffi_fn_free_changewatch(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Ends the waiting (the app goes to the background, or the account is left).
+     */
+open func cancel()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_changewatch_cancel(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Waits up to `seconds` (the check interval from `Engine::check_interval_seconds`).
+     * `Changed`: check now (`check_for_changes`, `refresh_mailbox`); `TimedOut`: the
+     * interval is over, check now too; `Cancelled`: stop. Blocks: call it from a
+     * background task.
+     */
+open func wait(seconds: UInt32) -> WatchOutcome  {
+    return try!  FfiConverterTypeWatchOutcome_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_changewatch_wait(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(seconds),uniffiCallStatus
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChangeWatch: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = ChangeWatch
+
+    public static func lift(_ handle: UInt64) throws -> ChangeWatch {
+        return ChangeWatch(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: ChangeWatch) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChangeWatch {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ChangeWatch, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChangeWatch_lift(_ handle: UInt64) throws -> ChangeWatch {
+    return try FfiConverterTypeChangeWatch.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeChangeWatch_lower(_ value: ChangeWatch) -> UInt64 {
+    return FfiConverterTypeChangeWatch.lower(value)
+}
+
+
+
+
+
+
+/**
+ * The app's resolver for MX records. `domain` is a domain name; answer its MX records
+ * (none when it has none), within a few seconds. Called from background threads.
+ */
+public protocol DnsResolver: AnyObject, Sendable {
+    
+    func mx(domain: String) throws  -> [MxRecord]
+    
+}
+/**
+ * The app's resolver for MX records. `domain` is a domain name; answer its MX records
+ * (none when it has none), within a few seconds. Called from background threads.
+ */
+open class DnsResolverImpl: DnsResolver, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_nimbra_ffi_fn_clone_dnsresolver(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_nimbra_ffi_fn_free_dnsresolver(handle, $0) }
+    }
+
+    
+
+    
+open func mx(domain: String)throws  -> [MxRecord]  {
+    return try  FfiConverterSequenceTypeMxRecord.lift(try rustCallWithError(FfiConverterTypeDnsError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_dnsresolver_mx(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(domain),uniffiCallStatus
+    )
+})
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceDnsResolver {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceDnsResolver = UniffiVTableCallbackInterfaceDnsResolver(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeDnsResolver.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface DnsResolver: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeDnsResolver.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface DnsResolver: handle missing in uniffiClone")
+            }
+        },
+        mx: { (
+            uniffiHandle: UInt64,
+            domain: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            nonisolated(unsafe) let domain = domain
+
+            let makeCall: @Sendable () throws -> [MxRecord] = {
+                () throws -> [MxRecord] in
+                guard let uniffiObj = try? FfiConverterTypeDnsResolver.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.mx(
+                     domain: try FfiConverterString.lift(domain)
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterSequenceTypeMxRecord.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeDnsError_lower
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceDnsResolver> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceDnsResolver>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitDnsResolver() {
+    uniffi_nimbra_ffi_fn_init_callback_vtable_dnsresolver(UniffiCallbackInterfaceDnsResolver.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDnsResolver: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<DnsResolver>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = DnsResolver
+
+    public static func lift(_ handle: UInt64) throws -> DnsResolver {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return DnsResolverImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: DnsResolver) -> UInt64 {
+         if let rustImpl = value as? DnsResolverImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DnsResolver {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: DnsResolver, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDnsResolver_lift(_ handle: UInt64) throws -> DnsResolver {
+    return try FfiConverterTypeDnsResolver.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeDnsResolver_lower(_ value: DnsResolver) -> UInt64 {
+    return FfiConverterTypeDnsResolver.lower(value)
+}
+
+
+
+
+
+
 public protocol EngineProtocol: AnyObject, Sendable {
+    
+    /**
+     * What a reply, reply-all or forward of a thread's latest message starts with: its
+     * subject, who it goes to (never the account itself, each once), the earlier message
+     * quoted (a reply only when Quote replies is on), the files a forward carries, and the
+     * account's default signature. `date_text` is that message's date as the app writes
+     * it (it goes into "On …, … wrote:"). From the device when the thread is kept with its
+     * messages, else fetched (network) and kept.
+     */
+    func startAnswer(accountId: String, threadId: String, kind: AnswerKind, dateText: String) throws  -> DraftStart
     
     /**
      * The accounts on this device, in their order.
@@ -680,9 +1072,16 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func addSignature(accountId: String) throws  -> String
     
     /**
-     * Done, star, read and the like. Network.
+     * Done, star, read and the like. Offline, it waits in the account's queue and is made
+     * once the server can be reached (`catch_up`), as on the Mac. Network.
      */
-    func apply(accountId: String, threadId: String, action: ThreadAction) throws 
+    func apply(accountId: String, threadId: String, action: ThreadAction) throws  -> ActionOutcome
+    
+    /**
+     * The app icon's number: unread threads in every account's inbox, as last counted
+     * (each account once), or 0 when the badge is off in Preferences. Disk.
+     */
+    func badgeCount() throws  -> UInt32
     
     /**
      * Starts a Google sign-in that comes back to `redirect_uri` (for an iOS client,
@@ -700,20 +1099,17 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func beginMicrosoftSignIn(redirectUri: String, accountId: String?, hint: String?) throws  -> SignInRequest
     
     /**
-     * Blocks a sender: their mail goes to the Blocked label from now on, and `thread_id`
-     * (theirs) goes there now. Network.
+     * Blocks a sender, as the Mac does: on the account's list from now on, their threads
+     * in the inbox put away in the Blocked label (made when there is none), and
+     * `thread_id` (theirs, open in `from`) moved there as Move to does. Their mail never
+     * notifies. Network.
      */
-    func blockSender(accountId: String, address: String, threadId: String?) throws 
+    func blockSender(accountId: String, address: String, threadId: String?, from: Mailbox) throws 
     
     /**
      * Disk.
      */
     func blockedSenders(accountId: String) throws  -> [String]
-    
-    /**
-     * Takes a message off the send-later list. Its draft stays in Drafts. Disk.
-     */
-    func cancelScheduled(accountId: String, draftId: String) throws 
     
     /**
      * Forgets a sign-in that was started and will not be finished (the user closed the
@@ -722,8 +1118,10 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func cancelSignIn(requestId: String) 
     
     /**
-     * What changed since `cursor` (`None`: start from now). Mail from blocked senders that
-     * arrived is put away on the way. Network.
+     * What changed since `cursor` (`None`: start from now), and what to notify about, as
+     * the Mac decides: blocked senders' new mail is put away first and never notifies, the
+     * first few new threads are named and the rest counted. On the first look (no cursor)
+     * what blocked senders left in the inbox meanwhile is put away. Network.
      */
     func checkForChanges(accountId: String, cursor: String?) throws  -> SyncResult
     
@@ -734,6 +1132,8 @@ public protocol EngineProtocol: AnyObject, Sendable {
     
     /**
      * Network.
+     * A new label, unless one is already called that (in any case): then that one, as on
+     * the Mac. Network (disk when it exists).
      */
     func createLabel(accountId: String, name: String) throws  -> Label
     
@@ -743,7 +1143,7 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func deleteDraft(accountId: String, draftId: String) throws 
     
     /**
-     * Network.
+     * Deletes a label; the mail stays. Network.
      */
     func deleteLabel(accountId: String, labelId: String) throws 
     
@@ -794,30 +1194,33 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func labels(accountId: String) throws  -> [Label]
     
     /**
+     * Pause `contact_scan_pause_seconds` before each step, as the Mac does, and stop when it
+     * says there is no more; what was learnt is kept, so the scan resumes where it was.
      * Learns a little more about who the account writes with (one page of Sent or of the
      * mail that came in). Whether there is more to learn. Network.
      */
     func learnContacts(accountId: String) throws  -> Bool
     
     /**
-     * A page of a mailbox's threads, newest first. `page` is the last page's
-     * `next_page`. Network.
+     * When an opened thread counts as read (Preferences): at once (0), after a moment, or
+     * only when the user says so (`None`).
      */
-    func listThreads(accountId: String, mailbox: Mailbox, page: String?, limit: UInt32) throws  -> ThreadPage
+    func markReadAfterMs()  -> UInt32?
+    
+    /**
+     * Move to Inbox from `from`: out of Spam (not spam) or Trash (restored), else out of
+     * the archive. Offline, it waits as `apply` does. Network.
+     */
+    func moveToInbox(accountId: String, threadId: String, from: Mailbox) throws  -> ActionOutcome
+    
+    /**
+     * Move to a label from `from`: the label added and, from an inbox (one account's, All
+     * inboxes or a Split Inbox category), out of the inbox: a move, not a copy, as on the
+     * Mac. Network.
+     */
+    func moveToLabel(accountId: String, threadId: String, labelId: String, from: Mailbox) throws 
     
     func preferences()  -> Preferences
-    
-    /**
-     * Send: keeps the message on the device and hands it back, held. Call `deliver` on it
-     * once the undo time (`Preferences.undo_send_seconds`) is over, or `undo` to take it
-     * back. `draft_id` is its saved draft, which sending uses up. Disk and Keychain.
-     */
-    func queueSend(accountId: String, message: OutgoingMessage, draftId: String?) throws  -> OutgoingSend
-    
-    /**
-     * A thread's messages, parsed: text blocks, the original HTML, attachments. Network.
-     */
-    func readThread(accountId: String, threadId: String) throws  -> MailThread
     
     /**
      * Adds and removes labels in one change (a move: add the label, remove "INBOX").
@@ -842,26 +1245,9 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func saveDraft(accountId: String, draftId: String?, message: OutgoingMessage) throws  -> String
     
     /**
-     * Send later: saves the draft and keeps it on the list for `at_ms`. The app sends what
-     * is due with `send_due`. Network.
-     */
-    func scheduleSend(accountId: String, message: OutgoingMessage, draftId: String?, atMs: Int64) throws  -> ScheduledSend
-    
-    /**
-     * Disk.
-     */
-    func scheduledSends(accountId: String) throws  -> [ScheduledSend]
-    
-    /**
      * Searches the account's mail (Gmail's search words, or text for IMAP). Network.
      */
     func search(accountId: String, query: String, page: String?, limit: UInt32) throws  -> ThreadPage
-    
-    /**
-     * Sends the send-later messages that are due. The drafts sent (or found gone).
-     * Network.
-     */
-    func sendDue(accountId: String) throws  -> [String]
     
     func setDefaultAccount(accountId: String) throws 
     
@@ -875,8 +1261,9 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func signatures(accountId: String)  -> [SignatureInfo]
     
     /**
-     * Puts a thread away until `until_ms`: out of the inbox, and back unread when the time
-     * comes (`wake_due`). `only_if_no_reply` makes it a reminder. Network.
+     * Puts a thread away until `until_ms`, kept with its account as the macOS app keeps it:
+     * out of the inbox now, back unread when the time comes (`wake_due`).
+     * `only_if_no_reply` makes it a reminder. Network (disk when it is already out).
      */
     func snooze(accountId: String, threadId: String, untilMs: Int64, onlyIfNoReply: Bool) throws 
     
@@ -886,30 +1273,26 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func snoozed(accountId: String) throws  -> [SnoozedThread]
     
     /**
-     * Address suggestions for what is typed, best first, from the mail this account has
-     * seen. Disk.
+     * Address suggestions for what is typed, best first, as the Mac ranks them: what every
+     * account on the device learnt of the people it writes with, the account the message
+     * is written from (`account_id`) counting double. Never the user's own addresses, nor
+     * anyone already in the field (`present`). Disk.
      */
-    func suggestContacts(accountId: String, query: String) throws  -> [Person]
+    func suggestContacts(accountId: String, query: String, present: [String]) throws  -> [Person]
     
     /**
      * One thread's row, fresh. Network.
      */
-    func threadSummary(accountId: String, threadId: String) throws  -> ThreadSummary
+    func threadSummary(accountId: String, threadId: String) throws  -> ThreadRow
     
     /**
-     * Disk.
+     * Unblocks a sender: off the list, and `thread_id` (theirs) out of the Blocked label
+     * and back in the inbox. Network (disk without a thread).
      */
-    func unblockSender(accountId: String, address: String) throws 
+    func unblockSender(accountId: String, address: String, threadId: String?) throws 
     
     /**
-     * What an earlier run left unsent for this account: send each again (`deliver`), or,
-     * when it may have gone (`Unsure`) or was refused, put it in Drafts. Mail that was
-     * still being written goes to Drafts on its own. Disk.
-     */
-    func unsent(accountId: String) throws  -> [OutgoingSend]
-    
-    /**
-     * Cancels a snooze and puts the thread back in the inbox. Network.
+     * Cancels a snooze (Undo): out of the list, and the thread back in the inbox. Network.
      */
     func unsnooze(accountId: String, threadId: String) throws 
     
@@ -919,9 +1302,138 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func updateSignature(signatureId: String, name: String, html: String) throws 
     
     /**
-     * Brings back what is due by now. The threads that came back. Network.
+     * Brings back the snoozes due by now, each through its own account. The ones that came
+     * back (to notify about: "Back from snooze", or for a reminder "No reply yet"). One
+     * that could not be checked (offline) stays for next time. Network.
      */
-    func wakeDue(accountId: String) throws  -> [String]
+    func wakeDue(accountId: String) throws  -> [SnoozedThread]
+    
+    /**
+     * All inboxes: the newest `per_account` inbox threads of every account (in whole
+     * pages, as far as the list was scrolled), fetched side by side and merged newest
+     * first. An account that fails is left out and counted; all failing is the error.
+     * Network.
+     */
+    func allInboxes(perAccount: UInt32) throws  -> AllInboxesPage
+    
+    /**
+     * All inboxes as kept: every account's inbox, newest first, each row with its account.
+     * Disk.
+     */
+    func cachedAllInboxes() throws  -> [ThreadRow]
+    
+    /**
+     * Unread and total threads by label, as last fetched. Disk.
+     */
+    func cachedCounts(accountId: String) throws  -> [LabelCount]
+    
+    /**
+     * A thread as kept on the device, when its messages were downloaded: at once, also
+     * offline. `None`: read it with `read_thread`. Disk.
+     */
+    func cachedThread(accountId: String, threadId: String) throws  -> MailThread?
+    
+    /**
+     * A mailbox as kept on the device: at once, also offline. Empty when it was never
+     * listed. Disk.
+     */
+    func cachedThreads(accountId: String, mailbox: Mailbox) throws  -> [ThreadRow]
+    
+    /**
+     * The page after what is listed (`page` is the last `next_page`), kept after it.
+     * Returns that page's threads. Network.
+     */
+    func loadMore(accountId: String, mailbox: Mailbox, page: String) throws  -> ThreadPage
+    
+    /**
+     * The mailboxes an account lists, in order: the Split Inbox (Gmail's inbox and its
+     * four categories; none for an account with its own servers), the other mailboxes,
+     * then its labels or folders as last fetched (`refresh_mailbox` and `labels` fetch
+     * them). Disk.
+     */
+    func mailboxes(accountId: String) throws  -> [MailboxEntry]
+    
+    /**
+     * A thread's messages, parsed: text blocks, the original HTML, attachments. They are
+     * kept with its row, so it opens at once next time (`cached_thread`). Network.
+     */
+    func readThread(accountId: String, threadId: String) throws  -> MailThread
+    
+    /**
+     * Brings a mailbox up to date and keeps it: from the change feed when the device
+     * knows where it was read last, else by listing its first page afresh (keeping the
+     * messages already downloaded). Network.
+     */
+    func refreshMailbox(accountId: String, mailbox: Mailbox) throws  -> ThreadPage
+    
+    /**
+     * Takes a message off the send-later list. Its draft stays in Drafts. Disk.
+     */
+    func cancelScheduled(accountId: String, draftId: String) throws 
+    
+    /**
+     * Back online (or `pending_work` said so): makes the changes that waited, in order,
+     * then sends the messages that waited. Fails as offline while the server cannot be
+     * reached. Network.
+     */
+    func catchUp(accountId: String) throws  -> CatchUpResult
+    
+    /**
+     * What waits for this account, and when to look again: the soonest snooze or send
+     * later, or the next retry while something waits for the connection. Schedule a timer
+     * or a background task for `next_deadline_ms`, then call `wake_due`, `send_due` and
+     * `catch_up`. Disk.
+     */
+    func pendingWork(accountId: String) throws  -> PendingWork
+    
+    /**
+     * Send: checks the message as the Mac does, keeps it on the device and hands it back,
+     * held. `deliver` it at `deliver_at_ms` (now plus the undo time in Preferences), or
+     * `undo` it before. `draft_id` is its saved draft, which sending uses up. Disk and
+     * Keychain.
+     */
+    func queueSend(accountId: String, message: OutgoingMessage, draftId: String?) throws  -> OutgoingSend
+    
+    /**
+     * Send later: saves the draft and keeps it on the list for `at_ms`. The app sends what
+     * is due with `send_due`. Network.
+     */
+    func scheduleSend(accountId: String, message: OutgoingMessage, draftId: String?, atMs: Int64) throws  -> ScheduledSend
+    
+    /**
+     * Disk.
+     */
+    func scheduledSends(accountId: String) throws  -> [ScheduledSend]
+    
+    /**
+     * Sends the send-later messages kept with this account that are due, each from its
+     * draft's own account. The drafts sent (or found gone). Network.
+     */
+    func sendDue(accountId: String) throws  -> [String]
+    
+    /**
+     * What an earlier run left unsent for this account, as the Mac picks it up: what never
+     * left comes back to be sent (`deliver`); what may have gone, was refused, was still
+     * being written or was not scheduled goes to Drafts (listed, to say so); what was
+     * discarded is deleted. Network.
+     */
+    func unsent(accountId: String) throws  -> UnsentReport
+    
+    /**
+     * A message `deliver` left waiting for the connection: `catch_up` sends it.
+     */
+    func waitForConnection(send: OutgoingSend) 
+    
+    /**
+     * How long to wait between two checks for mail, as set in Preferences (10 seconds to
+     * an hour).
+     */
+    func checkIntervalSeconds()  -> UInt32
+    
+    /**
+     * A watch on the account's server for live updates. Disk and Keychain (it connects).
+     */
+    func watch(accountId: String) throws  -> ChangeWatch
     
 }
 open class Engine: EngineProtocol, @unchecked Sendable {
@@ -998,6 +1510,27 @@ public convenience init(config: EngineConfig, dataDir: String, cacheDir: String,
 
     
     /**
+     * What a reply, reply-all or forward of a thread's latest message starts with: its
+     * subject, who it goes to (never the account itself, each once), the earlier message
+     * quoted (a reply only when Quote replies is on), the files a forward carries, and the
+     * account's default signature. `date_text` is that message's date as the app writes
+     * it (it goes into "On …, … wrote:"). From the device when the thread is kept with its
+     * messages, else fetched (network) and kept.
+     */
+open func startAnswer(accountId: String, threadId: String, kind: AnswerKind, dateText: String)throws  -> DraftStart  {
+    return try  FfiConverterTypeDraftStart_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_start_answer(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(threadId),
+        FfiConverterTypeAnswerKind_lower(kind),
+        FfiConverterString.lower(dateText),uniffiCallStatus
+    )
+})
+}
+    
+    /**
      * The accounts on this device, in their order.
      */
 open func accounts() -> [Account]  {
@@ -1039,9 +1572,11 @@ open func addSignature(accountId: String)throws  -> String  {
 }
     
     /**
-     * Done, star, read and the like. Network.
+     * Done, star, read and the like. Offline, it waits in the account's queue and is made
+     * once the server can be reached (`catch_up`), as on the Mac. Network.
      */
-open func apply(accountId: String, threadId: String, action: ThreadAction)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+open func apply(accountId: String, threadId: String, action: ThreadAction)throws  -> ActionOutcome  {
+    return try  FfiConverterTypeActionOutcome_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_apply(
             self.uniffiCloneHandle(),
@@ -1049,7 +1584,20 @@ open func apply(accountId: String, threadId: String, action: ThreadAction)throws
         FfiConverterString.lower(threadId),
         FfiConverterTypeThreadAction_lower(action),uniffiCallStatus
     )
+})
 }
+    
+    /**
+     * The app icon's number: unread threads in every account's inbox, as last counted
+     * (each account once), or 0 when the badge is off in Preferences. Disk.
+     */
+open func badgeCount()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_badge_count(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
 }
     
     /**
@@ -1088,16 +1636,19 @@ open func beginMicrosoftSignIn(redirectUri: String, accountId: String?, hint: St
 }
     
     /**
-     * Blocks a sender: their mail goes to the Blocked label from now on, and `thread_id`
-     * (theirs) goes there now. Network.
+     * Blocks a sender, as the Mac does: on the account's list from now on, their threads
+     * in the inbox put away in the Blocked label (made when there is none), and
+     * `thread_id` (theirs, open in `from`) moved there as Move to does. Their mail never
+     * notifies. Network.
      */
-open func blockSender(accountId: String, address: String, threadId: String?)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+open func blockSender(accountId: String, address: String, threadId: String?, from: Mailbox)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_block_sender(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(accountId),
         FfiConverterString.lower(address),
-        FfiConverterOptionString.lower(threadId),uniffiCallStatus
+        FfiConverterOptionString.lower(threadId),
+        FfiConverterTypeMailbox_lower(from),uniffiCallStatus
     )
 }
 }
@@ -1116,19 +1667,6 @@ open func blockedSenders(accountId: String)throws  -> [String]  {
 }
     
     /**
-     * Takes a message off the send-later list. Its draft stays in Drafts. Disk.
-     */
-open func cancelScheduled(accountId: String, draftId: String)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
-        uniffiCallStatus in
-    uniffi_nimbra_ffi_fn_method_engine_cancel_scheduled(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(accountId),
-        FfiConverterString.lower(draftId),uniffiCallStatus
-    )
-}
-}
-    
-    /**
      * Forgets a sign-in that was started and will not be finished (the user closed the
      * browser).
      */
@@ -1142,8 +1680,10 @@ open func cancelSignIn(requestId: String)  {try! rustCall() {
 }
     
     /**
-     * What changed since `cursor` (`None`: start from now). Mail from blocked senders that
-     * arrived is put away on the way. Network.
+     * What changed since `cursor` (`None`: start from now), and what to notify about, as
+     * the Mac decides: blocked senders' new mail is put away first and never notifies, the
+     * first few new threads are named and the rest counted. On the first look (no cursor)
+     * what blocked senders left in the inbox meanwhile is put away. Network.
      */
 open func checkForChanges(accountId: String, cursor: String?)throws  -> SyncResult  {
     return try  FfiConverterTypeSyncResult_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -1172,6 +1712,8 @@ open func counts(accountId: String, labelIds: [String])throws  -> [LabelCount]  
     
     /**
      * Network.
+     * A new label, unless one is already called that (in any case): then that one, as on
+     * the Mac. Network (disk when it exists).
      */
 open func createLabel(accountId: String, name: String)throws  -> Label  {
     return try  FfiConverterTypeLabel_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -1198,7 +1740,7 @@ open func deleteDraft(accountId: String, draftId: String)throws   {try rustCallW
 }
     
     /**
-     * Network.
+     * Deletes a label; the mail stays. Network.
      */
 open func deleteLabel(accountId: String, labelId: String)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
@@ -1332,6 +1874,8 @@ open func labels(accountId: String)throws  -> [Label]  {
 }
     
     /**
+     * Pause `contact_scan_pause_seconds` before each step, as the Mac does, and stop when it
+     * says there is no more; what was learnt is kept, so the scan resumes where it was.
      * Learns a little more about who the account writes with (one page of Sent or of the
      * mail that came in). Whether there is more to learn. Network.
      */
@@ -1346,20 +1890,49 @@ open func learnContacts(accountId: String)throws  -> Bool  {
 }
     
     /**
-     * A page of a mailbox's threads, newest first. `page` is the last page's
-     * `next_page`. Network.
+     * When an opened thread counts as read (Preferences): at once (0), after a moment, or
+     * only when the user says so (`None`).
      */
-open func listThreads(accountId: String, mailbox: Mailbox, page: String?, limit: UInt32)throws  -> ThreadPage  {
-    return try  FfiConverterTypeThreadPage_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+open func markReadAfterMs() -> UInt32?  {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
         uniffiCallStatus in
-    uniffi_nimbra_ffi_fn_method_engine_list_threads(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(accountId),
-        FfiConverterTypeMailbox_lower(mailbox),
-        FfiConverterOptionString.lower(page),
-        FfiConverterUInt32.lower(limit),uniffiCallStatus
+    uniffi_nimbra_ffi_fn_method_engine_mark_read_after_ms(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Move to Inbox from `from`: out of Spam (not spam) or Trash (restored), else out of
+     * the archive. Offline, it waits as `apply` does. Network.
+     */
+open func moveToInbox(accountId: String, threadId: String, from: Mailbox)throws  -> ActionOutcome  {
+    return try  FfiConverterTypeActionOutcome_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_move_to_inbox(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(threadId),
+        FfiConverterTypeMailbox_lower(from),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Move to a label from `from`: the label added and, from an inbox (one account's, All
+     * inboxes or a Split Inbox category), out of the inbox: a move, not a copy, as on the
+     * Mac. Network.
+     */
+open func moveToLabel(accountId: String, threadId: String, labelId: String, from: Mailbox)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_move_to_label(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(threadId),
+        FfiConverterString.lower(labelId),
+        FfiConverterTypeMailbox_lower(from),uniffiCallStatus
+    )
+}
 }
     
 open func preferences() -> Preferences  {
@@ -1367,37 +1940,6 @@ open func preferences() -> Preferences  {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_preferences(
             self.uniffiCloneHandle(),uniffiCallStatus
-    )
-})
-}
-    
-    /**
-     * Send: keeps the message on the device and hands it back, held. Call `deliver` on it
-     * once the undo time (`Preferences.undo_send_seconds`) is over, or `undo` to take it
-     * back. `draft_id` is its saved draft, which sending uses up. Disk and Keychain.
-     */
-open func queueSend(accountId: String, message: OutgoingMessage, draftId: String?)throws  -> OutgoingSend  {
-    return try  FfiConverterTypeOutgoingSend_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
-        uniffiCallStatus in
-    uniffi_nimbra_ffi_fn_method_engine_queue_send(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(accountId),
-        FfiConverterTypeOutgoingMessage_lower(message),
-        FfiConverterOptionString.lower(draftId),uniffiCallStatus
-    )
-})
-}
-    
-    /**
-     * A thread's messages, parsed: text blocks, the original HTML, attachments. Network.
-     */
-open func readThread(accountId: String, threadId: String)throws  -> MailThread  {
-    return try  FfiConverterTypeMailThread_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
-        uniffiCallStatus in
-    uniffi_nimbra_ffi_fn_method_engine_read_thread(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(accountId),
-        FfiConverterString.lower(threadId),uniffiCallStatus
     )
 })
 }
@@ -1461,36 +2003,6 @@ open func saveDraft(accountId: String, draftId: String?, message: OutgoingMessag
 }
     
     /**
-     * Send later: saves the draft and keeps it on the list for `at_ms`. The app sends what
-     * is due with `send_due`. Network.
-     */
-open func scheduleSend(accountId: String, message: OutgoingMessage, draftId: String?, atMs: Int64)throws  -> ScheduledSend  {
-    return try  FfiConverterTypeScheduledSend_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
-        uniffiCallStatus in
-    uniffi_nimbra_ffi_fn_method_engine_schedule_send(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(accountId),
-        FfiConverterTypeOutgoingMessage_lower(message),
-        FfiConverterOptionString.lower(draftId),
-        FfiConverterInt64.lower(atMs),uniffiCallStatus
-    )
-})
-}
-    
-    /**
-     * Disk.
-     */
-open func scheduledSends(accountId: String)throws  -> [ScheduledSend]  {
-    return try  FfiConverterSequenceTypeScheduledSend.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
-        uniffiCallStatus in
-    uniffi_nimbra_ffi_fn_method_engine_scheduled_sends(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(accountId),uniffiCallStatus
-    )
-})
-}
-    
-    /**
      * Searches the account's mail (Gmail's search words, or text for IMAP). Network.
      */
 open func search(accountId: String, query: String, page: String?, limit: UInt32)throws  -> ThreadPage  {
@@ -1502,20 +2014,6 @@ open func search(accountId: String, query: String, page: String?, limit: UInt32)
         FfiConverterString.lower(query),
         FfiConverterOptionString.lower(page),
         FfiConverterUInt32.lower(limit),uniffiCallStatus
-    )
-})
-}
-    
-    /**
-     * Sends the send-later messages that are due. The drafts sent (or found gone).
-     * Network.
-     */
-open func sendDue(accountId: String)throws  -> [String]  {
-    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
-        uniffiCallStatus in
-    uniffi_nimbra_ffi_fn_method_engine_send_due(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(accountId),uniffiCallStatus
     )
 })
 }
@@ -1562,8 +2060,9 @@ open func signatures(accountId: String) -> [SignatureInfo]  {
 }
     
     /**
-     * Puts a thread away until `until_ms`: out of the inbox, and back unread when the time
-     * comes (`wake_due`). `only_if_no_reply` makes it a reminder. Network.
+     * Puts a thread away until `until_ms`, kept with its account as the macOS app keeps it:
+     * out of the inbox now, back unread when the time comes (`wake_due`).
+     * `only_if_no_reply` makes it a reminder. Network (disk when it is already out).
      */
 open func snooze(accountId: String, threadId: String, untilMs: Int64, onlyIfNoReply: Bool)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
@@ -1591,16 +2090,19 @@ open func snoozed(accountId: String)throws  -> [SnoozedThread]  {
 }
     
     /**
-     * Address suggestions for what is typed, best first, from the mail this account has
-     * seen. Disk.
+     * Address suggestions for what is typed, best first, as the Mac ranks them: what every
+     * account on the device learnt of the people it writes with, the account the message
+     * is written from (`account_id`) counting double. Never the user's own addresses, nor
+     * anyone already in the field (`present`). Disk.
      */
-open func suggestContacts(accountId: String, query: String)throws  -> [Person]  {
+open func suggestContacts(accountId: String, query: String, present: [String])throws  -> [Person]  {
     return try  FfiConverterSequenceTypePerson.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_suggest_contacts(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(accountId),
-        FfiConverterString.lower(query),uniffiCallStatus
+        FfiConverterString.lower(query),
+        FfiConverterSequenceString.lower(present),uniffiCallStatus
     )
 })
 }
@@ -1608,8 +2110,8 @@ open func suggestContacts(accountId: String, query: String)throws  -> [Person]  
     /**
      * One thread's row, fresh. Network.
      */
-open func threadSummary(accountId: String, threadId: String)throws  -> ThreadSummary  {
-    return try  FfiConverterTypeThreadSummary_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+open func threadSummary(accountId: String, threadId: String)throws  -> ThreadRow  {
+    return try  FfiConverterTypeThreadRow_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_thread_summary(
             self.uniffiCloneHandle(),
@@ -1620,35 +2122,22 @@ open func threadSummary(accountId: String, threadId: String)throws  -> ThreadSum
 }
     
     /**
-     * Disk.
+     * Unblocks a sender: off the list, and `thread_id` (theirs) out of the Blocked label
+     * and back in the inbox. Network (disk without a thread).
      */
-open func unblockSender(accountId: String, address: String)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+open func unblockSender(accountId: String, address: String, threadId: String?)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_unblock_sender(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(accountId),
-        FfiConverterString.lower(address),uniffiCallStatus
+        FfiConverterString.lower(address),
+        FfiConverterOptionString.lower(threadId),uniffiCallStatus
     )
 }
 }
     
     /**
-     * What an earlier run left unsent for this account: send each again (`deliver`), or,
-     * when it may have gone (`Unsure`) or was refused, put it in Drafts. Mail that was
-     * still being written goes to Drafts on its own. Disk.
-     */
-open func unsent(accountId: String)throws  -> [OutgoingSend]  {
-    return try  FfiConverterSequenceTypeOutgoingSend.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
-        uniffiCallStatus in
-    uniffi_nimbra_ffi_fn_method_engine_unsent(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(accountId),uniffiCallStatus
-    )
-})
-}
-    
-    /**
-     * Cancels a snooze and puts the thread back in the inbox. Network.
+     * Cancels a snooze (Undo): out of the list, and the thread back in the inbox. Network.
      */
 open func unsnooze(accountId: String, threadId: String)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
@@ -1675,12 +2164,309 @@ open func updateSignature(signatureId: String, name: String, html: String)throws
 }
     
     /**
-     * Brings back what is due by now. The threads that came back. Network.
+     * Brings back the snoozes due by now, each through its own account. The ones that came
+     * back (to notify about: "Back from snooze", or for a reminder "No reply yet"). One
+     * that could not be checked (offline) stays for next time. Network.
      */
-open func wakeDue(accountId: String)throws  -> [String]  {
-    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+open func wakeDue(accountId: String)throws  -> [SnoozedThread]  {
+    return try  FfiConverterSequenceTypeSnoozedThread.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_engine_wake_due(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * All inboxes: the newest `per_account` inbox threads of every account (in whole
+     * pages, as far as the list was scrolled), fetched side by side and merged newest
+     * first. An account that fails is left out and counted; all failing is the error.
+     * Network.
+     */
+open func allInboxes(perAccount: UInt32)throws  -> AllInboxesPage  {
+    return try  FfiConverterTypeAllInboxesPage_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_all_inboxes(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(perAccount),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * All inboxes as kept: every account's inbox, newest first, each row with its account.
+     * Disk.
+     */
+open func cachedAllInboxes()throws  -> [ThreadRow]  {
+    return try  FfiConverterSequenceTypeThreadRow.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_cached_all_inboxes(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Unread and total threads by label, as last fetched. Disk.
+     */
+open func cachedCounts(accountId: String)throws  -> [LabelCount]  {
+    return try  FfiConverterSequenceTypeLabelCount.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_cached_counts(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * A thread as kept on the device, when its messages were downloaded: at once, also
+     * offline. `None`: read it with `read_thread`. Disk.
+     */
+open func cachedThread(accountId: String, threadId: String)throws  -> MailThread?  {
+    return try  FfiConverterOptionTypeMailThread.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_cached_thread(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(threadId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * A mailbox as kept on the device: at once, also offline. Empty when it was never
+     * listed. Disk.
+     */
+open func cachedThreads(accountId: String, mailbox: Mailbox)throws  -> [ThreadRow]  {
+    return try  FfiConverterSequenceTypeThreadRow.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_cached_threads(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterTypeMailbox_lower(mailbox),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * The page after what is listed (`page` is the last `next_page`), kept after it.
+     * Returns that page's threads. Network.
+     */
+open func loadMore(accountId: String, mailbox: Mailbox, page: String)throws  -> ThreadPage  {
+    return try  FfiConverterTypeThreadPage_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_load_more(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterTypeMailbox_lower(mailbox),
+        FfiConverterString.lower(page),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * The mailboxes an account lists, in order: the Split Inbox (Gmail's inbox and its
+     * four categories; none for an account with its own servers), the other mailboxes,
+     * then its labels or folders as last fetched (`refresh_mailbox` and `labels` fetch
+     * them). Disk.
+     */
+open func mailboxes(accountId: String)throws  -> [MailboxEntry]  {
+    return try  FfiConverterSequenceTypeMailboxEntry.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_mailboxes(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * A thread's messages, parsed: text blocks, the original HTML, attachments. They are
+     * kept with its row, so it opens at once next time (`cached_thread`). Network.
+     */
+open func readThread(accountId: String, threadId: String)throws  -> MailThread  {
+    return try  FfiConverterTypeMailThread_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_read_thread(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(threadId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Brings a mailbox up to date and keeps it: from the change feed when the device
+     * knows where it was read last, else by listing its first page afresh (keeping the
+     * messages already downloaded). Network.
+     */
+open func refreshMailbox(accountId: String, mailbox: Mailbox)throws  -> ThreadPage  {
+    return try  FfiConverterTypeThreadPage_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_refresh_mailbox(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterTypeMailbox_lower(mailbox),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Takes a message off the send-later list. Its draft stays in Drafts. Disk.
+     */
+open func cancelScheduled(accountId: String, draftId: String)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_cancel_scheduled(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(draftId),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Back online (or `pending_work` said so): makes the changes that waited, in order,
+     * then sends the messages that waited. Fails as offline while the server cannot be
+     * reached. Network.
+     */
+open func catchUp(accountId: String)throws  -> CatchUpResult  {
+    return try  FfiConverterTypeCatchUpResult_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_catch_up(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * What waits for this account, and when to look again: the soonest snooze or send
+     * later, or the next retry while something waits for the connection. Schedule a timer
+     * or a background task for `next_deadline_ms`, then call `wake_due`, `send_due` and
+     * `catch_up`. Disk.
+     */
+open func pendingWork(accountId: String)throws  -> PendingWork  {
+    return try  FfiConverterTypePendingWork_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_pending_work(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Send: checks the message as the Mac does, keeps it on the device and hands it back,
+     * held. `deliver` it at `deliver_at_ms` (now plus the undo time in Preferences), or
+     * `undo` it before. `draft_id` is its saved draft, which sending uses up. Disk and
+     * Keychain.
+     */
+open func queueSend(accountId: String, message: OutgoingMessage, draftId: String?)throws  -> OutgoingSend  {
+    return try  FfiConverterTypeOutgoingSend_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_queue_send(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterTypeOutgoingMessage_lower(message),
+        FfiConverterOptionString.lower(draftId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Send later: saves the draft and keeps it on the list for `at_ms`. The app sends what
+     * is due with `send_due`. Network.
+     */
+open func scheduleSend(accountId: String, message: OutgoingMessage, draftId: String?, atMs: Int64)throws  -> ScheduledSend  {
+    return try  FfiConverterTypeScheduledSend_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_schedule_send(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterTypeOutgoingMessage_lower(message),
+        FfiConverterOptionString.lower(draftId),
+        FfiConverterInt64.lower(atMs),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Disk.
+     */
+open func scheduledSends(accountId: String)throws  -> [ScheduledSend]  {
+    return try  FfiConverterSequenceTypeScheduledSend.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_scheduled_sends(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Sends the send-later messages kept with this account that are due, each from its
+     * draft's own account. The drafts sent (or found gone). Network.
+     */
+open func sendDue(accountId: String)throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_send_due(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * What an earlier run left unsent for this account, as the Mac picks it up: what never
+     * left comes back to be sent (`deliver`); what may have gone, was refused, was still
+     * being written or was not scheduled goes to Drafts (listed, to say so); what was
+     * discarded is deleted. Network.
+     */
+open func unsent(accountId: String)throws  -> UnsentReport  {
+    return try  FfiConverterTypeUnsentReport_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_unsent(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * A message `deliver` left waiting for the connection: `catch_up` sends it.
+     */
+open func waitForConnection(send: OutgoingSend)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_wait_for_connection(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeOutgoingSend_lower(send),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * How long to wait between two checks for mail, as set in Preferences (10 seconds to
+     * an hour).
+     */
+open func checkIntervalSeconds() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_check_interval_seconds(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * A watch on the account's server for live updates. Disk and Keychain (it connects).
+     */
+open func watch(accountId: String)throws  -> ChangeWatch  {
+    return try  FfiConverterTypeChangeWatch_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_watch(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(accountId),uniffiCallStatus
     )
@@ -1745,10 +2531,17 @@ public protocol OutgoingSendProtocol: AnyObject, Sendable {
     func accountId()  -> String
     
     /**
-     * Sends it, once however often this is called. `Ok(false)` when it was not waiting to
-     * be sent (sent already, taken back). Offline, it stays held to send again. Network.
+     * Hands it to the server, once however often this is called, and says what became of
+     * it, as the Mac decides: sent; waiting for the connection (it is sent by `catch_up`);
+     * it may have gone (saved to Drafts, never sent again by itself); or refused (show the
+     * message again, or `save_to_drafts`). Network.
      */
-    func deliver() throws  -> Bool
+    func deliver()  -> SendOutcome
+    
+    /**
+     * When the undo time is over and it is to be handed over (`deliver`).
+     */
+    func deliverAtMs()  -> Int64
     
     /**
      * Deletes it and whatever draft was saved of it. Whether that worked. Network.
@@ -1766,8 +2559,8 @@ public protocol OutgoingSendProtocol: AnyObject, Sendable {
     func message()  -> OutgoingMessage
     
     /**
-     * Puts it in Drafts instead (a refused or unsure send). Its draft id, or `None` while
-     * that has not worked yet (it stays kept). Network.
+     * Puts it in Drafts instead. Its draft id, or `None` while that has not worked yet (it
+     * stays kept). Network.
      */
     func saveToDrafts()  -> String?
     
@@ -1776,7 +2569,8 @@ public protocol OutgoingSendProtocol: AnyObject, Sendable {
     func subject()  -> String
     
     /**
-     * Undo send: takes it back while it has not left. Whether it was taken back.
+     * Undo send, or taking a refused message back to edit: nothing is left of it on the
+     * device. Whether it was taken back (not once it has left).
      */
     func undo()  -> Bool
     
@@ -1847,13 +2641,27 @@ open func accountId() -> String  {
 }
     
     /**
-     * Sends it, once however often this is called. `Ok(false)` when it was not waiting to
-     * be sent (sent already, taken back). Offline, it stays held to send again. Network.
+     * Hands it to the server, once however often this is called, and says what became of
+     * it, as the Mac decides: sent; waiting for the connection (it is sent by `catch_up`);
+     * it may have gone (saved to Drafts, never sent again by itself); or refused (show the
+     * message again, or `save_to_drafts`). Network.
      */
-open func deliver()throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+open func deliver() -> SendOutcome  {
+    return try!  FfiConverterTypeSendOutcome_lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_outgoingsend_deliver(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * When the undo time is over and it is to be handed over (`deliver`).
+     */
+open func deliverAtMs() -> Int64  {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_outgoingsend_deliver_at_ms(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -1896,8 +2704,8 @@ open func message() -> OutgoingMessage  {
 }
     
     /**
-     * Puts it in Drafts instead (a refused or unsure send). Its draft id, or `None` while
-     * that has not worked yet (it stays kept). Network.
+     * Puts it in Drafts instead. Its draft id, or `None` while that has not worked yet (it
+     * stays kept). Network.
      */
 open func saveToDrafts() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
@@ -1927,7 +2735,8 @@ open func subject() -> String  {
 }
     
     /**
-     * Undo send: takes it back while it has not left. Whether it was taken back.
+     * Undo send, or taking a refused message back to edit: nothing is left of it on the
+     * device. Whether it was taken back (not once it has left).
      */
 open func undo() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -2356,6 +3165,79 @@ public func FfiConverterTypeAccount_lift(_ buf: RustBuffer) throws -> Account {
 }
 
 
+/**
+ * All inboxes: every account's inbox, newest first.
+ */
+public struct AllInboxesPage: Equatable, Hashable {
+    public var threads: [ThreadRow]
+    /**
+     * Each account's unread inbox threads.
+     */
+    public var unread: [LabelCount]
+    /**
+     * Accounts that could not be listed (left out). All of them failing is an error.
+     */
+    public var failedAccounts: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(threads: [ThreadRow], 
+        /**
+         * Each account's unread inbox threads.
+         */unread: [LabelCount], 
+        /**
+         * Accounts that could not be listed (left out). All of them failing is an error.
+         */failedAccounts: UInt32) {
+        self.threads = threads
+        self.unread = unread
+        self.failedAccounts = failedAccounts
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AllInboxesPage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAllInboxesPage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AllInboxesPage {
+        return
+            try AllInboxesPage(
+                threads: FfiConverterSequenceTypeThreadRow.read(from: &buf), 
+                unread: FfiConverterSequenceTypeLabelCount.read(from: &buf), 
+                failedAccounts: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AllInboxesPage, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeThreadRow.write(value.threads, into: &buf)
+        FfiConverterSequenceTypeLabelCount.write(value.unread, into: &buf)
+        FfiConverterUInt32.write(value.failedAccounts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAllInboxesPage_lift(_ buf: RustBuffer) throws -> AllInboxesPage {
+    return try FfiConverterTypeAllInboxesPage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeAllInboxesPage_lower(_ value: AllInboxesPage) -> RustBuffer {
+    return FfiConverterTypeAllInboxesPage.lower(value)
+}
+
+
 public struct AttachmentInfo: Equatable, Hashable {
     public var messageId: String
     public var attachmentId: String
@@ -2425,6 +3307,77 @@ public func FfiConverterTypeAttachmentInfo_lift(_ buf: RustBuffer) throws -> Att
 #endif
 @Sendable public func FfiConverterTypeAttachmentInfo_lower(_ value: AttachmentInfo) -> RustBuffer {
     return FfiConverterTypeAttachmentInfo.lower(value)
+}
+
+
+/**
+ * What a catch-up got done (`Engine::catch_up`).
+ */
+public struct CatchUpResult: Equatable, Hashable {
+    public var changes: UInt32
+    public var sent: UInt32
+    public var movedToDrafts: [MovedToDrafts]
+    /**
+     * Nothing waits any more: back online.
+     */
+    public var done: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(changes: UInt32, sent: UInt32, movedToDrafts: [MovedToDrafts], 
+        /**
+         * Nothing waits any more: back online.
+         */done: Bool) {
+        self.changes = changes
+        self.sent = sent
+        self.movedToDrafts = movedToDrafts
+        self.done = done
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CatchUpResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCatchUpResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CatchUpResult {
+        return
+            try CatchUpResult(
+                changes: FfiConverterUInt32.read(from: &buf), 
+                sent: FfiConverterUInt32.read(from: &buf), 
+                movedToDrafts: FfiConverterSequenceTypeMovedToDrafts.read(from: &buf), 
+                done: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CatchUpResult, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.changes, into: &buf)
+        FfiConverterUInt32.write(value.sent, into: &buf)
+        FfiConverterSequenceTypeMovedToDrafts.write(value.movedToDrafts, into: &buf)
+        FfiConverterBool.write(value.done, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCatchUpResult_lift(_ buf: RustBuffer) throws -> CatchUpResult {
+    return try FfiConverterTypeCatchUpResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeCatchUpResult_lower(_ value: CatchUpResult) -> RustBuffer {
+    return FfiConverterTypeCatchUpResult.lower(value)
 }
 
 
@@ -2523,6 +3476,156 @@ public func FfiConverterTypeDraftMessage_lift(_ buf: RustBuffer) throws -> Draft
 #endif
 @Sendable public func FfiConverterTypeDraftMessage_lower(_ value: DraftMessage) -> RustBuffer {
     return FfiConverterTypeDraftMessage.lower(value)
+}
+
+
+/**
+ * A draft's HTML taken apart (`split_draft_html`).
+ */
+public struct DraftParts: Equatable, Hashable {
+    public var written: String
+    public var signature: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(written: String, signature: String?) {
+        self.written = written
+        self.signature = signature
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DraftParts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDraftParts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DraftParts {
+        return
+            try DraftParts(
+                written: FfiConverterString.read(from: &buf), 
+                signature: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DraftParts, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.written, into: &buf)
+        FfiConverterOptionString.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDraftParts_lift(_ buf: RustBuffer) throws -> DraftParts {
+    return try FfiConverterTypeDraftParts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeDraftParts_lower(_ value: DraftParts) -> RustBuffer {
+    return FfiConverterTypeDraftParts.lower(value)
+}
+
+
+/**
+ * What a reply or forward starts with (`Engine::start_answer`).
+ */
+public struct DraftStart: Equatable, Hashable {
+    public var subject: String
+    public var to: [String]
+    /**
+     * The earlier message as text, folded under what is written; added when sent
+     * (`message_html`).
+     */
+    public var quoted: String?
+    /**
+     * The files a forward carries.
+     */
+    public var kept: [AttachmentInfo]
+    public var reply: ReplyRef?
+    /**
+     * The account's default signature, shown under what is written.
+     */
+    public var signature: SignatureInfo?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(subject: String, to: [String], 
+        /**
+         * The earlier message as text, folded under what is written; added when sent
+         * (`message_html`).
+         */quoted: String?, 
+        /**
+         * The files a forward carries.
+         */kept: [AttachmentInfo], reply: ReplyRef?, 
+        /**
+         * The account's default signature, shown under what is written.
+         */signature: SignatureInfo?) {
+        self.subject = subject
+        self.to = to
+        self.quoted = quoted
+        self.kept = kept
+        self.reply = reply
+        self.signature = signature
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DraftStart: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDraftStart: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DraftStart {
+        return
+            try DraftStart(
+                subject: FfiConverterString.read(from: &buf), 
+                to: FfiConverterSequenceString.read(from: &buf), 
+                quoted: FfiConverterOptionString.read(from: &buf), 
+                kept: FfiConverterSequenceTypeAttachmentInfo.read(from: &buf), 
+                reply: FfiConverterOptionTypeReplyRef.read(from: &buf), 
+                signature: FfiConverterOptionTypeSignatureInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DraftStart, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.subject, into: &buf)
+        FfiConverterSequenceString.write(value.to, into: &buf)
+        FfiConverterOptionString.write(value.quoted, into: &buf)
+        FfiConverterSequenceTypeAttachmentInfo.write(value.kept, into: &buf)
+        FfiConverterOptionTypeReplyRef.write(value.reply, into: &buf)
+        FfiConverterOptionTypeSignatureInfo.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDraftStart_lift(_ buf: RustBuffer) throws -> DraftStart {
+    return try FfiConverterTypeDraftStart.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeDraftStart_lower(_ value: DraftStart) -> RustBuffer {
+    return FfiConverterTypeDraftStart.lower(value)
 }
 
 
@@ -3024,6 +4127,263 @@ public func FfiConverterTypeMailThread_lift(_ buf: RustBuffer) throws -> MailThr
 }
 
 
+/**
+ * A mailbox an account lists, in order.
+ */
+public struct MailboxEntry: Equatable, Hashable {
+    public var mailbox: Mailbox
+    public var section: MailboxSection
+    /**
+     * A label's name; `None` for the mailboxes every account has.
+     */
+    public var name: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(mailbox: Mailbox, section: MailboxSection, 
+        /**
+         * A label's name; `None` for the mailboxes every account has.
+         */name: String?) {
+        self.mailbox = mailbox
+        self.section = section
+        self.name = name
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MailboxEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMailboxEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MailboxEntry {
+        return
+            try MailboxEntry(
+                mailbox: FfiConverterTypeMailbox.read(from: &buf), 
+                section: FfiConverterTypeMailboxSection.read(from: &buf), 
+                name: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MailboxEntry, into buf: inout [UInt8]) {
+        FfiConverterTypeMailbox.write(value.mailbox, into: &buf)
+        FfiConverterTypeMailboxSection.write(value.section, into: &buf)
+        FfiConverterOptionString.write(value.name, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMailboxEntry_lift(_ buf: RustBuffer) throws -> MailboxEntry {
+    return try FfiConverterTypeMailboxEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeMailboxEntry_lower(_ value: MailboxEntry) -> RustBuffer {
+    return FfiConverterTypeMailboxEntry.lower(value)
+}
+
+
+/**
+ * What an email link fills a new message with.
+ */
+public struct MailtoDraft: Equatable, Hashable {
+    public var to: [String]
+    public var cc: [String]
+    public var bcc: [String]
+    public var subject: String
+    public var body: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(to: [String], cc: [String], bcc: [String], subject: String, body: String) {
+        self.to = to
+        self.cc = cc
+        self.bcc = bcc
+        self.subject = subject
+        self.body = body
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MailtoDraft: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMailtoDraft: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MailtoDraft {
+        return
+            try MailtoDraft(
+                to: FfiConverterSequenceString.read(from: &buf), 
+                cc: FfiConverterSequenceString.read(from: &buf), 
+                bcc: FfiConverterSequenceString.read(from: &buf), 
+                subject: FfiConverterString.read(from: &buf), 
+                body: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MailtoDraft, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.to, into: &buf)
+        FfiConverterSequenceString.write(value.cc, into: &buf)
+        FfiConverterSequenceString.write(value.bcc, into: &buf)
+        FfiConverterString.write(value.subject, into: &buf)
+        FfiConverterString.write(value.body, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMailtoDraft_lift(_ buf: RustBuffer) throws -> MailtoDraft {
+    return try FfiConverterTypeMailtoDraft.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeMailtoDraft_lower(_ value: MailtoDraft) -> RustBuffer {
+    return FfiConverterTypeMailtoDraft.lower(value)
+}
+
+
+public struct MovedToDrafts: Equatable, Hashable {
+    public var subject: String
+    public var why: LeftBehind
+    /**
+     * Drafts has it; `false`: it is still kept on the device, to try again.
+     */
+    public var inDrafts: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(subject: String, why: LeftBehind, 
+        /**
+         * Drafts has it; `false`: it is still kept on the device, to try again.
+         */inDrafts: Bool) {
+        self.subject = subject
+        self.why = why
+        self.inDrafts = inDrafts
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MovedToDrafts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMovedToDrafts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MovedToDrafts {
+        return
+            try MovedToDrafts(
+                subject: FfiConverterString.read(from: &buf), 
+                why: FfiConverterTypeLeftBehind.read(from: &buf), 
+                inDrafts: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MovedToDrafts, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.subject, into: &buf)
+        FfiConverterTypeLeftBehind.write(value.why, into: &buf)
+        FfiConverterBool.write(value.inDrafts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMovedToDrafts_lift(_ buf: RustBuffer) throws -> MovedToDrafts {
+    return try FfiConverterTypeMovedToDrafts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeMovedToDrafts_lower(_ value: MovedToDrafts) -> RustBuffer {
+    return FfiConverterTypeMovedToDrafts.lower(value)
+}
+
+
+/**
+ * One MX record: a mail server and its preference (lower is preferred).
+ */
+public struct MxRecord: Equatable, Hashable {
+    public var preference: UInt16
+    public var host: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(preference: UInt16, host: String) {
+        self.preference = preference
+        self.host = host
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MxRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMxRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MxRecord {
+        return
+            try MxRecord(
+                preference: FfiConverterUInt16.read(from: &buf), 
+                host: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MxRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt16.write(value.preference, into: &buf)
+        FfiConverterString.write(value.host, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMxRecord_lift(_ buf: RustBuffer) throws -> MxRecord {
+    return try FfiConverterTypeMxRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeMxRecord_lower(_ value: MxRecord) -> RustBuffer {
+    return FfiConverterTypeMxRecord.lower(value)
+}
+
+
 public struct OutgoingFile: Equatable, Hashable {
     public var name: String
     public var mime: String
@@ -3179,6 +4539,73 @@ public func FfiConverterTypeOutgoingMessage_lift(_ buf: RustBuffer) throws -> Ou
 }
 
 
+/**
+ * What waits for an account, and when to look again (`Engine::pending_work`).
+ */
+public struct PendingWork: Equatable, Hashable {
+    public var queuedChanges: UInt32
+    public var waitingMessages: UInt32
+    /**
+     * The soonest snooze, send later or retry (ms since 1970); `None`: nothing is due.
+     */
+    public var nextDeadlineMs: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(queuedChanges: UInt32, waitingMessages: UInt32, 
+        /**
+         * The soonest snooze, send later or retry (ms since 1970); `None`: nothing is due.
+         */nextDeadlineMs: Int64?) {
+        self.queuedChanges = queuedChanges
+        self.waitingMessages = waitingMessages
+        self.nextDeadlineMs = nextDeadlineMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PendingWork: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePendingWork: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingWork {
+        return
+            try PendingWork(
+                queuedChanges: FfiConverterUInt32.read(from: &buf), 
+                waitingMessages: FfiConverterUInt32.read(from: &buf), 
+                nextDeadlineMs: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PendingWork, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.queuedChanges, into: &buf)
+        FfiConverterUInt32.write(value.waitingMessages, into: &buf)
+        FfiConverterOptionInt64.write(value.nextDeadlineMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingWork_lift(_ buf: RustBuffer) throws -> PendingWork {
+    return try FfiConverterTypePendingWork.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypePendingWork_lower(_ value: PendingWork) -> RustBuffer {
+    return FfiConverterTypePendingWork.lower(value)
+}
+
+
 public struct Person: Equatable, Hashable {
     /**
      * May be empty.
@@ -3269,6 +4696,14 @@ public struct Preferences: Equatable, Hashable {
      * Quote the message being answered in a reply.
      */
     public var quoteReplies: Bool
+    /**
+     * Unread mail counts on the app icon.
+     */
+    public var badge: Bool
+    /**
+     * New mail notifications play a sound.
+     */
+    public var notificationSound: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3290,7 +4725,13 @@ public struct Preferences: Equatable, Hashable {
          */undoSendSeconds: UInt32, 
         /**
          * Quote the message being answered in a reply.
-         */quoteReplies: Bool) {
+         */quoteReplies: Bool, 
+        /**
+         * Unread mail counts on the app icon.
+         */badge: Bool, 
+        /**
+         * New mail notifications play a sound.
+         */notificationSound: Bool) {
         self.notifications = notifications
         self.originalView = originalView
         self.loadImages = loadImages
@@ -3299,6 +4740,8 @@ public struct Preferences: Equatable, Hashable {
         self.checkEverySeconds = checkEverySeconds
         self.undoSendSeconds = undoSendSeconds
         self.quoteReplies = quoteReplies
+        self.badge = badge
+        self.notificationSound = notificationSound
     }
 
     
@@ -3324,7 +4767,9 @@ public struct FfiConverterTypePreferences: FfiConverterRustBuffer {
                 markRead: FfiConverterTypeMarkReadChoice.read(from: &buf), 
                 checkEverySeconds: FfiConverterUInt32.read(from: &buf), 
                 undoSendSeconds: FfiConverterUInt32.read(from: &buf), 
-                quoteReplies: FfiConverterBool.read(from: &buf)
+                quoteReplies: FfiConverterBool.read(from: &buf), 
+                badge: FfiConverterBool.read(from: &buf), 
+                notificationSound: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -3337,6 +4782,8 @@ public struct FfiConverterTypePreferences: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.checkEverySeconds, into: &buf)
         FfiConverterUInt32.write(value.undoSendSeconds, into: &buf)
         FfiConverterBool.write(value.quoteReplies, into: &buf)
+        FfiConverterBool.write(value.badge, into: &buf)
+        FfiConverterBool.write(value.notificationSound, into: &buf)
     }
 }
 
@@ -3474,6 +4921,60 @@ public func FfiConverterTypeScheduledSend_lift(_ buf: RustBuffer) throws -> Sche
 }
 
 
+public struct SendLaterTime: Equatable, Hashable {
+    public var kind: SendLaterKind
+    public var atMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: SendLaterKind, atMs: Int64) {
+        self.kind = kind
+        self.atMs = atMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SendLaterTime: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSendLaterTime: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SendLaterTime {
+        return
+            try SendLaterTime(
+                kind: FfiConverterTypeSendLaterKind.read(from: &buf), 
+                atMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SendLaterTime, into buf: inout [UInt8]) {
+        FfiConverterTypeSendLaterKind.write(value.kind, into: &buf)
+        FfiConverterInt64.write(value.atMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSendLaterTime_lift(_ buf: RustBuffer) throws -> SendLaterTime {
+    return try FfiConverterTypeSendLaterTime.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeSendLaterTime_lower(_ value: SendLaterTime) -> RustBuffer {
+    return FfiConverterTypeSendLaterTime.lower(value)
+}
+
+
 /**
  * A sign-in started in the browser: open `url` in `ASWebAuthenticationSession`, then
  * hand the address it came back to to the matching `finish_*_sign_in` with `id`.
@@ -3604,8 +5105,70 @@ public func FfiConverterTypeSignatureInfo_lift(_ buf: RustBuffer) throws -> Sign
 }
 
 
+public struct SnoozeTime: Equatable, Hashable {
+    public var kind: SnoozeKind
+    public var untilMs: Int64
+    public var onlyIfNoReply: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: SnoozeKind, untilMs: Int64, onlyIfNoReply: Bool) {
+        self.kind = kind
+        self.untilMs = untilMs
+        self.onlyIfNoReply = onlyIfNoReply
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SnoozeTime: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSnoozeTime: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SnoozeTime {
+        return
+            try SnoozeTime(
+                kind: FfiConverterTypeSnoozeKind.read(from: &buf), 
+                untilMs: FfiConverterInt64.read(from: &buf), 
+                onlyIfNoReply: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SnoozeTime, into buf: inout [UInt8]) {
+        FfiConverterTypeSnoozeKind.write(value.kind, into: &buf)
+        FfiConverterInt64.write(value.untilMs, into: &buf)
+        FfiConverterBool.write(value.onlyIfNoReply, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSnoozeTime_lift(_ buf: RustBuffer) throws -> SnoozeTime {
+    return try FfiConverterTypeSnoozeTime.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeSnoozeTime_lower(_ value: SnoozeTime) -> RustBuffer {
+    return FfiConverterTypeSnoozeTime.lower(value)
+}
+
+
 public struct SnoozedThread: Equatable, Hashable {
     public var threadId: String
+    /**
+     * The account it is in, when it was snoozed from All inboxes as another's.
+     */
+    public var accountId: String?
     /**
      * When it comes back, or for a reminder, when it is checked for a reply.
      */
@@ -3622,12 +5185,16 @@ public struct SnoozedThread: Equatable, Hashable {
     // declare one manually.
     public init(threadId: String, 
         /**
+         * The account it is in, when it was snoozed from All inboxes as another's.
+         */accountId: String?, 
+        /**
          * When it comes back, or for a reminder, when it is checked for a reply.
          */untilMs: Int64, 
         /**
          * A reminder: it comes back only if nobody replied.
          */onlyIfNoReply: Bool, subject: String, sender: String, snippet: String) {
         self.threadId = threadId
+        self.accountId = accountId
         self.untilMs = untilMs
         self.onlyIfNoReply = onlyIfNoReply
         self.subject = subject
@@ -3652,6 +5219,7 @@ public struct FfiConverterTypeSnoozedThread: FfiConverterRustBuffer {
         return
             try SnoozedThread(
                 threadId: FfiConverterString.read(from: &buf), 
+                accountId: FfiConverterOptionString.read(from: &buf), 
                 untilMs: FfiConverterInt64.read(from: &buf), 
                 onlyIfNoReply: FfiConverterBool.read(from: &buf), 
                 subject: FfiConverterString.read(from: &buf), 
@@ -3662,6 +5230,7 @@ public struct FfiConverterTypeSnoozedThread: FfiConverterRustBuffer {
 
     public static func write(_ value: SnoozedThread, into buf: inout [UInt8]) {
         FfiConverterString.write(value.threadId, into: &buf)
+        FfiConverterOptionString.write(value.accountId, into: &buf)
         FfiConverterInt64.write(value.untilMs, into: &buf)
         FfiConverterBool.write(value.onlyIfNoReply, into: &buf)
         FfiConverterString.write(value.subject, into: &buf)
@@ -3700,9 +5269,21 @@ public struct SyncResult: Equatable, Hashable {
     public var changedThreads: [String]
     /**
      * Threads that got a new unread message in the inbox, without those from blocked
-     * senders (which were put away): for notifications.
+     * senders (which were put away).
      */
     public var newUnreadInbox: [String]
+    /**
+     * The first few of them, each its own notification (sender and subject).
+     */
+    public var named: [ThreadRow]
+    /**
+     * How many more arrived, summed up in one notification ("N more new messages").
+     */
+    public var moreNew: UInt32
+    /**
+     * Notifications are on in Preferences.
+     */
+    public var notify: Bool
     /**
      * The cursor given was too old: list the mailboxes afresh.
      */
@@ -3719,14 +5300,26 @@ public struct SyncResult: Equatable, Hashable {
          */changedThreads: [String], 
         /**
          * Threads that got a new unread message in the inbox, without those from blocked
-         * senders (which were put away): for notifications.
+         * senders (which were put away).
          */newUnreadInbox: [String], 
+        /**
+         * The first few of them, each its own notification (sender and subject).
+         */named: [ThreadRow], 
+        /**
+         * How many more arrived, summed up in one notification ("N more new messages").
+         */moreNew: UInt32, 
+        /**
+         * Notifications are on in Preferences.
+         */notify: Bool, 
         /**
          * The cursor given was too old: list the mailboxes afresh.
          */expired: Bool) {
         self.cursor = cursor
         self.changedThreads = changedThreads
         self.newUnreadInbox = newUnreadInbox
+        self.named = named
+        self.moreNew = moreNew
+        self.notify = notify
         self.expired = expired
     }
 
@@ -3749,6 +5342,9 @@ public struct FfiConverterTypeSyncResult: FfiConverterRustBuffer {
                 cursor: FfiConverterString.read(from: &buf), 
                 changedThreads: FfiConverterSequenceString.read(from: &buf), 
                 newUnreadInbox: FfiConverterSequenceString.read(from: &buf), 
+                named: FfiConverterSequenceTypeThreadRow.read(from: &buf), 
+                moreNew: FfiConverterUInt32.read(from: &buf), 
+                notify: FfiConverterBool.read(from: &buf), 
                 expired: FfiConverterBool.read(from: &buf)
         )
     }
@@ -3757,6 +5353,9 @@ public struct FfiConverterTypeSyncResult: FfiConverterRustBuffer {
         FfiConverterString.write(value.cursor, into: &buf)
         FfiConverterSequenceString.write(value.changedThreads, into: &buf)
         FfiConverterSequenceString.write(value.newUnreadInbox, into: &buf)
+        FfiConverterSequenceTypeThreadRow.write(value.named, into: &buf)
+        FfiConverterUInt32.write(value.moreNew, into: &buf)
+        FfiConverterBool.write(value.notify, into: &buf)
         FfiConverterBool.write(value.expired, into: &buf)
     }
 }
@@ -3922,7 +5521,7 @@ public func FfiConverterTypeTextSpan_lift(_ buf: RustBuffer) throws -> TextSpan 
 
 
 public struct ThreadPage: Equatable, Hashable {
-    public var threads: [ThreadSummary]
+    public var threads: [ThreadRow]
     /**
      * Hand back to get the next page; `None` at the end.
      */
@@ -3930,7 +5529,7 @@ public struct ThreadPage: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(threads: [ThreadSummary], 
+    public init(threads: [ThreadRow], 
         /**
          * Hand back to get the next page; `None` at the end.
          */nextPage: String?) {
@@ -3954,13 +5553,13 @@ public struct FfiConverterTypeThreadPage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ThreadPage {
         return
             try ThreadPage(
-                threads: FfiConverterSequenceTypeThreadSummary.read(from: &buf), 
+                threads: FfiConverterSequenceTypeThreadRow.read(from: &buf), 
                 nextPage: FfiConverterOptionString.read(from: &buf)
         )
     }
 
     public static func write(_ value: ThreadPage, into buf: inout [UInt8]) {
-        FfiConverterSequenceTypeThreadSummary.write(value.threads, into: &buf)
+        FfiConverterSequenceTypeThreadRow.write(value.threads, into: &buf)
         FfiConverterOptionString.write(value.nextPage, into: &buf)
     }
 }
@@ -3981,8 +5580,15 @@ public func FfiConverterTypeThreadPage_lift(_ buf: RustBuffer) throws -> ThreadP
 }
 
 
-public struct ThreadSummary: Equatable, Hashable {
+/**
+ * One thread in a list: the row both apps keep (`listing::Row` in the engine).
+ */
+public struct ThreadRow: Equatable, Hashable {
     public var id: String
+    /**
+     * The account it is in, when the list mixes accounts (All inboxes).
+     */
+    public var accountId: String?
     public var sender: String
     public var subject: String
     public var snippet: String
@@ -3994,14 +5600,32 @@ public struct ThreadSummary: Equatable, Hashable {
      * Every label on any of its messages ("INBOX", "STARRED", label ids).
      */
     public var labels: [String]
+    /**
+     * Who wrote in it ("Ana, Ben · 3 messages"), once its messages are downloaded.
+     */
+    public var participants: String
+    /**
+     * Its messages are on the device: `cached_thread` opens it at once, also offline.
+     */
+    public var loaded: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, sender: String, subject: String, snippet: String, timestampMs: Int64, messageCount: UInt32, unread: Bool, starred: Bool, 
+    public init(id: String, 
+        /**
+         * The account it is in, when the list mixes accounts (All inboxes).
+         */accountId: String?, sender: String, subject: String, snippet: String, timestampMs: Int64, messageCount: UInt32, unread: Bool, starred: Bool, 
         /**
          * Every label on any of its messages ("INBOX", "STARRED", label ids).
-         */labels: [String]) {
+         */labels: [String], 
+        /**
+         * Who wrote in it ("Ana, Ben · 3 messages"), once its messages are downloaded.
+         */participants: String, 
+        /**
+         * Its messages are on the device: `cached_thread` opens it at once, also offline.
+         */loaded: Bool) {
         self.id = id
+        self.accountId = accountId
         self.sender = sender
         self.subject = subject
         self.snippet = snippet
@@ -4010,6 +5634,8 @@ public struct ThreadSummary: Equatable, Hashable {
         self.unread = unread
         self.starred = starred
         self.labels = labels
+        self.participants = participants
+        self.loaded = loaded
     }
 
     
@@ -4018,17 +5644,18 @@ public struct ThreadSummary: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension ThreadSummary: Sendable {}
+extension ThreadRow: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeThreadSummary: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ThreadSummary {
+public struct FfiConverterTypeThreadRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ThreadRow {
         return
-            try ThreadSummary(
+            try ThreadRow(
                 id: FfiConverterString.read(from: &buf), 
+                accountId: FfiConverterOptionString.read(from: &buf), 
                 sender: FfiConverterString.read(from: &buf), 
                 subject: FfiConverterString.read(from: &buf), 
                 snippet: FfiConverterString.read(from: &buf), 
@@ -4036,12 +5663,15 @@ public struct FfiConverterTypeThreadSummary: FfiConverterRustBuffer {
                 messageCount: FfiConverterUInt32.read(from: &buf), 
                 unread: FfiConverterBool.read(from: &buf), 
                 starred: FfiConverterBool.read(from: &buf), 
-                labels: FfiConverterSequenceString.read(from: &buf)
+                labels: FfiConverterSequenceString.read(from: &buf), 
+                participants: FfiConverterString.read(from: &buf), 
+                loaded: FfiConverterBool.read(from: &buf)
         )
     }
 
-    public static func write(_ value: ThreadSummary, into buf: inout [UInt8]) {
+    public static func write(_ value: ThreadRow, into buf: inout [UInt8]) {
         FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.accountId, into: &buf)
         FfiConverterString.write(value.sender, into: &buf)
         FfiConverterString.write(value.subject, into: &buf)
         FfiConverterString.write(value.snippet, into: &buf)
@@ -4050,6 +5680,8 @@ public struct FfiConverterTypeThreadSummary: FfiConverterRustBuffer {
         FfiConverterBool.write(value.unread, into: &buf)
         FfiConverterBool.write(value.starred, into: &buf)
         FfiConverterSequenceString.write(value.labels, into: &buf)
+        FfiConverterString.write(value.participants, into: &buf)
+        FfiConverterBool.write(value.loaded, into: &buf)
     }
 }
 
@@ -4057,15 +5689,135 @@ public struct FfiConverterTypeThreadSummary: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeThreadSummary_lift(_ buf: RustBuffer) throws -> ThreadSummary {
-    return try FfiConverterTypeThreadSummary.lift(buf)
+public func FfiConverterTypeThreadRow_lift(_ buf: RustBuffer) throws -> ThreadRow {
+    return try FfiConverterTypeThreadRow.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-@Sendable public func FfiConverterTypeThreadSummary_lower(_ value: ThreadSummary) -> RustBuffer {
-    return FfiConverterTypeThreadSummary.lower(value)
+@Sendable public func FfiConverterTypeThreadRow_lower(_ value: ThreadRow) -> RustBuffer {
+    return FfiConverterTypeThreadRow.lower(value)
+}
+
+
+/**
+ * A time of day, as typed (`parse_time`).
+ */
+public struct TimeOfDay: Equatable, Hashable {
+    public var hour: UInt32
+    public var minute: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hour: UInt32, minute: UInt32) {
+        self.hour = hour
+        self.minute = minute
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TimeOfDay: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTimeOfDay: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TimeOfDay {
+        return
+            try TimeOfDay(
+                hour: FfiConverterUInt32.read(from: &buf), 
+                minute: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TimeOfDay, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.hour, into: &buf)
+        FfiConverterUInt32.write(value.minute, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTimeOfDay_lift(_ buf: RustBuffer) throws -> TimeOfDay {
+    return try FfiConverterTypeTimeOfDay.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeTimeOfDay_lower(_ value: TimeOfDay) -> RustBuffer {
+    return FfiConverterTypeTimeOfDay.lower(value)
+}
+
+
+/**
+ * What an earlier run left unsent (`Engine::unsent`).
+ */
+public struct UnsentReport {
+    /**
+     * Never left: send these (`deliver`).
+     */
+    public var toSend: [OutgoingSend]
+    public var movedToDrafts: [MovedToDrafts]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Never left: send these (`deliver`).
+         */toSend: [OutgoingSend], movedToDrafts: [MovedToDrafts]) {
+        self.toSend = toSend
+        self.movedToDrafts = movedToDrafts
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension UnsentReport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUnsentReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UnsentReport {
+        return
+            try UnsentReport(
+                toSend: FfiConverterSequenceTypeOutgoingSend.read(from: &buf), 
+                movedToDrafts: FfiConverterSequenceTypeMovedToDrafts.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UnsentReport, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeOutgoingSend.write(value.toSend, into: &buf)
+        FfiConverterSequenceTypeMovedToDrafts.write(value.movedToDrafts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUnsentReport_lift(_ buf: RustBuffer) throws -> UnsentReport {
+    return try FfiConverterTypeUnsentReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeUnsentReport_lower(_ value: UnsentReport) -> RustBuffer {
+    return FfiConverterTypeUnsentReport.lower(value)
 }
 
 
@@ -4141,6 +5893,151 @@ public func FfiConverterTypeAccountKind_lift(_ buf: RustBuffer) throws -> Accoun
 #endif
 @Sendable public func FfiConverterTypeAccountKind_lower(_ value: AccountKind) -> RustBuffer {
     return FfiConverterTypeAccountKind.lower(value)
+}
+
+
+
+/**
+ * What became of an action.
+ */
+
+public enum ActionOutcome: Equatable, Hashable {
+    
+    case done
+    /**
+     * Offline: it waits on the device and is made once the server can be reached.
+     */
+    case queued
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ActionOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeActionOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = ActionOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ActionOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done
+        
+        case 2: return .queued
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ActionOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .done:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .queued:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeActionOutcome_lift(_ buf: RustBuffer) throws -> ActionOutcome {
+    return try FfiConverterTypeActionOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeActionOutcome_lower(_ value: ActionOutcome) -> RustBuffer {
+    return FfiConverterTypeActionOutcome.lower(value)
+}
+
+
+
+
+public enum AnswerKind: Equatable, Hashable {
+    
+    case reply
+    case replyAll
+    case forward
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AnswerKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAnswerKind: FfiConverterRustBuffer {
+    typealias SwiftType = AnswerKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AnswerKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .reply
+        
+        case 2: return .replyAll
+        
+        case 3: return .forward
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AnswerKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .reply:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .replyAll:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .forward:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAnswerKind_lift(_ buf: RustBuffer) throws -> AnswerKind {
+    return try FfiConverterTypeAnswerKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeAnswerKind_lower(_ value: AnswerKind) -> RustBuffer {
+    return FfiConverterTypeAnswerKind.lower(value)
 }
 
 
@@ -4342,6 +6239,179 @@ public func FfiConverterTypeDiscovery_lift(_ buf: RustBuffer) throws -> Discover
 
 
 
+public 
+enum DnsError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * The lookup failed or timed out.
+     */
+    case Failed(message: String
+    )
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension DnsError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDnsError: FfiConverterRustBuffer {
+    typealias SwiftType = DnsError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DnsError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Failed(
+            message: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DnsError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .Failed(message):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDnsError_lift(_ buf: RustBuffer) throws -> DnsError {
+    return try FfiConverterTypeDnsError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeDnsError_lower(_ value: DnsError) -> RustBuffer {
+    return FfiConverterTypeDnsError.lower(value)
+}
+
+
+/**
+ * Why a message went to Drafts instead of out.
+ */
+
+public enum LeftBehind: Equatable, Hashable {
+    
+    /**
+     * It may already have been sent: check Sent before sending it again.
+     */
+    case maybeSent
+    /**
+     * It was not sent.
+     */
+    case refused
+    /**
+     * It was still being written when the app quit.
+     */
+    case writing
+    /**
+     * It was to be sent later, and that was not kept before the app quit.
+     */
+    case unscheduled
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension LeftBehind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLeftBehind: FfiConverterRustBuffer {
+    typealias SwiftType = LeftBehind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LeftBehind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .maybeSent
+        
+        case 2: return .refused
+        
+        case 3: return .writing
+        
+        case 4: return .unscheduled
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LeftBehind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .maybeSent:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .refused:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .writing:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unscheduled:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLeftBehind_lift(_ buf: RustBuffer) throws -> LeftBehind {
+    return try FfiConverterTypeLeftBehind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeLeftBehind_lower(_ value: LeftBehind) -> RustBuffer {
+    return FfiConverterTypeLeftBehind.lower(value)
+}
+
+
+
 
 public enum Mailbox: Equatable, Hashable {
     
@@ -4350,6 +6420,14 @@ public enum Mailbox: Equatable, Hashable {
     )
     case starred
     case important
+    /**
+     * Put away until later (kept on the device, and Gmail's own snoozed threads).
+     */
+    case snoozed
+    /**
+     * Put away until later unless someone replies (kept on the device).
+     */
+    case reminders
     case drafts
     case sent
     /**
@@ -4394,19 +6472,23 @@ public struct FfiConverterTypeMailbox: FfiConverterRustBuffer {
         
         case 4: return .important
         
-        case 5: return .drafts
+        case 5: return .snoozed
         
-        case 6: return .sent
+        case 6: return .reminders
         
-        case 7: return .done
+        case 7: return .drafts
         
-        case 8: return .allMail
+        case 8: return .sent
         
-        case 9: return .spam
+        case 9: return .done
         
-        case 10: return .trash
+        case 10: return .allMail
         
-        case 11: return .label(id: try FfiConverterString.read(from: &buf)
+        case 11: return .spam
+        
+        case 12: return .trash
+        
+        case 13: return .label(id: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -4434,32 +6516,40 @@ public struct FfiConverterTypeMailbox: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case .drafts:
+        case .snoozed:
             writeInt(&buf, Int32(5))
         
         
-        case .sent:
+        case .reminders:
             writeInt(&buf, Int32(6))
         
         
-        case .done:
+        case .drafts:
             writeInt(&buf, Int32(7))
         
         
-        case .allMail:
+        case .sent:
             writeInt(&buf, Int32(8))
         
         
-        case .spam:
+        case .done:
             writeInt(&buf, Int32(9))
         
         
-        case .trash:
+        case .allMail:
             writeInt(&buf, Int32(10))
         
         
-        case let .label(id):
+        case .spam:
             writeInt(&buf, Int32(11))
+        
+        
+        case .trash:
+            writeInt(&buf, Int32(12))
+        
+        
+        case let .label(id):
+            writeInt(&buf, Int32(13))
             FfiConverterString.write(id, into: &buf)
             
         }
@@ -4479,6 +6569,88 @@ public func FfiConverterTypeMailbox_lift(_ buf: RustBuffer) throws -> Mailbox {
 #endif
 @Sendable public func FfiConverterTypeMailbox_lower(_ value: Mailbox) -> RustBuffer {
     return FfiConverterTypeMailbox.lower(value)
+}
+
+
+
+/**
+ * Where a mailbox goes in the list of mailboxes.
+ */
+
+public enum MailboxSection: Equatable, Hashable {
+    
+    /**
+     * The Split Inbox (Gmail only).
+     */
+    case split
+    case mailboxes
+    /**
+     * The account's labels (IMAP: its folders).
+     */
+    case labels
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MailboxSection: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMailboxSection: FfiConverterRustBuffer {
+    typealias SwiftType = MailboxSection
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MailboxSection {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .split
+        
+        case 2: return .mailboxes
+        
+        case 3: return .labels
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MailboxSection, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .split:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .mailboxes:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .labels:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMailboxSection_lift(_ buf: RustBuffer) throws -> MailboxSection {
+    return try FfiConverterTypeMailboxSection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeMailboxSection_lower(_ value: MailboxSection) -> RustBuffer {
+    return FfiConverterTypeMailboxSection.lower(value)
 }
 
 
@@ -4811,6 +6983,204 @@ public func FfiConverterTypeSecretError_lift(_ buf: RustBuffer) throws -> Secret
 
 
 
+public enum SendLaterKind: Equatable, Hashable {
+    
+    case inAnHour
+    case thisEvening
+    case tomorrowMorning
+    case mondayMorning
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SendLaterKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSendLaterKind: FfiConverterRustBuffer {
+    typealias SwiftType = SendLaterKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SendLaterKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .inAnHour
+        
+        case 2: return .thisEvening
+        
+        case 3: return .tomorrowMorning
+        
+        case 4: return .mondayMorning
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SendLaterKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .inAnHour:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .thisEvening:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .tomorrowMorning:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .mondayMorning:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSendLaterKind_lift(_ buf: RustBuffer) throws -> SendLaterKind {
+    return try FfiConverterTypeSendLaterKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeSendLaterKind_lower(_ value: SendLaterKind) -> RustBuffer {
+    return FfiConverterTypeSendLaterKind.lower(value)
+}
+
+
+
+/**
+ * What became of a message handed to the server (`OutgoingSend::deliver`).
+ */
+
+public enum SendOutcome: Equatable, Hashable {
+    
+    case sent
+    /**
+     * Offline: it stays held. Hand it to `Engine::wait_for_connection`; `catch_up` sends it.
+     */
+    case waitingForConnection
+    /**
+     * The answer never came: it may have gone. Never sent again by itself.
+     */
+    case maybeSent(inDrafts: Bool
+    )
+    /**
+     * The server said no.
+     */
+    case refused(message: String
+    )
+    /**
+     * The account's sign-in is gone: sign in again.
+     */
+    case signedOut
+    /**
+     * It was not waiting to be sent (sent already, or taken back).
+     */
+    case notWaiting
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SendOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSendOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = SendOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SendOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sent
+        
+        case 2: return .waitingForConnection
+        
+        case 3: return .maybeSent(inDrafts: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 4: return .refused(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .signedOut
+        
+        case 6: return .notWaiting
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SendOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .sent:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .waitingForConnection:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .maybeSent(inDrafts):
+            writeInt(&buf, Int32(3))
+            FfiConverterBool.write(inDrafts, into: &buf)
+            
+        
+        case let .refused(message):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case .signedOut:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .notWaiting:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSendOutcome_lift(_ buf: RustBuffer) throws -> SendOutcome {
+    return try FfiConverterTypeSendOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeSendOutcome_lower(_ value: SendOutcome) -> RustBuffer {
+    return FfiConverterTypeSendOutcome.lower(value)
+}
+
+
+
+
 public enum SendStage: Equatable, Hashable {
     
     /**
@@ -4974,6 +7344,123 @@ public func FfiConverterTypeServerSecurity_lift(_ buf: RustBuffer) throws -> Ser
 #endif
 @Sendable public func FfiConverterTypeServerSecurity_lower(_ value: ServerSecurity) -> RustBuffer {
     return FfiConverterTypeServerSecurity.lower(value)
+}
+
+
+
+/**
+ * A time the Snooze menu offers.
+ */
+
+public enum SnoozeKind: Equatable, Hashable {
+    
+    case laterToday
+    case inThreeHours
+    case tomorrow
+    case tomorrowEvening
+    case thisWeekend
+    case nextWeek
+    /**
+     * A reminder in three days, if nobody replied.
+     */
+    case noReplyInThreeDays
+    /**
+     * A reminder in a week, if nobody replied.
+     */
+    case noReplyInAWeek
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SnoozeKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSnoozeKind: FfiConverterRustBuffer {
+    typealias SwiftType = SnoozeKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SnoozeKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .laterToday
+        
+        case 2: return .inThreeHours
+        
+        case 3: return .tomorrow
+        
+        case 4: return .tomorrowEvening
+        
+        case 5: return .thisWeekend
+        
+        case 6: return .nextWeek
+        
+        case 7: return .noReplyInThreeDays
+        
+        case 8: return .noReplyInAWeek
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SnoozeKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .laterToday:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .inThreeHours:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .tomorrow:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .tomorrowEvening:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .thisWeekend:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .nextWeek:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .noReplyInThreeDays:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .noReplyInAWeek:
+            writeInt(&buf, Int32(8))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSnoozeKind_lift(_ buf: RustBuffer) throws -> SnoozeKind {
+    return try FfiConverterTypeSnoozeKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeSnoozeKind_lower(_ value: SnoozeKind) -> RustBuffer {
+    return FfiConverterTypeSnoozeKind.lower(value)
 }
 
 
@@ -5188,6 +7675,214 @@ public func FfiConverterTypeThreadAction_lift(_ buf: RustBuffer) throws -> Threa
 }
 
 
+
+/**
+ * How to leave a mailing list (`MailMessage.unsubscribe`).
+ */
+
+public enum Unsubscribe: Equatable, Hashable {
+    
+    /**
+     * Open it in the browser, where the list asks for confirmation.
+     */
+    case web(url: String
+    )
+    /**
+     * Send exactly this message, from the account the mail came to, without a signature:
+     * a program reads it.
+     */
+    case mail(to: String, subject: String, body: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension Unsubscribe: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUnsubscribe: FfiConverterRustBuffer {
+    typealias SwiftType = Unsubscribe
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Unsubscribe {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .web(url: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .mail(to: try FfiConverterString.read(from: &buf), subject: try FfiConverterString.read(from: &buf), body: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: Unsubscribe, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .web(url):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(url, into: &buf)
+            
+        
+        case let .mail(to,subject,body):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(to, into: &buf)
+            FfiConverterString.write(subject, into: &buf)
+            FfiConverterString.write(body, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUnsubscribe_lift(_ buf: RustBuffer) throws -> Unsubscribe {
+    return try FfiConverterTypeUnsubscribe.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeUnsubscribe_lower(_ value: Unsubscribe) -> RustBuffer {
+    return FfiConverterTypeUnsubscribe.lower(value)
+}
+
+
+
+/**
+ * How a wait for changes ended (`ChangeWatch::wait`).
+ */
+
+public enum WatchOutcome: Equatable, Hashable {
+    
+    case changed
+    case timedOut
+    case cancelled
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WatchOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWatchOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = WatchOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WatchOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .changed
+        
+        case 2: return .timedOut
+        
+        case 3: return .cancelled
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WatchOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .changed:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .timedOut:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .cancelled:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWatchOutcome_lift(_ buf: RustBuffer) throws -> WatchOutcome {
+    return try FfiConverterTypeWatchOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeWatchOutcome_lower(_ value: WatchOutcome) -> RustBuffer {
+    return FfiConverterTypeWatchOutcome.lower(value)
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -5263,6 +7958,54 @@ fileprivate struct FfiConverterOptionTypeMailMessage: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMailThread: FfiConverterRustBuffer {
+    typealias SwiftType = MailThread?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMailThread.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMailThread.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMailtoDraft: FfiConverterRustBuffer {
+    typealias SwiftType = MailtoDraft?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMailtoDraft.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMailtoDraft.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypePerson: FfiConverterRustBuffer {
     typealias SwiftType = Person?
 
@@ -5311,6 +8054,54 @@ fileprivate struct FfiConverterOptionTypeReplyRef: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSignatureInfo: FfiConverterRustBuffer {
+    typealias SwiftType = SignatureInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSignatureInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSignatureInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTimeOfDay: FfiConverterRustBuffer {
+    typealias SwiftType = TimeOfDay?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTimeOfDay.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTimeOfDay.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeDiscovery: FfiConverterRustBuffer {
     typealias SwiftType = Discovery?
 
@@ -5351,6 +8142,30 @@ fileprivate struct FfiConverterOptionTypeThreadAction: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeThreadAction.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeUnsubscribe: FfiConverterRustBuffer {
+    typealias SwiftType = Unsubscribe?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeUnsubscribe.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeUnsubscribe.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -5534,6 +8349,81 @@ fileprivate struct FfiConverterSequenceTypeMailMessage: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeMailboxEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [MailboxEntry]
+
+    public static func write(_ value: [MailboxEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMailboxEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MailboxEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MailboxEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMailboxEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMovedToDrafts: FfiConverterRustBuffer {
+    typealias SwiftType = [MovedToDrafts]
+
+    public static func write(_ value: [MovedToDrafts], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMovedToDrafts.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MovedToDrafts] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MovedToDrafts]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMovedToDrafts.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMxRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [MxRecord]
+
+    public static func write(_ value: [MxRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMxRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MxRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MxRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMxRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeOutgoingFile: FfiConverterRustBuffer {
     typealias SwiftType = [OutgoingFile]
 
@@ -5609,6 +8499,31 @@ fileprivate struct FfiConverterSequenceTypeScheduledSend: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSendLaterTime: FfiConverterRustBuffer {
+    typealias SwiftType = [SendLaterTime]
+
+    public static func write(_ value: [SendLaterTime], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSendLaterTime.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SendLaterTime] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SendLaterTime]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSendLaterTime.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSignatureInfo: FfiConverterRustBuffer {
     typealias SwiftType = [SignatureInfo]
 
@@ -5626,6 +8541,31 @@ fileprivate struct FfiConverterSequenceTypeSignatureInfo: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeSignatureInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSnoozeTime: FfiConverterRustBuffer {
+    typealias SwiftType = [SnoozeTime]
+
+    public static func write(_ value: [SnoozeTime], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSnoozeTime.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SnoozeTime] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SnoozeTime]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSnoozeTime.read(from: &buf))
         }
         return seq
     }
@@ -5709,26 +8649,37 @@ fileprivate struct FfiConverterSequenceTypeTextSpan: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeThreadSummary: FfiConverterRustBuffer {
-    typealias SwiftType = [ThreadSummary]
+fileprivate struct FfiConverterSequenceTypeThreadRow: FfiConverterRustBuffer {
+    typealias SwiftType = [ThreadRow]
 
-    public static func write(_ value: [ThreadSummary], into buf: inout [UInt8]) {
+    public static func write(_ value: [ThreadRow], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterTypeThreadSummary.write(item, into: &buf)
+            FfiConverterTypeThreadRow.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ThreadSummary] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ThreadRow] {
         let len: Int32 = try readInt(&buf)
-        var seq = [ThreadSummary]()
+        var seq = [ThreadRow]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeThreadSummary.read(from: &buf))
+            seq.append(try FfiConverterTypeThreadRow.read(from: &buf))
         }
         return seq
     }
+}
+/**
+ * How long to wait before each `Engine::learn_contacts` step, so learning addresses never
+ * competes with the mail being read.
+ */
+public func contactScanPauseSeconds() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_contact_scan_pause_seconds(uniffiCallStatus
+    )
+})
 }
 /**
  * The engine's version.
@@ -5737,6 +8688,21 @@ public func coreVersion() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_func_core_version(uniffiCallStatus
+    )
+})
+}
+/**
+ * When a day picked in a calendar comes back, at a time of day, in the device's time
+ * zone. `None` for a time already gone by (or not on the clock that day).
+ */
+public func dayTime(year: Int32, month: UInt32, day: UInt32, time: TimeOfDay) -> Int64?  {
+    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_day_time(
+        FfiConverterInt32.lower(year),
+        FfiConverterUInt32.lower(month),
+        FfiConverterUInt32.lower(day),
+        FfiConverterTypeTimeOfDay_lower(time),uniffiCallStatus
     )
 })
 }
@@ -5777,6 +8743,28 @@ public func parseMessage(raw: Data) -> MailMessage?  {
 })
 }
 /**
+ * A time typed in ("4:30 PM", "16:30", "430p", "noon"), as the Mac reads it: without AM
+ * or PM, 1 to 7 is the afternoon. `None` when it is not a time.
+ */
+public func parseTime(text: String) -> TimeOfDay?  {
+    return try!  FfiConverterOptionTypeTimeOfDay.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_parse_time(
+        FfiConverterString.lower(text),uniffiCallStatus
+    )
+})
+}
+/**
+ * The times the Snooze menu offers from now: the quick times, then the two reminders.
+ */
+public func snoozeTimes() -> [SnoozeTime]  {
+    return try!  FfiConverterSequenceTypeSnoozeTime.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_snooze_times(uniffiCallStatus
+    )
+})
+}
+/**
  * The action that undoes `action`, if there is one (Undo after Done is Move to Inbox).
  */
 public func undoAction(action: ThreadAction) -> ThreadAction?  {
@@ -5784,6 +8772,102 @@ public func undoAction(action: ThreadAction) -> ThreadAction?  {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_func_undo_action(
         FfiConverterTypeThreadAction_lower(action),uniffiCallStatus
+    )
+})
+}
+/**
+ * The HTML part of an outgoing message, as the Mac sends it: what was written, the
+ * signature (already cleaned: a `SignatureInfo`'s HTML) in its own block, then the quoted
+ * earlier message (as text) in the usual quote block.
+ */
+public func messageHtml(written: String, signature: String?, quoted: String?) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_message_html(
+        FfiConverterString.lower(written),
+        FfiConverterOptionString.lower(signature),
+        FfiConverterOptionString.lower(quoted),uniffiCallStatus
+    )
+})
+}
+/**
+ * A saved draft's HTML taken apart again: what was written (without the quote) and the
+ * signature it was saved with. `None` for what was written when the HTML has no quote
+ * block: then all of it was written.
+ */
+public func splitDraftHtml(html: String) -> DraftParts  {
+    return try!  FfiConverterTypeDraftParts_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_split_draft_html(
+        FfiConverterString.lower(html),uniffiCallStatus
+    )
+})
+}
+/**
+ * Text as the editor's HTML: escaped, a `<div>` per line.
+ */
+public func textToHtml(text: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_text_to_html(
+        FfiConverterString.lower(text),uniffiCallStatus
+    )
+})
+}
+/**
+ * From now on, server discovery's MX lookups go to `resolver`. Once per process, before
+ * the first `discover_servers`; the Mac's resolver is used when this is never called.
+ */
+public func useDnsResolver(resolver: DnsResolver)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_use_dns_resolver(
+        FfiConverterTypeDnsResolver_lower(resolver),uniffiCallStatus
+    )
+}
+}
+/**
+ * Downloads one of a message's remote images, when the user asked for them: https on a
+ * public host only (checked at every redirect, so a message cannot probe the local
+ * network), size-capped, with a timeout, its format read from the bytes. Network.
+ */
+public func fetchRemoteImage(url: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_fetch_remote_image(
+        FfiConverterString.lower(url),uniffiCallStatus
+    )
+})
+}
+/**
+ * A `mailto:` link as a new message, or `None` when it is not one.
+ */
+public func parseMailto(link: String) -> MailtoDraft?  {
+    return try!  FfiConverterOptionTypeMailtoDraft.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_parse_mailto(
+        FfiConverterString.lower(link),uniffiCallStatus
+    )
+})
+}
+/**
+ * What a list's unsubscribe link asks for, or `None` when it is not valid. A `mailto:`
+ * link gives one address, a subject and a plain body: never a Cc or a Bcc.
+ */
+public func unsubscribeAction(link: String) -> Unsubscribe?  {
+    return try!  FfiConverterOptionTypeUnsubscribe.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_unsubscribe_action(
+        FfiConverterString.lower(link),uniffiCallStatus
+    )
+})
+}
+/**
+ * The times Send later offers from now.
+ */
+public func sendLaterTimes() -> [SendLaterTime]  {
+    return try!  FfiConverterSequenceTypeSendLaterTime.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_func_send_later_times(uniffiCallStatus
     )
 })
 }
@@ -5803,7 +8887,13 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_nimbra_ffi_checksum_func_contact_scan_pause_seconds() != 20255) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nimbra_ffi_checksum_func_core_version() != 64925) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_day_time() != 38562) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_func_is_email_address() != 5953) {
@@ -5815,7 +8905,43 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_func_parse_message() != 28834) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nimbra_ffi_checksum_func_parse_time() != 13730) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_snooze_times() != 57400) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nimbra_ffi_checksum_func_undo_action() != 45541) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_message_html() != 46899) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_split_draft_html() != 41520) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_text_to_html() != 31354) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_use_dns_resolver() != 28685) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_fetch_remote_image() != 62596) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_parse_mailto() != 46464) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_unsubscribe_action() != 10339) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_func_send_later_times() != 47842) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_dnsresolver_mx() != 59546) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_start_answer() != 5046) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_accounts() != 65131) {
@@ -5827,7 +8953,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_add_signature() != 55864) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_apply() != 53608) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_apply() != 56858) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_badge_count() != 44853) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_begin_google_sign_in() != 46043) {
@@ -5836,31 +8965,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_begin_microsoft_sign_in() != 16895) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_block_sender() != 10723) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_block_sender() != 32514) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_blocked_senders() != 59366) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_cancel_scheduled() != 9882) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_nimbra_ffi_checksum_method_engine_cancel_sign_in() != 60203) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_check_for_changes() != 22010) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_check_for_changes() != 59707) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_counts() != 64508) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_create_label() != 49105) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_create_label() != 43678) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_delete_draft() != 54643) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_delete_label() != 40988) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_delete_label() != 31199) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_delete_signature() != 47881) {
@@ -5890,19 +9016,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_labels() != 15581) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_learn_contacts() != 56383) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_learn_contacts() != 29216) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_list_threads() != 5927) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_mark_read_after_ms() != 6291) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_move_to_inbox() != 33154) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_move_to_label() != 36179) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_preferences() != 64449) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_nimbra_ffi_checksum_method_engine_queue_send() != 6708) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_nimbra_ffi_checksum_method_engine_read_thread() != 7033) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_relabel() != 26244) {
@@ -5917,16 +9043,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_save_draft() != 10526) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_schedule_send() != 45013) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_nimbra_ffi_checksum_method_engine_scheduled_sends() != 3523) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_nimbra_ffi_checksum_method_engine_search() != 49027) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_nimbra_ffi_checksum_method_engine_send_due() != 63103) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_set_default_account() != 19574) {
@@ -5941,58 +9058,88 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_signatures() != 25188) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_snooze() != 46446) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_snooze() != 32435) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_snoozed() != 44478) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_suggest_contacts() != 19966) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_suggest_contacts() != 19405) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_thread_summary() != 26301) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_thread_summary() != 13322) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_unblock_sender() != 26269) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_unblock_sender() != 57880) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_unsent() != 8456) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_nimbra_ffi_checksum_method_engine_unsnooze() != 1960) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_unsnooze() != 7764) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_update_signature() != 31573) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_wake_due() != 20610) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_wake_due() != 52554) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_account_id() != 51698) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_all_inboxes() != 45754) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_deliver() != 28854) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_cached_all_inboxes() != 43383) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_discard() != 58485) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_cached_counts() != 59691) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_is_kept() != 11173) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_cached_thread() != 43404) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_message() != 2175) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_cached_threads() != 14555) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_save_to_drafts() != 28898) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_load_more() != 56523) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_stage() != 27819) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_mailboxes() != 9049) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_subject() != 31947) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_read_thread() != 31198) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_undo() != 29890) {
+    if (uniffi_nimbra_ffi_checksum_method_engine_refresh_mailbox() != 56207) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_cancel_scheduled() != 22653) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_catch_up() != 39880) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_pending_work() != 54464) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_queue_send() != 41268) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_schedule_send() != 43306) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_scheduled_sends() != 31601) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_send_due() != 32238) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_unsent() != 21657) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_wait_for_connection() != 12110) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_check_interval_seconds() != 63096) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_watch() != 30987) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_secretstore_get() != 9776) {
@@ -6004,10 +9151,47 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_secretstore_delete() != 31798) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_account_id() != 29045) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_deliver() != 5310) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_deliver_at_ms() != 23423) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_discard() != 39897) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_is_kept() != 14266) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_message() != 24415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_save_to_drafts() != 8694) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_stage() != 24829) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_subject() != 50854) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_outgoingsend_undo() != 61894) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_changewatch_cancel() != 30065) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_changewatch_wait() != 26448) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nimbra_ffi_checksum_constructor_engine_new() != 64115) {
         return InitializationResult.apiChecksumMismatch
     }
 
+    uniffiCallbackInitDnsResolver()
     uniffiCallbackInitSecretStore()
     return InitializationResult.ok
 }()

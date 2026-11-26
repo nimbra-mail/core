@@ -1105,6 +1105,7 @@ name = "nimbra-ffi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "keyring",
  "nimbra-core",
  "uniffi",

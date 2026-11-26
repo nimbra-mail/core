@@ -76,6 +76,19 @@ pub fn blocks(senders: &[String], thread: &Summary) -> bool {
     theirs.is_some_and(|sender| senders.iter().any(|s| s == sender))
 }
 
+/// Blocks a sender: on the account's list from now on, and their threads in the inbox put
+/// away in the Blocked label (made when there is none). The label's id and how many threads
+/// went there. Blocking (network).
+pub fn block(client: &mail::Client, store: &Store, address: &str) -> Result<(String, usize)> {
+    if !set(store, address, true)? {
+        anyhow::bail!("That sender has no address to block.");
+    }
+    // Their other threads in the inbox go too.
+    let label = label_id(client)?;
+    let moved = sweep(client, store);
+    Ok((label, moved))
+}
+
 /// Moves a thread to the Blocked label: out of the inbox, and read.
 pub fn put_away(client: &mail::Client, thread: &str, label: &str) -> Result<()> {
     client.relabel(thread, &[label], &["INBOX", "UNREAD"])

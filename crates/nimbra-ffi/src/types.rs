@@ -2,7 +2,7 @@
 //! Ids (accounts, threads, messages, drafts, labels) are the engine's or the provider's,
 //! and only ever handed back to the engine they came from.
 
-use nimbra_core::{discover, mail, rich, scheduled, servers, settings, snooze};
+use nimbra_core::{discover, listing, mail, rich, scheduled, servers, settings, snooze};
 
 // ------------------------------------------------------------------ setup
 
@@ -97,6 +97,10 @@ pub enum Mailbox {
     },
     Starred,
     Important,
+    /// Put away until later (kept on the device, and Gmail's own snoozed threads).
+    Snoozed,
+    /// Put away until later unless someone replies (kept on the device).
+    Reminders,
     Drafts,
     Sent,
     /// Archived ("Done"): everything not in the inbox, Sent, Drafts, Spam or Trash.
@@ -123,9 +127,12 @@ pub struct LabelCount {
     pub total: u32,
 }
 
+/// One thread in a list: the row both apps keep (`listing::Row` in the engine).
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
-pub struct ThreadSummary {
+pub struct ThreadRow {
     pub id: String,
+    /// The account it is in, when the list mixes accounts (All inboxes).
+    pub account_id: Option<String>,
     pub sender: String,
     pub subject: String,
     pub snippet: String,
@@ -135,13 +142,46 @@ pub struct ThreadSummary {
     pub starred: bool,
     /// Every label on any of its messages ("INBOX", "STARRED", label ids).
     pub labels: Vec<String>,
+    /// Who wrote in it ("Ana, Ben · 3 messages"), once its messages are downloaded.
+    pub participants: String,
+    /// Its messages are on the device: `cached_thread` opens it at once, also offline.
+    pub loaded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct ThreadPage {
-    pub threads: Vec<ThreadSummary>,
+    pub threads: Vec<ThreadRow>,
     /// Hand back to get the next page; `None` at the end.
     pub next_page: Option<String>,
+}
+
+/// Where a mailbox goes in the list of mailboxes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MailboxSection {
+    /// The Split Inbox (Gmail only).
+    Split,
+    Mailboxes,
+    /// The account's labels (IMAP: its folders).
+    Labels,
+}
+
+/// A mailbox an account lists, in order.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct MailboxEntry {
+    pub mailbox: Mailbox,
+    pub section: MailboxSection,
+    /// A label's name; `None` for the mailboxes every account has.
+    pub name: Option<String>,
+}
+
+/// All inboxes: every account's inbox, newest first.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct AllInboxesPage {
+    pub threads: Vec<ThreadRow>,
+    /// Each account's unread inbox threads.
+    pub unread: Vec<LabelCount>,
+    /// Accounts that could not be listed (left out). All of them failing is an error.
+    pub failed_accounts: u32,
 }
 
 /// What changed since a sync point (`Engine::check_for_changes`).
@@ -152,8 +192,14 @@ pub struct SyncResult {
     /// Threads with any change: fetch their rows again (`thread_summary`).
     pub changed_threads: Vec<String>,
     /// Threads that got a new unread message in the inbox, without those from blocked
-    /// senders (which were put away): for notifications.
+    /// senders (which were put away).
     pub new_unread_inbox: Vec<String>,
+    /// The first few of them, each its own notification (sender and subject).
+    pub named: Vec<ThreadRow>,
+    /// How many more arrived, summed up in one notification ("N more new messages").
+    pub more_new: u32,
+    /// Notifications are on in Preferences.
+    pub notify: bool,
     /// The cursor given was too old: list the mailboxes afresh.
     pub expired: bool,
 }
@@ -270,6 +316,8 @@ pub enum ThreadAction {
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct SnoozedThread {
     pub thread_id: String,
+    /// The account it is in, when it was snoozed from All inboxes as another's.
+    pub account_id: Option<String>,
     /// When it comes back, or for a reminder, when it is checked for a reply.
     pub until_ms: i64,
     /// A reminder: it comes back only if nobody replied.
@@ -311,6 +359,43 @@ pub struct OutgoingMessage {
     pub reply: Option<ReplyRef>,
 }
 
+/// How a wait for changes ended (`ChangeWatch::wait`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum WatchOutcome {
+    Changed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AnswerKind {
+    Reply,
+    ReplyAll,
+    Forward,
+}
+
+/// What a reply or forward starts with (`Engine::start_answer`).
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct DraftStart {
+    pub subject: String,
+    pub to: Vec<String>,
+    /// The earlier message as text, folded under what is written; added when sent
+    /// (`message_html`).
+    pub quoted: Option<String>,
+    /// The files a forward carries.
+    pub kept: Vec<AttachmentInfo>,
+    pub reply: Option<ReplyRef>,
+    /// The account's default signature, shown under what is written.
+    pub signature: Option<SignatureInfo>,
+}
+
+/// A draft's HTML taken apart (`split_draft_html`).
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct DraftParts {
+    pub written: String,
+    pub signature: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct DraftMessage {
     pub id: String,
@@ -339,6 +424,96 @@ pub enum SendStage {
     Refused,
     /// Sent, taken back, or saved to Drafts.
     Over,
+}
+
+/// What became of an action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ActionOutcome {
+    Done,
+    /// Offline: it waits on the device and is made once the server can be reached.
+    Queued,
+}
+
+/// What became of a message handed to the server (`OutgoingSend::deliver`).
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum SendOutcome {
+    Sent,
+    /// Offline: it stays held. Hand it to `Engine::wait_for_connection`; `catch_up` sends it.
+    WaitingForConnection,
+    /// The answer never came: it may have gone. Never sent again by itself.
+    MaybeSent {
+        in_drafts: bool,
+    },
+    /// The server said no.
+    Refused {
+        message: String,
+    },
+    /// The account's sign-in is gone: sign in again.
+    SignedOut,
+    /// It was not waiting to be sent (sent already, or taken back).
+    NotWaiting,
+}
+
+/// Why a message went to Drafts instead of out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum LeftBehind {
+    /// It may already have been sent: check Sent before sending it again.
+    MaybeSent,
+    /// It was not sent.
+    Refused,
+    /// It was still being written when the app quit.
+    Writing,
+    /// It was to be sent later, and that was not kept before the app quit.
+    Unscheduled,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct MovedToDrafts {
+    pub subject: String,
+    pub why: LeftBehind,
+    /// Drafts has it; `false`: it is still kept on the device, to try again.
+    pub in_drafts: bool,
+}
+
+/// What an earlier run left unsent (`Engine::unsent`).
+#[derive(uniffi::Record)]
+pub struct UnsentReport {
+    /// Never left: send these (`deliver`).
+    pub to_send: Vec<std::sync::Arc<crate::sending::OutgoingSend>>,
+    pub moved_to_drafts: Vec<MovedToDrafts>,
+}
+
+/// What a catch-up got done (`Engine::catch_up`).
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct CatchUpResult {
+    pub changes: u32,
+    pub sent: u32,
+    pub moved_to_drafts: Vec<MovedToDrafts>,
+    /// Nothing waits any more: back online.
+    pub done: bool,
+}
+
+/// What waits for an account, and when to look again (`Engine::pending_work`).
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct PendingWork {
+    pub queued_changes: u32,
+    pub waiting_messages: u32,
+    /// The soonest snooze, send later or retry (ms since 1970); `None`: nothing is due.
+    pub next_deadline_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum SendLaterKind {
+    InAnHour,
+    ThisEvening,
+    TomorrowMorning,
+    MondayMorning,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct SendLaterTime {
+    pub kind: SendLaterKind,
+    pub at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -387,6 +562,10 @@ pub struct Preferences {
     pub undo_send_seconds: u32,
     /// Quote the message being answered in a reply.
     pub quote_replies: bool,
+    /// Unread mail counts on the app icon.
+    pub badge: bool,
+    /// New mail notifications play a sound.
+    pub notification_sound: bool,
 }
 
 // ------------------------------------------------------------------ conversions
@@ -452,6 +631,36 @@ impl From<discover::Found> for Discovery {
 }
 
 impl Mailbox {
+    /// The mailbox for one of the core's (not a search, nor All inboxes).
+    pub(crate) fn of_view(view: mail::View) -> Option<Mailbox> {
+        Some(match view {
+            mail::View::Inbox => Mailbox::Inbox,
+            mail::View::Primary => Mailbox::Split {
+                category: SplitCategory::Primary,
+            },
+            mail::View::Updates => Mailbox::Split {
+                category: SplitCategory::Updates,
+            },
+            mail::View::Promotions => Mailbox::Split {
+                category: SplitCategory::Promotions,
+            },
+            mail::View::Social => Mailbox::Split {
+                category: SplitCategory::Social,
+            },
+            mail::View::Starred => Mailbox::Starred,
+            mail::View::Important => Mailbox::Important,
+            mail::View::Snoozed => Mailbox::Snoozed,
+            mail::View::Reminders => Mailbox::Reminders,
+            mail::View::Drafts => Mailbox::Drafts,
+            mail::View::Sent => Mailbox::Sent,
+            mail::View::Done => Mailbox::Done,
+            mail::View::AllMail => Mailbox::AllMail,
+            mail::View::Spam => Mailbox::Spam,
+            mail::View::Trash => Mailbox::Trash,
+            mail::View::AllInboxes | mail::View::Search | mail::View::Label(_) => return None,
+        })
+    }
+
     /// The core's mailbox and the label (or folder) id it needs.
     pub(crate) fn view(&self) -> (mail::View, Option<&str>) {
         match self {
@@ -466,6 +675,8 @@ impl Mailbox {
                 None,
             ),
             Mailbox::Starred => (mail::View::Starred, None),
+            Mailbox::Snoozed => (mail::View::Snoozed, None),
+            Mailbox::Reminders => (mail::View::Reminders, None),
             Mailbox::Important => (mail::View::Important, None),
             Mailbox::Drafts => (mail::View::Drafts, None),
             Mailbox::Sent => (mail::View::Sent, None),
@@ -479,18 +690,89 @@ impl Mailbox {
     }
 }
 
-impl From<&mail::Summary> for ThreadSummary {
+impl From<&mail::Summary> for ThreadRow {
     fn from(summary: &mail::Summary) -> Self {
-        ThreadSummary {
-            id: summary.id.clone(),
-            sender: summary.sender.clone(),
-            subject: summary.subject.clone(),
-            snippet: summary.snippet.clone(),
-            timestamp_ms: summary.timestamp_ms,
-            message_count: u32::try_from(summary.message_count).unwrap_or(u32::MAX),
-            unread: summary.unread,
-            starred: summary.starred,
-            labels: summary.labels.clone(),
+        (&listing::Row::from_summary(summary.clone())).into()
+    }
+}
+
+impl From<&listing::Row> for ThreadRow {
+    fn from(row: &listing::Row) -> Self {
+        ThreadRow {
+            id: row.id.clone().unwrap_or_default(),
+            account_id: row.account.clone(),
+            sender: row.sender.clone(),
+            subject: row.subject.clone(),
+            snippet: row.snippet.clone(),
+            timestamp_ms: row.timestamp_ms,
+            message_count: row
+                .thread
+                .as_deref()
+                .and_then(|count| count.parse().ok())
+                .unwrap_or(1),
+            unread: row.unread,
+            starred: row.starred,
+            labels: row.labels.clone(),
+            participants: row.participants.clone(),
+            loaded: row.loaded,
+        }
+    }
+}
+
+impl MailMessage {
+    fn kept(header: &listing::Header, sender: &str, snippet: &str, blocks: &[rich::Block]) -> Self {
+        MailMessage {
+            from: (&header.from).into(),
+            to: header.to.iter().map(Person::from).collect(),
+            cc: header.cc.iter().map(Person::from).collect(),
+            reply_to: header.reply_to.as_ref().map(Person::from),
+            sender: sender.to_string(),
+            address: header.from.address.clone(),
+            others: header.everyone(),
+            message_id: header.message_id.clone(),
+            timestamp_ms: header.date_ms,
+            snippet: snippet.to_string(),
+            blocks: blocks.iter().map(TextBlock::from).collect(),
+            text: plain_text(blocks),
+            html: None,
+            attachments: header
+                .attachments
+                .iter()
+                .map(AttachmentInfo::from)
+                .collect(),
+            unsubscribe: header.unsubscribe.clone(),
+        }
+    }
+}
+
+impl From<&listing::Row> for MailThread {
+    /// A thread as kept with its row: the earlier messages, then the latest.
+    fn from(row: &listing::Row) -> Self {
+        let mut messages: Vec<MailMessage> = row
+            .earlier
+            .iter()
+            .rev()
+            .map(|e| MailMessage::kept(&e.header, &e.sender, &e.snippet, &e.blocks))
+            .collect();
+        let sender = row.header.from.label().to_string();
+        let mut latest = MailMessage::kept(&row.header, &sender, &row.snippet, &row.body);
+        latest.html = row.html.clone();
+        if !row.reply_all.is_empty() {
+            latest.others = row.reply_all.clone();
+        }
+        messages.push(latest);
+        MailThread {
+            id: row.id.clone().unwrap_or_default(),
+            messages,
+        }
+    }
+}
+
+impl From<mail::Label> for Label {
+    fn from(label: mail::Label) -> Self {
+        Label {
+            id: label.id,
+            name: label.name,
         }
     }
 }
@@ -632,17 +914,47 @@ impl ThreadAction {
     }
 }
 
-impl From<&snooze::Snoozed> for SnoozedThread {
-    fn from(item: &snooze::Snoozed) -> Self {
+impl From<&snooze::Snooze> for SnoozedThread {
+    fn from(item: &snooze::Snooze) -> Self {
         SnoozedThread {
             thread_id: item.thread_id.clone(),
+            account_id: item.mail.account.clone(),
             until_ms: item.until_ms,
             only_if_no_reply: item.no_reply,
-            subject: item.subject.clone(),
-            sender: item.sender.clone(),
-            snippet: item.snippet.clone(),
+            subject: item.mail.subject.clone(),
+            sender: item.mail.sender.clone(),
+            snippet: item.mail.snippet.clone(),
         }
     }
+}
+
+/// A time the Snooze menu offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum SnoozeKind {
+    LaterToday,
+    InThreeHours,
+    Tomorrow,
+    TomorrowEvening,
+    ThisWeekend,
+    NextWeek,
+    /// A reminder in three days, if nobody replied.
+    NoReplyInThreeDays,
+    /// A reminder in a week, if nobody replied.
+    NoReplyInAWeek,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct SnoozeTime {
+    pub kind: SnoozeKind,
+    pub until_ms: i64,
+    pub only_if_no_reply: bool,
+}
+
+/// A time of day, as typed (`parse_time`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TimeOfDay {
+    pub hour: u32,
+    pub minute: u32,
 }
 
 impl From<&OutgoingMessage> for mail::Outgoing {

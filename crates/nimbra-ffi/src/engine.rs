@@ -16,19 +16,19 @@ use nimbra_core::imap_mail::Credential;
 use nimbra_core::settings::{AccountRef, Settings};
 use nimbra_core::store::Store;
 use nimbra_core::{
-    blocking, contacts, discover, gmail, imap_mail, mail, microsoft, paths, scheduled, sending,
-    servers, settings, signature, smtp, snooze, store,
+    accounts, blocking, contacts, discover, gmail, imap_mail, listing, mail, microsoft, paths,
+    sending, servers, settings, signature, smtp, snooze, store,
 };
 
 use crate::error::{NimbraError, Result};
 use crate::secrets::{self, SecretStore};
 use crate::types::*;
 
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
@@ -36,9 +36,9 @@ fn now_ms() -> i64 {
 }
 
 /// One account's connection and store.
-struct Open {
-    client: Arc<mail::Client>,
-    store: Arc<Store>,
+pub(crate) struct Open {
+    pub(crate) client: Arc<mail::Client>,
+    pub(crate) store: Arc<Store>,
 }
 
 /// A sign-in the browser has not come back from yet.
@@ -64,69 +64,9 @@ pub struct Engine {
     open: Mutex<HashMap<String, Arc<Open>>>,
     pending: Mutex<HashMap<String, Pending>>,
     /// Numbers the messages handed to `queue_send` (the core's "composer").
-    sends: Mutex<u64>,
-}
-
-/// A message on its way: kept on the device from `queue_send` until the server has it.
-#[derive(uniffi::Object)]
-pub struct OutgoingSend {
-    job: Arc<sending::Job>,
-}
-
-#[uniffi::export]
-impl OutgoingSend {
-    pub fn account_id(&self) -> String {
-        self.job.account.clone()
-    }
-
-    pub fn subject(&self) -> String {
-        self.job.subject()
-    }
-
-    pub fn stage(&self) -> SendStage {
-        self.job.stage().into()
-    }
-
-    /// The message as it is now, to show again after Undo.
-    pub fn message(&self) -> OutgoingMessage {
-        let (_, outgoing) = self.job.mail();
-        OutgoingMessage::from(outgoing.as_ref())
-    }
-
-    /// Whether it is kept on the device (so quitting cannot lose it).
-    pub fn is_kept(&self) -> bool {
-        self.job.kept()
-    }
-
-    /// Sends it, once however often this is called. `Ok(false)` when it was not waiting to
-    /// be sent (sent already, taken back). Offline, it stays held to send again. Network.
-    pub fn deliver(&self) -> Result<bool> {
-        match self.job.send() {
-            None => Ok(false),
-            Some(Ok(())) => Ok(true),
-            Some(Err(error)) => Err(error.into()),
-        }
-    }
-
-    /// Undo send: takes it back while it has not left. Whether it was taken back.
-    pub fn undo(&self) -> bool {
-        if self.job.stage() != sending::Stage::Held {
-            return false;
-        }
-        self.job.forget();
-        true
-    }
-
-    /// Puts it in Drafts instead (a refused or unsure send). Its draft id, or `None` while
-    /// that has not worked yet (it stays kept). Network.
-    pub fn save_to_drafts(&self) -> Option<String> {
-        self.job.saved_as_draft()
-    }
-
-    /// Deletes it and whatever draft was saved of it. Whether that worked. Network.
-    pub fn discard(&self) -> bool {
-        self.job.discard()
-    }
+    pub(crate) sends: Mutex<u64>,
+    /// Messages that wait for the connection, by account: sent by `catch_up`.
+    pub(crate) waiting: Mutex<HashMap<String, Vec<Arc<sending::Job>>>>,
 }
 
 #[uniffi::export]
@@ -178,6 +118,7 @@ impl Engine {
             open: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             sends: Mutex::new(0),
+            waiting: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -437,16 +378,16 @@ impl Engine {
             return Err(NimbraError::invalid("There is no such account."));
         }
         locked(&self.open).remove(&account_id);
-        gmail::forget_refresh_token(&account_id);
-        servers::forget_password(&account_id);
-        microsoft::forget_refresh_token(&account_id);
-        store::wipe(&account_id);
+        // As signing out on the Mac: whoever signs in next must not send its mail.
+        for job in locked(&self.waiting)
+            .remove(&account_id)
+            .unwrap_or_default()
+        {
+            job.forget();
+        }
+        accounts::forget_secrets_and_mail(&account_id);
         self.change_settings(|settings| {
-            settings.accounts.retain(|a| a.id != account_id);
-            settings.forget_signatures(&account_id);
-            if settings.default_account.as_deref() == Some(account_id.as_str()) {
-                settings.default_account = None;
-            }
+            accounts::remove(settings, &account_id);
             Ok(())
         })
     }
@@ -456,15 +397,10 @@ impl Engine {
     /// The account's own labels (IMAP: its folders). Network.
     pub fn labels(&self, account_id: String) -> Result<Vec<Label>> {
         let open = self.connect(&account_id)?;
-        Ok(open
-            .client
-            .labels()?
-            .into_iter()
-            .map(|label| Label {
-                id: label.id,
-                name: label.name,
-            })
-            .collect())
+        let mut labels = open.client.labels()?;
+        listing::sort_labels(&mut labels);
+        Self::keep_labels(&open, |kept| *kept = labels.clone())?;
+        Ok(labels.into_iter().map(Label::from).collect())
     }
 
     /// Unread and total threads for these labels ("INBOX", "STARRED", label ids). Network.
@@ -482,27 +418,6 @@ impl Engine {
                 })
             })
             .collect())
-    }
-
-    /// A page of a mailbox's threads, newest first. `page` is the last page's
-    /// `next_page`. Network.
-    pub fn list_threads(
-        &self,
-        account_id: String,
-        mailbox: Mailbox,
-        page: Option<String>,
-        limit: u32,
-    ) -> Result<ThreadPage> {
-        let open = self.connect(&account_id)?;
-        let (view, label) = mailbox.view();
-        let limit = limit.clamp(1, 100) as usize;
-        let (threads, next_page) = open
-            .client
-            .threads_page(view, label, limit, page.as_deref())?;
-        Ok(ThreadPage {
-            threads: threads.iter().map(ThreadSummary::from).collect(),
-            next_page,
-        })
     }
 
     /// Searches the account's mail (Gmail's search words, or text for IMAP). Network.
@@ -526,44 +441,58 @@ impl Engine {
             open.client
                 .threads_page(mail::View::Search, Some(query), limit, page.as_deref())?;
         Ok(ThreadPage {
-            threads: threads.iter().map(ThreadSummary::from).collect(),
+            threads: threads.iter().map(ThreadRow::from).collect(),
             next_page,
         })
     }
 
     /// One thread's row, fresh. Network.
-    pub fn thread_summary(&self, account_id: String, thread_id: String) -> Result<ThreadSummary> {
+    pub fn thread_summary(&self, account_id: String, thread_id: String) -> Result<ThreadRow> {
         let open = self.connect(&account_id)?;
         Ok((&open.client.summary(&thread_id, false)?).into())
     }
 
-    /// What changed since `cursor` (`None`: start from now). Mail from blocked senders that
-    /// arrived is put away on the way. Network.
+    /// What changed since `cursor` (`None`: start from now), and what to notify about, as
+    /// the Mac decides: blocked senders' new mail is put away first and never notifies, the
+    /// first few new threads are named and the rest counted. On the first look (no cursor)
+    /// what blocked senders left in the inbox meanwhile is put away. Network.
     pub fn check_for_changes(
         &self,
         account_id: String,
         cursor: Option<String>,
     ) -> Result<SyncResult> {
         let open = self.connect(&account_id)?;
+        let notify = self.preferences().notifications;
         let fresh = |expired: bool| -> Result<SyncResult> {
             let (_, latest) = open.client.profile()?;
             Ok(SyncResult {
                 cursor: latest,
                 changed_threads: Vec::new(),
                 new_unread_inbox: Vec::new(),
+                named: Vec::new(),
+                more_new: 0,
+                notify,
                 expired,
             })
         };
         let Some(cursor) = cursor.filter(|c| !c.is_empty()) else {
+            blocking::sweep(&*open.client, &open.store);
             return fresh(false);
         };
         match open.client.history(&cursor) {
             Ok(changes) => {
-                let new = blocking::screen(&*open.client, &open.store, changes.new_unread_inbox);
+                let news = nimbra_core::notifying::new_mail(
+                    &*open.client,
+                    Some(&open.store),
+                    changes.new_unread_inbox,
+                );
                 Ok(SyncResult {
                     cursor: changes.latest,
                     changed_threads: changes.threads,
-                    new_unread_inbox: new,
+                    new_unread_inbox: news.fresh,
+                    named: news.named.iter().map(ThreadRow::from).collect(),
+                    more_new: news.more as u32,
+                    notify,
                     expired: false,
                 })
             }
@@ -572,17 +501,38 @@ impl Engine {
         }
     }
 
-    // -------------------------------------------------------------- reading
-
-    /// A thread's messages, parsed: text blocks, the original HTML, attachments. Network.
-    pub fn read_thread(&self, account_id: String, thread_id: String) -> Result<MailThread> {
-        let open = self.connect(&account_id)?;
-        let messages = open.client.thread(&thread_id)?;
-        Ok(MailThread {
-            id: thread_id,
-            messages: messages.iter().map(MailMessage::from).collect(),
-        })
+    /// The app icon's number: unread threads in every account's inbox, as last counted
+    /// (each account once), or 0 when the badge is off in Preferences. Disk.
+    pub fn badge_count(&self) -> Result<u32> {
+        if !self.preferences().badge {
+            return Ok(0);
+        }
+        let mut unread = HashMap::new();
+        for account in self.accounts() {
+            // One that cannot be opened (signed out, or removed meanwhile) does not count.
+            let Ok(open) = self.connect(&account.id) else {
+                continue;
+            };
+            let meta: listing::Meta = open.store.load(listing::META).unwrap_or_default();
+            let count = meta.counts.get("INBOX").map_or(0, |(unread, _)| *unread);
+            unread.insert(account.id, count);
+        }
+        Ok(nimbra_core::notifying::inbox_badge(
+            "",
+            unread.get("").copied(),
+            &unread,
+            |_| true,
+        ))
     }
+
+    /// When an opened thread counts as read (Preferences): at once (0), after a moment, or
+    /// only when the user says so (`None`).
+    pub fn mark_read_after_ms(&self) -> Option<u32> {
+        let choice = locked(&self.settings).mark_read;
+        nimbra_core::notifying::mark_read_after(choice).map(|after| after.as_millis() as u32)
+    }
+
+    // -------------------------------------------------------------- reading
 
     /// An attachment's content. Network.
     pub fn download_attachment(
@@ -597,11 +547,23 @@ impl Engine {
 
     // -------------------------------------------------------------- actions
 
-    /// Done, star, read and the like. Network.
-    pub fn apply(&self, account_id: String, thread_id: String, action: ThreadAction) -> Result<()> {
+    /// Done, star, read and the like. Offline, it waits in the account's queue and is made
+    /// once the server can be reached (`catch_up`), as on the Mac. Network.
+    pub fn apply(
+        &self,
+        account_id: String,
+        thread_id: String,
+        action: ThreadAction,
+    ) -> Result<ActionOutcome> {
         let open = self.connect(&account_id)?;
-        open.client.change(&thread_id, action.change())?;
-        Ok(())
+        match open.client.change(&thread_id, action.change()) {
+            Ok(()) => Ok(ActionOutcome::Done),
+            Err(error) if error.is::<mail::Offline>() => {
+                nimbra_core::outbox::queue(&open.store, &thread_id, action.change())?;
+                Ok(ActionOutcome::Queued)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Adds and removes labels in one change (a move: add the label, remove "INBOX").
@@ -621,27 +583,41 @@ impl Engine {
     }
 
     /// Network.
+    /// A new label, unless one is already called that (in any case): then that one, as on
+    /// the Mac. Network (disk when it exists).
     pub fn create_label(&self, account_id: String, name: String) -> Result<Label> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(NimbraError::invalid("A label needs a name."));
+        }
         let open = self.connect(&account_id)?;
-        let label = open.client.create_label(name.trim())?;
-        Ok(Label {
-            id: label.id,
-            name: label.name,
-        })
+        let meta: listing::Meta = open.store.load(listing::META).unwrap_or_default();
+        if let Some(existing) = listing::label_named(&meta.labels, name) {
+            return Ok(existing.clone().into());
+        }
+        let label = open.client.create_label(name)?;
+        let made = label.clone();
+        Self::keep_labels(&open, move |kept| kept.push(made))?;
+        Ok(label.into())
     }
 
     /// Network.
     pub fn rename_label(&self, account_id: String, label_id: String, name: String) -> Result<()> {
+        let name = name.trim().to_string();
         let open = self.connect(&account_id)?;
-        open.client.rename_label(&label_id, name.trim())?;
-        Ok(())
+        open.client.rename_label(&label_id, &name)?;
+        Self::keep_labels(&open, |kept| {
+            for label in kept.iter_mut().filter(|l| l.id == label_id) {
+                label.name = name.clone();
+            }
+        })
     }
 
-    /// Network.
+    /// Deletes a label; the mail stays. Network.
     pub fn delete_label(&self, account_id: String, label_id: String) -> Result<()> {
         let open = self.connect(&account_id)?;
         open.client.delete_label(&label_id)?;
-        Ok(())
+        Self::keep_labels(&open, |kept| kept.retain(|l| l.id != label_id))
     }
 
     /// Deletes a thread for good (Gmail may need `NeedsFullAccess` first). Network.
@@ -651,8 +627,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Puts a thread away until `until_ms`: out of the inbox, and back unread when the time
-    /// comes (`wake_due`). `only_if_no_reply` makes it a reminder. Network.
+    /// Puts a thread away until `until_ms`, kept with its account as the macOS app keeps it:
+    /// out of the inbox now, back unread when the time comes (`wake_due`).
+    /// `only_if_no_reply` makes it a reminder. Network (disk when it is already out).
     pub fn snooze(
         &self,
         account_id: String,
@@ -661,19 +638,15 @@ impl Engine {
         only_if_no_reply: bool,
     ) -> Result<()> {
         let open = self.connect(&account_id)?;
-        let row = open.client.summary(&thread_id, false)?;
-        snooze::add(
-            &open.store,
-            snooze::Snoozed {
-                thread_id: thread_id.clone(),
-                until_ms,
-                no_reply: only_if_no_reply,
-                since_ms: row.timestamp_ms,
-                subject: row.subject,
-                sender: row.sender,
-                snippet: row.snippet,
-            },
-        )?;
+        let row = match listing::find_kept(&open.store, &thread_id) {
+            Some(row) => row,
+            None => listing::Row::from_summary(open.client.summary(&thread_id, false)?),
+        };
+        let item = snooze::Snooze::new(&row, until_ms, only_if_no_reply);
+        open.store
+            .update(snooze::LIST, |list: &mut Vec<snooze::Snooze>| {
+                snooze::put(list, std::slice::from_ref(&item))
+            })?;
         if row.labels.iter().any(|label| label == "INBOX") {
             open.client.change(&thread_id, mail::Change::Archive)?;
         }
@@ -688,50 +661,119 @@ impl Engine {
         Ok(list.iter().map(SnoozedThread::from).collect())
     }
 
-    /// Cancels a snooze and puts the thread back in the inbox. Network.
+    /// Cancels a snooze (Undo): out of the list, and the thread back in the inbox. Network.
     pub fn unsnooze(&self, account_id: String, thread_id: String) -> Result<()> {
         let open = self.connect(&account_id)?;
-        if snooze::remove(&open.store, &thread_id)? {
+        let mut had = false;
+        open.store
+            .update(snooze::LIST, |list: &mut Vec<snooze::Snooze>| {
+                had = list.iter().any(|s| s.thread_id == thread_id);
+                snooze::forget(list, std::slice::from_ref(&thread_id));
+            })?;
+        if had {
             open.client.change(&thread_id, mail::Change::Unarchive)?;
         }
         Ok(())
     }
 
-    /// Brings back what is due by now. The threads that came back. Network.
-    pub fn wake_due(&self, account_id: String) -> Result<Vec<String>> {
+    /// Brings back the snoozes due by now, each through its own account. The ones that came
+    /// back (to notify about: "Back from snooze", or for a reminder "No reply yet"). One
+    /// that could not be checked (offline) stays for next time. Network.
+    pub fn wake_due(&self, account_id: String) -> Result<Vec<SnoozedThread>> {
         let open = self.connect(&account_id)?;
-        Ok(snooze::wake_due(&open.store, &*open.client, now_ms()))
+        let mut back = Vec::new();
+        for item in snooze::due(&snooze::list(&open.store), now_ms()) {
+            let owner = item
+                .mail
+                .account
+                .clone()
+                .unwrap_or_else(|| account_id.clone());
+            let Ok(theirs) = self.connect(&owner) else {
+                continue;
+            };
+            if matches!(
+                snooze::wake_kept(&open.store, &*theirs.client, &item),
+                Ok(true)
+            ) {
+                back.push(SnoozedThread::from(&item));
+            }
+        }
+        Ok(back)
     }
 
-    /// Blocks a sender: their mail goes to the Blocked label from now on, and `thread_id`
-    /// (theirs) goes there now. Network.
+    /// Blocks a sender, as the Mac does: on the account's list from now on, their threads
+    /// in the inbox put away in the Blocked label (made when there is none), and
+    /// `thread_id` (theirs, open in `from`) moved there as Move to does. Their mail never
+    /// notifies. Network.
     pub fn block_sender(
         &self,
         account_id: String,
         address: String,
         thread_id: Option<String>,
+        from: Mailbox,
     ) -> Result<()> {
         let address = mail::address_of(&address).to_lowercase();
         if !mail::is_address(&address) {
             return Err(NimbraError::invalid("That is not an email address."));
         }
         let open = self.connect(&account_id)?;
-        blocking::set(&open.store, &address, true)?;
+        let (label, _) = blocking::block(&*open.client, &open.store, &address)?;
         if let Some(thread_id) = thread_id {
-            let label = blocking::label_id(&*open.client)?;
-            blocking::put_away(&*open.client, &thread_id, &label)?;
+            self.move_to_label(account_id, thread_id, label, from)?;
         }
         Ok(())
     }
 
-    /// Disk.
-    pub fn unblock_sender(&self, account_id: String, address: String) -> Result<()> {
+    /// Unblocks a sender: off the list, and `thread_id` (theirs) out of the Blocked label
+    /// and back in the inbox. Network (disk without a thread).
+    pub fn unblock_sender(
+        &self,
+        account_id: String,
+        address: String,
+        thread_id: Option<String>,
+    ) -> Result<()> {
         let open = self.connect(&account_id)?;
-        blocking::set(
-            &open.store,
-            &mail::address_of(&address).to_lowercase(),
-            false,
-        )?;
+        blocking::set(&open.store, &mail::address_of(&address), false)?;
+        if let Some(thread_id) = thread_id {
+            let label = blocking::label_id(&*open.client)?;
+            open.client
+                .relabel(&thread_id, &["INBOX"], &[label.as_str()])?;
+        }
+        Ok(())
+    }
+
+    /// Move to Inbox from `from`: out of Spam (not spam) or Trash (restored), else out of
+    /// the archive. Offline, it waits as `apply` does. Network.
+    pub fn move_to_inbox(
+        &self,
+        account_id: String,
+        thread_id: String,
+        from: Mailbox,
+    ) -> Result<ActionOutcome> {
+        let (view, _) = from.view();
+        let change = listing::to_inbox(view);
+        self.apply(account_id, thread_id, ThreadAction::from_change(change))
+    }
+
+    /// Move to a label from `from`: the label added and, from an inbox (one account's, All
+    /// inboxes or a Split Inbox category), out of the inbox: a move, not a copy, as on the
+    /// Mac. Network.
+    pub fn move_to_label(
+        &self,
+        account_id: String,
+        thread_id: String,
+        label_id: String,
+        from: Mailbox,
+    ) -> Result<()> {
+        let open = self.connect(&account_id)?;
+        let (view, _) = from.view();
+        let leaves: &[&str] = if listing::inbox_like(view) {
+            &["INBOX"]
+        } else {
+            &[]
+        };
+        open.client
+            .relabel(&thread_id, &[label_id.as_str()], leaves)?;
         Ok(())
     }
 
@@ -769,136 +811,43 @@ impl Engine {
         Ok(())
     }
 
-    /// Send: keeps the message on the device and hands it back, held. Call `deliver` on it
-    /// once the undo time (`Preferences.undo_send_seconds`) is over, or `undo` to take it
-    /// back. `draft_id` is its saved draft, which sending uses up. Disk and Keychain.
-    pub fn queue_send(
-        &self,
-        account_id: String,
-        message: OutgoingMessage,
-        draft_id: Option<String>,
-    ) -> Result<Arc<OutgoingSend>> {
-        let outgoing = mail::Outgoing::from(&message);
-        outgoing
-            .recipients()
-            .map_err(|e| NimbraError::invalid(e.to_string()))?;
-        if outgoing.attachment_size() > mail::ATTACHMENT_LIMIT {
-            return Err(NimbraError::invalid("The attachments are over 25 MB."));
-        }
-        let open = self.connect(&account_id)?;
-        let serial = {
-            let mut sends = locked(&self.sends);
-            *sends += 1;
-            *sends
-        };
-        let job = sending::Job::new(
-            account_id,
-            serial,
-            open.client.clone(),
-            Some(open.store.clone()),
-            sending::QueuedMail { draft_id, outgoing },
-        )?;
-        // Not kept: it can still be sent, but quitting before then loses it (`is_kept`).
-        job.keep_asking();
-        Ok(Arc::new(OutgoingSend { job }))
-    }
-
-    /// What an earlier run left unsent for this account: send each again (`deliver`), or,
-    /// when it may have gone (`Unsure`) or was refused, put it in Drafts. Mail that was
-    /// still being written goes to Drafts on its own. Disk.
-    pub fn unsent(&self, account_id: String) -> Result<Vec<Arc<OutgoingSend>>> {
-        let open = self.connect(&account_id)?;
-        let mut left = Vec::new();
-        for job in sending::Job::left_behind(&account_id, &open.client, &open.store) {
-            match job.stage() {
-                sending::Stage::Writing | sending::Stage::Unscheduled => {
-                    job.to_drafts();
-                }
-                sending::Stage::Discarded => {
-                    job.discard();
-                }
-                sending::Stage::Over => {}
-                _ => left.push(Arc::new(OutgoingSend { job })),
-            }
-        }
-        Ok(left)
-    }
-
-    /// Send later: saves the draft and keeps it on the list for `at_ms`. The app sends what
-    /// is due with `send_due`. Network.
-    pub fn schedule_send(
-        &self,
-        account_id: String,
-        message: OutgoingMessage,
-        draft_id: Option<String>,
-        at_ms: i64,
-    ) -> Result<ScheduledSend> {
-        let outgoing = mail::Outgoing::from(&message);
-        outgoing
-            .recipients()
-            .map_err(|e| NimbraError::invalid(e.to_string()))?;
-        let open = self.connect(&account_id)?;
-        let draft_id = open.client.save_draft(draft_id.as_deref(), &outgoing)?;
-        let item = scheduled::Scheduled {
-            draft_id,
-            at_ms,
-            subject: outgoing.subject.clone(),
-            account: None,
-        };
-        scheduled::add(&open.store, item.clone())?;
-        Ok((&item).into())
-    }
-
-    /// Disk.
-    pub fn scheduled_sends(&self, account_id: String) -> Result<Vec<ScheduledSend>> {
-        let open = self.connect(&account_id)?;
-        let mut list = scheduled::list(&open.store);
-        list.sort_by_key(|item| item.at_ms);
-        Ok(list.iter().map(ScheduledSend::from).collect())
-    }
-
-    /// Takes a message off the send-later list. Its draft stays in Drafts. Disk.
-    pub fn cancel_scheduled(&self, account_id: String, draft_id: String) -> Result<()> {
-        let open = self.connect(&account_id)?;
-        scheduled::remove(&open.store, &draft_id)?;
-        Ok(())
-    }
-
-    /// Sends the send-later messages that are due. The drafts sent (or found gone).
-    /// Network.
-    pub fn send_due(&self, account_id: String) -> Result<Vec<String>> {
-        let open = self.connect(&account_id)?;
-        let now = now_ms();
-        let due: Vec<String> = scheduled::list(&open.store)
-            .into_iter()
-            .filter(|item| item.at_ms <= now && item.account.is_none())
-            .map(|item| item.draft_id)
-            .collect();
-        Ok(due
-            .into_iter()
-            .filter(|id| scheduled::send(&open.store, &*open.client, id).is_some())
-            .collect())
-    }
-
     // -------------------------------------------------------------- contacts
 
-    /// Address suggestions for what is typed, best first, from the mail this account has
-    /// seen. Disk.
-    pub fn suggest_contacts(&self, account_id: String, query: String) -> Result<Vec<Person>> {
-        let open = self.connect(&account_id)?;
-        Ok(open
-            .client
-            .contacts()
-            .map(|book| {
-                book.suggest(query.trim())
-                    .into_iter()
-                    .take(contacts::SHOWN)
-                    .map(|(person, _)| Person::from(&person))
-                    .collect()
-            })
-            .unwrap_or_default())
+    /// Address suggestions for what is typed, best first, as the Mac ranks them: what every
+    /// account on the device learnt of the people it writes with, the account the message
+    /// is written from (`account_id`) counting double. Never the user's own addresses, nor
+    /// anyone already in the field (`present`). Disk.
+    pub fn suggest_contacts(
+        &self,
+        account_id: String,
+        query: String,
+        present: Vec<String>,
+    ) -> Result<Vec<Person>> {
+        let accounts = self.accounts();
+        let mine: Vec<String> = accounts.iter().map(|a| a.email.to_lowercase()).collect();
+        let present: Vec<String> = present.iter().map(|a| a.trim().to_lowercase()).collect();
+        let open: Vec<(String, Arc<Open>)> = accounts
+            .into_iter()
+            .filter_map(|a| Some((a.id.clone(), self.connect(&a.id).ok()?)))
+            .collect();
+        let books = open
+            .iter()
+            .filter_map(|(id, open)| Some((id.as_str(), open.client.contacts()?.as_ref())));
+        Ok(contacts::rank(
+            query.trim(),
+            &account_id,
+            books,
+            std::iter::empty(),
+            &mine,
+            &present,
+        )
+        .iter()
+        .map(Person::from)
+        .collect())
     }
 
+    /// Pause `contact_scan_pause_seconds` before each step, as the Mac does, and stop when it
+    /// says there is no more; what was learnt is kept, so the scan resumes where it was.
     /// Learns a little more about who the account writes with (one page of Sent or of the
     /// mail that came in). Whether there is more to learn. Network.
     pub fn learn_contacts(&self, account_id: String) -> Result<bool> {
@@ -985,6 +934,8 @@ impl Engine {
             check_every_seconds: settings.check_every,
             undo_send_seconds: settings.undo_send,
             quote_replies: settings.quote_replies,
+            badge: settings.dock_badge,
+            notification_sound: settings.notify_sound,
         }
     }
 
@@ -998,12 +949,14 @@ impl Engine {
             settings.check_every = preferences.check_every_seconds.clamp(10, 24 * 60 * 60);
             settings.undo_send = preferences.undo_send_seconds.min(60);
             settings.quote_replies = preferences.quote_replies;
+            settings.dock_badge = preferences.badge;
+            settings.notify_sound = preferences.notification_sound;
             Ok(())
         })
     }
 }
 
-fn kind_of(account: &AccountRef) -> AccountKind {
+pub(crate) fn kind_of(account: &AccountRef) -> AccountKind {
     match (&account.servers, account.oauth.as_deref()) {
         (None, _) => AccountKind::Gmail,
         (Some(_), Some(microsoft::PROVIDER)) => AccountKind::Microsoft,
@@ -1024,7 +977,7 @@ impl Engine {
             .ok_or_else(|| NimbraError::invalid("Microsoft sign-in is not set up in this app."))
     }
 
-    fn account(&self, id: &str) -> Result<Option<AccountRef>> {
+    pub(crate) fn account(&self, id: &str) -> Result<Option<AccountRef>> {
         Ok(locked(&self.settings)
             .accounts
             .iter()
@@ -1033,10 +986,22 @@ impl Engine {
     }
 
     fn has_email(&self, email: &str) -> bool {
+        // Not `accounts::duplicate_of`: it skips an id, and the first account's is "".
         locked(&self.settings)
             .accounts
             .iter()
             .any(|a| a.email.eq_ignore_ascii_case(email))
+    }
+
+    /// Changes the account's kept labels (sorted, as they are listed) as the server has
+    /// them now. Disk.
+    fn keep_labels(open: &Open, change: impl FnOnce(&mut Vec<mail::Label>)) -> Result<()> {
+        open.store
+            .update(listing::META, |meta: &mut listing::Meta| {
+                change(&mut meta.labels);
+                listing::sort_labels(&mut meta.labels);
+            })?;
+        Ok(())
     }
 
     /// Changes the settings and saves them, unless `change` refuses.
@@ -1081,7 +1046,7 @@ impl Engine {
 
     /// The account's connection and store, opened on first use with its sign-in from the
     /// Keychain.
-    fn connect(&self, account_id: &str) -> Result<Arc<Open>> {
+    pub(crate) fn connect(&self, account_id: &str) -> Result<Arc<Open>> {
         if let Some(open) = locked(&self.open).get(account_id) {
             return Ok(open.clone());
         }
@@ -1091,38 +1056,21 @@ impl Engine {
         let signed_out = || NimbraError::SignedOut {
             account: account.id.clone(),
         };
+        // As the Mac connects: the sign-in or password from the Keychain (`accounts`).
         let client: Arc<mail::Client> = match kind_of(&account) {
             AccountKind::Gmail => {
                 let token = gmail::stored_refresh_token(&account.id)?.ok_or_else(signed_out)?;
-                contacts::wrap(
-                    gmail::Client::new(self.google()?.clone(), token, account.id.clone()),
-                    &account.email,
-                )
+                accounts::gmail_connection(self.google()?.clone(), token, &account)
             }
-            kind => {
-                let credential = if kind == AccountKind::Microsoft {
-                    let token =
-                        microsoft::stored_refresh_token(&account.id)?.ok_or_else(signed_out)?;
-                    Credential::Microsoft(Arc::new(microsoft::Tokens::new(
-                        self.microsoft()?.clone(),
-                        token,
-                        account.id.clone(),
-                    )))
+            _ => {
+                let microsoft = if accounts::is_microsoft(&account) {
+                    Some(self.microsoft()?)
                 } else {
-                    Credential::Password(
-                        servers::stored_password(&account.id)?.ok_or_else(signed_out)?,
-                    )
+                    None
                 };
-                let servers = account.servers.clone().ok_or_else(signed_out)?;
-                contacts::wrap(
-                    imap_mail::Client::new(
-                        account.id.clone(),
-                        account.email.clone(),
-                        servers,
-                        credential,
-                    ),
-                    &account.email,
-                )
+                let credential =
+                    accounts::stored_credential(&account.id, microsoft)?.ok_or_else(signed_out)?;
+                accounts::imap_connection(&account, Some(credential)).ok_or_else(signed_out)?
             }
         };
         let store = Arc::new(Store::open(&account.id)?);
@@ -1162,9 +1110,9 @@ mod tests {
     }
 
     #[test]
-    fn a_new_engine_has_no_accounts_and_keeps_preferences_in_its_folder() {
+    fn the_engine_keeps_preferences_in_its_own_folder() {
+        // The engine is shared: other tests' accounts come and go meanwhile.
         let engine = engine();
-        assert!(engine.accounts().is_empty());
         let mut preferences = engine.preferences();
         preferences.undo_send_seconds = 10;
         preferences.load_images = !preferences.load_images;
@@ -1225,7 +1173,7 @@ mod tests {
     fn unknown_accounts_are_refused_without_the_network() {
         let engine = engine();
         assert!(matches!(
-            engine.list_threads("nobody".into(), Mailbox::Inbox, None, 20),
+            engine.refresh_mailbox("nobody".into(), Mailbox::Inbox),
             Err(NimbraError::Invalid { .. })
         ));
         assert!(engine.remove_account("nobody".into()).is_err());
@@ -1234,6 +1182,372 @@ mod tests {
                 .begin_microsoft_sign_in("msauth.x://auth".into(), None, None)
                 .is_err()
         );
+    }
+
+    /// An account on the test engine whose connection is a fake server, and that server.
+    pub(crate) fn fake_account(
+        engine: &Engine,
+        email: &str,
+    ) -> (String, Arc<nimbra_core::testing::Fake>) {
+        let fake = nimbra_core::testing::Fake::new(email);
+        let id = mail::new_account_id().unwrap();
+        engine
+            .change_settings(|settings| {
+                settings.accounts.push(AccountRef {
+                    id: id.clone(),
+                    email: email.to_string(),
+                    servers: None,
+                    oauth: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let client: Arc<mail::Client> = fake.clone();
+        locked(&engine.open).insert(
+            id.clone(),
+            Arc::new(Open {
+                client,
+                store: Arc::new(Store::temp()),
+            }),
+        );
+        (id, fake)
+    }
+
+    #[test]
+    fn a_mailbox_is_kept_and_opens_from_the_device() {
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "lists@example.com");
+        fake.add(nimbra_core::testing::Fake::thread(
+            "a",
+            &["INBOX", "UNREAD"],
+            2,
+        ));
+        fake.add(nimbra_core::testing::Fake::thread("b", &["INBOX"], 1));
+        assert!(
+            engine
+                .cached_threads(id.clone(), Mailbox::Inbox)
+                .unwrap()
+                .is_empty()
+        );
+        let page = engine.refresh_mailbox(id.clone(), Mailbox::Inbox).unwrap();
+        let ids: Vec<_> = page.threads.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(
+            engine.cached_threads(id.clone(), Mailbox::Inbox).unwrap(),
+            page.threads
+        );
+        // Read once, then it opens offline.
+        let thread = engine.read_thread(id.clone(), "a".into()).unwrap();
+        fake.offline
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let kept = engine
+            .cached_thread(id.clone(), "a".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.messages.last().unwrap().text, thread.messages[0].text);
+        assert!(matches!(
+            engine.refresh_mailbox(id.clone(), Mailbox::Inbox),
+            Err(NimbraError::Offline)
+        ));
+        let entries = engine.mailboxes(id.clone()).unwrap();
+        assert_eq!(entries[0].section, MailboxSection::Split);
+        assert_eq!(
+            entries[1].mailbox,
+            Mailbox::Split {
+                category: SplitCategory::Primary
+            }
+        );
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn all_inboxes_mixes_accounts_newest_first() {
+        let engine = engine();
+        let (first, one) = fake_account(&engine, "one@example.com");
+        let (second, two) = fake_account(&engine, "two@example.com");
+        one.add(nimbra_core::testing::Fake::thread("x", &["INBOX"], 1));
+        two.add(nimbra_core::testing::Fake::thread(
+            "y",
+            &["INBOX", "UNREAD"],
+            5,
+        ));
+        let all = engine.all_inboxes(0).unwrap();
+        let rows: Vec<_> = all
+            .threads
+            .iter()
+            .filter(|t| t.id == "x" || t.id == "y")
+            .map(|t| (t.id.clone(), t.account_id.clone().unwrap()))
+            .collect();
+        assert_eq!(
+            rows,
+            [("y".into(), second.clone()), ("x".into(), first.clone())]
+        );
+        assert!(
+            all.unread
+                .iter()
+                .any(|u| u.label_id == second && u.unread == 1)
+        );
+        engine.remove_account(first).unwrap();
+        engine.remove_account(second).unwrap();
+    }
+
+    #[test]
+    fn a_snooze_leaves_the_inbox_lists_under_snoozed_and_comes_back_unread() {
+        use nimbra_core::testing::Fake;
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "snooze@example.com");
+        fake.add(Fake::thread("s1", &["INBOX"], 5));
+        fake.add(Fake::thread("s2", &["INBOX"], 4));
+        engine.refresh_mailbox(id.clone(), Mailbox::Inbox).unwrap();
+        engine.snooze(id.clone(), "s1".into(), 1, false).unwrap();
+        engine
+            .snooze(id.clone(), "s2".into(), i64::MAX, true)
+            .unwrap();
+        assert!(!fake.labels_of("s1").contains(&"INBOX".to_string()));
+        let snoozed = engine
+            .refresh_mailbox(id.clone(), Mailbox::Snoozed)
+            .unwrap();
+        assert_eq!(
+            snoozed
+                .threads
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            ["s1"]
+        );
+        let reminders = engine
+            .refresh_mailbox(id.clone(), Mailbox::Reminders)
+            .unwrap();
+        assert_eq!(reminders.threads[0].id, "s2");
+        let back = engine.wake_due(id.clone()).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].thread_id, "s1");
+        let labels = fake.labels_of("s1");
+        assert!(labels.contains(&"INBOX".into()) && labels.contains(&"UNREAD".into()));
+        assert_eq!(engine.snoozed(id.clone()).unwrap().len(), 1);
+        engine.unsnooze(id.clone(), "s2".into()).unwrap();
+        assert!(engine.snoozed(id.clone()).unwrap().is_empty());
+        assert!(fake.labels_of("s2").contains(&"INBOX".to_string()));
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn a_message_waits_for_the_connection_and_a_change_made_offline_is_made_later() {
+        use nimbra_core::testing::Fake;
+        use std::sync::atomic::Ordering;
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "send@example.com");
+        fake.add(Fake::thread("t", &["INBOX"], 1));
+        let message = OutgoingMessage {
+            to: "ana@example.com".into(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Hello".into(),
+            body: "Hi Ana".into(),
+            html: None,
+            files: Vec::new(),
+            kept: Vec::new(),
+            reply: None,
+        };
+        // Undo before it leaves: nothing goes.
+        let undone = engine
+            .queue_send(id.clone(), message.clone(), None)
+            .unwrap();
+        assert!(undone.deliver_at_ms() >= now_ms());
+        assert!(undone.undo());
+        assert_eq!(undone.deliver(), SendOutcome::NotWaiting);
+        // Offline: it waits, and so does a Done.
+        fake.offline.store(true, Ordering::SeqCst);
+        let send = engine
+            .queue_send(id.clone(), message.clone(), None)
+            .unwrap();
+        assert_eq!(send.deliver(), SendOutcome::WaitingForConnection);
+        engine.wait_for_connection(send.clone());
+        let outcome = engine
+            .apply(id.clone(), "t".into(), ThreadAction::Done)
+            .unwrap();
+        assert_eq!(outcome, ActionOutcome::Queued);
+        let pending = engine.pending_work(id.clone()).unwrap();
+        assert_eq!((pending.queued_changes, pending.waiting_messages), (1, 1));
+        assert!(pending.next_deadline_ms.is_some());
+        assert!(matches!(
+            engine.catch_up(id.clone()),
+            Err(NimbraError::Offline)
+        ));
+        // Back online.
+        fake.offline.store(false, Ordering::SeqCst);
+        let done = engine.catch_up(id.clone()).unwrap();
+        assert_eq!((done.changes, done.sent), (1, 1));
+        assert!(done.done);
+        assert!(!fake.labels_of("t").contains(&"INBOX".to_string()));
+        assert_eq!(fake.sent.lock().unwrap().len(), 1, "sent once, not twice");
+        assert_eq!(
+            engine.pending_work(id.clone()).unwrap().next_deadline_ms,
+            None
+        );
+        // Send later, due at once.
+        let later = engine
+            .schedule_send(id.clone(), message.clone(), None, 1)
+            .unwrap();
+        assert_eq!(
+            engine.scheduled_sends(id.clone()).unwrap()[0].draft_id,
+            later.draft_id
+        );
+        assert_eq!(engine.send_due(id.clone()).unwrap(), [later.draft_id]);
+        assert_eq!(fake.sent.lock().unwrap().len(), 2);
+        // Nothing to send is refused before it is kept.
+        let empty = OutgoingMessage {
+            subject: String::new(),
+            body: String::new(),
+            ..message
+        };
+        assert!(matches!(
+            engine.queue_send(id.clone(), empty, None),
+            Err(NimbraError::Invalid { .. })
+        ));
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn a_reply_answers_the_latest_message_once_and_quotes_it() {
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "answer@example.com");
+        fake.add(nimbra_core::testing::Fake::thread("r", &["INBOX"], 5));
+        let start = engine
+            .start_answer(id.clone(), "r".into(), AnswerKind::ReplyAll, "Tue".into())
+            .unwrap();
+        assert_eq!(start.subject, "Re: Subject r");
+        assert_eq!(start.to, ["r@example.com"], "never to the account itself");
+        assert_eq!(
+            start.reply.as_ref().map(|r| r.thread_id.as_str()),
+            Some("r")
+        );
+        let forward = engine
+            .start_answer(id.clone(), "r".into(), AnswerKind::Forward, String::new())
+            .unwrap();
+        assert!(
+            forward
+                .quoted
+                .unwrap()
+                .starts_with("---------- Forwarded message")
+        );
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn labels_are_made_once_by_name_and_listed_as_they_change() {
+        let engine = engine();
+        let (id, _fake) = fake_account(&engine, "labels@example.com");
+        let made = engine.create_label(id.clone(), "Travel".into()).unwrap();
+        let again = engine.create_label(id.clone(), " travel ".into()).unwrap();
+        assert_eq!(made, again, "a label by that name is that label");
+        engine.create_label(id.clone(), "Bills".into()).unwrap();
+        let names = |engine: &Engine| -> Vec<String> {
+            engine
+                .mailboxes(id.clone())
+                .unwrap()
+                .into_iter()
+                .filter_map(|entry| entry.name)
+                .collect()
+        };
+        assert_eq!(names(&engine), ["Bills", "Travel"]);
+        engine
+            .rename_label(id.clone(), made.id.clone(), "Trips".into())
+            .unwrap();
+        engine.delete_label(id.clone(), made.id.clone()).unwrap();
+        assert_eq!(names(&engine), ["Bills"]);
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn a_watch_wakes_on_a_change_and_stops_when_cancelled() {
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "watch@example.com");
+        let watch = engine.watch(id.clone()).unwrap();
+        fake.changed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(watch.wait(5), WatchOutcome::Changed);
+        watch.cancel();
+        assert_eq!(watch.wait(60), WatchOutcome::Cancelled);
+        assert!((10..=3600).contains(&engine.check_interval_seconds()));
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn new_mail_from_a_blocked_sender_never_notifies_and_only_a_few_are_named() {
+        use nimbra_core::testing::Fake;
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "notify@example.com");
+        let first = engine.check_for_changes(id.clone(), None).unwrap();
+        engine
+            .block_sender(id.clone(), "n4@example.com".into(), None, Mailbox::Inbox)
+            .unwrap();
+        for i in 0..5 {
+            fake.add(Fake::thread(&format!("n{i}"), &["INBOX", "UNREAD"], i));
+        }
+        *fake.changes.lock().unwrap() = nimbra_core::mail::Changes {
+            latest: "9".into(),
+            threads: (0..5).map(|i| format!("n{i}")).collect(),
+            new_unread_inbox: (0..5).map(|i| format!("n{i}")).collect(),
+        };
+        let news = engine
+            .check_for_changes(id.clone(), Some(first.cursor))
+            .unwrap();
+        assert_eq!(news.new_unread_inbox.len(), 4);
+        assert_eq!((news.named.len(), news.more_new), (3, 1));
+        assert!(!news.new_unread_inbox.contains(&"n4".to_string()));
+        engine.refresh_mailbox(id.clone(), Mailbox::Inbox).unwrap();
+        assert!(engine.badge_count().unwrap() >= 4);
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn moves_and_blocks_follow_the_macs_rules() {
+        use nimbra_core::testing::Fake;
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "moves@example.com");
+        fake.add(Fake::thread("m1", &["INBOX", "STARRED"], 3));
+        fake.add(Fake::thread("m2", &["INBOX", "STARRED"], 2));
+        fake.add(Fake::thread("m3", &["TRASH"], 1));
+        fake.add(Fake::thread("m4", &["INBOX"], 4));
+        let label = engine.create_label(id.clone(), "Projects".into()).unwrap();
+        engine
+            .move_to_label(id.clone(), "m1".into(), label.id.clone(), Mailbox::Inbox)
+            .unwrap();
+        engine
+            .move_to_label(id.clone(), "m2".into(), label.id.clone(), Mailbox::Starred)
+            .unwrap();
+        assert!(
+            !fake.labels_of("m1").contains(&"INBOX".to_string()),
+            "a move from the inbox"
+        );
+        assert!(
+            fake.labels_of("m2").contains(&"INBOX".to_string()),
+            "from Starred it stays"
+        );
+        engine
+            .move_to_inbox(id.clone(), "m3".into(), Mailbox::Trash)
+            .unwrap();
+        assert!(!fake.labels_of("m3").contains(&"TRASH".to_string()));
+        engine
+            .block_sender(
+                id.clone(),
+                "m4@example.com".into(),
+                Some("m4".into()),
+                Mailbox::Inbox,
+            )
+            .unwrap();
+        assert!(!fake.labels_of("m4").contains(&"INBOX".to_string()));
+        assert_eq!(
+            engine.blocked_senders(id.clone()).unwrap(),
+            ["m4@example.com"]
+        );
+        engine
+            .unblock_sender(id.clone(), "m4@example.com".into(), Some("m4".into()))
+            .unwrap();
+        assert!(fake.labels_of("m4").contains(&"INBOX".to_string()));
+        assert!(engine.blocked_senders(id.clone()).unwrap().is_empty());
+        engine.remove_account(id).unwrap();
     }
 
     fn url_of(text: &str) -> url::Url {

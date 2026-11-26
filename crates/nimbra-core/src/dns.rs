@@ -14,6 +14,10 @@
 //! - Plain DNS is neither encrypted nor signed here, so an attacker on the network can
 //!   forge an answer. The answer only chooses which provider to suggest; the connection
 //!   that follows is still checked with TLS against the host name.
+//! - Where the app cannot read the system's resolvers (iOS has no `/etc/resolv.conf` in its
+//!   sandbox), it answers MX queries itself through the system (`set_resolver`): the same
+//!   question goes to the same resolvers, never to a third party. Its answers are checked
+//!   the same way (host names, at most a few, most preferred first).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -36,9 +40,46 @@ const TYPE_MX: u16 = 15;
 const CLASS_IN: u16 = 1;
 const RCODE_NXDOMAIN: u16 = 3;
 
+/// Answers MX queries for the engine through the system's own resolver (on iOS,
+/// `DNSServiceQueryRecord`): the hosts with their preference, or none when the domain has
+/// none. Blocking, for at most a few seconds.
+pub trait Resolver: Send + Sync {
+    fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>>;
+}
+
+static RESOLVER: std::sync::OnceLock<Box<dyn Resolver>> = std::sync::OnceLock::new();
+
+/// From now on, MX queries go to `resolver` instead of the resolvers in `/etc/resolv.conf`.
+/// Once per process; a second one is refused.
+pub fn set_resolver(resolver: Box<dyn Resolver>) -> Result<()> {
+    RESOLVER
+        .set(resolver)
+        .map_err(|_| anyhow!("a DNS resolver is already set"))
+}
+
+/// The most MX hosts taken from an app's answer.
+const MOST_HOSTS: usize = 16;
+
+/// An app resolver's answer as `mx` gives it: valid host names only, lowercase and
+/// without the root dot, most preferred first, each once.
+fn from_app(mut found: Vec<(u16, String)>) -> Vec<String> {
+    found.sort_by_key(|(preference, _)| *preference);
+    let mut hosts: Vec<String> = Vec::new();
+    for (_, host) in found {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if crate::servers::is_host(&host) && !hosts.contains(&host) && hosts.len() < MOST_HOSTS {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
 /// The mail servers of `domain`, lowercase, most preferred first. Empty when the domain
 /// has none. Blocks for up to six seconds.
 pub fn mx(domain: &str) -> Result<Vec<String>> {
+    if let Some(resolver) = RESOLVER.get() {
+        return Ok(from_app(resolver.mx(domain.trim_end_matches('.'))?));
+    }
     let conf = std::fs::read_to_string("/etc/resolv.conf").context("reading /etc/resolv.conf")?;
     let resolvers = resolvers(&conf);
     if resolvers.is_empty() {
@@ -298,6 +339,17 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_apps_answer_is_checked_and_ordered() {
+        let hosts = from_app(vec![
+            (20, "ALT1.aspmx.l.google.com.".into()),
+            (10, "aspmx.l.google.com".into()),
+            (30, "bad host!".into()),
+            (5, "aspmx.l.google.com".into()),
+        ]);
+        assert_eq!(hosts, ["aspmx.l.google.com", "alt1.aspmx.l.google.com"]);
+    }
 
     /// A reply to `query(0xbeef, "example.com")` with two MX records, the second listed
     /// first by preference, both using compression as real resolvers do.

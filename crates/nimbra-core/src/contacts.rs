@@ -218,6 +218,50 @@ pub fn automated(address: &str) -> bool {
 }
 
 /// Whether what is being typed (`token`, lowercase) starts the person's address, a word of
+/// The people whose name, address or domain starts with `token`, best first, across
+/// accounts: what each account's `Contacts` learnt (`books`, by account id; the account the
+/// message is written `from` counts double), and the people of the mail on screen (`seen`,
+/// a little). Never the user's own addresses (`mine`, lowercase), nor anyone already in
+/// the field (`present`, lowercase). At most `SHOWN`.
+pub fn rank<'a>(
+    token: &str,
+    from: &str,
+    books: impl IntoIterator<Item = (&'a str, &'a Contacts)>,
+    seen: impl IntoIterator<Item = &'a Person>,
+    mine: &[String],
+    present: &[String],
+) -> Vec<Person> {
+    let mut found: HashMap<String, (Person, f64)> = HashMap::new();
+    let mut add = |person: Person, score: f64| {
+        let key = person.address.to_lowercase();
+        if key.is_empty() || mine.contains(&key) || present.contains(&key) {
+            return;
+        }
+        let entry = found.entry(key).or_insert_with(|| (person.clone(), 0.0));
+        entry.1 += score;
+        if entry.0.name.is_empty() && !person.name.is_empty() {
+            entry.0.name = person.name;
+        }
+    };
+    for (account, book) in books {
+        let weight = if account == from { 2.0 } else { 1.0 };
+        for (person, score) in book.suggest(token) {
+            add(person, score * weight);
+        }
+    }
+    for person in seen {
+        if matches(person, token) && !automated(&person.address) {
+            add(person.clone(), 0.25);
+        }
+    }
+    let mut found: Vec<(Person, f64)> = found.into_values().collect();
+    found.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.0.address.cmp(&b.0.address))
+    });
+    found.into_iter().take(SHOWN).map(|(p, _)| p).collect()
+}
+
 /// their name, or the address's domain.
 pub fn matches(person: &Person, token: &str) -> bool {
     if token.is_empty() {
@@ -786,6 +830,53 @@ mod tests {
 
     fn me_person() -> Person {
         me()
+    }
+
+    #[test]
+    fn suggestions_across_accounts_favour_the_one_written_from_and_skip_mine_and_present() {
+        let now = now_ms();
+        let work = Contacts::new("me@example.com");
+        work.learn(&[met(
+            me(),
+            &[person("Sam Work", "sam@work.example")],
+            now,
+            true,
+        )]);
+        let home = Contacts::new("me@home.example");
+        home.learn(&[
+            met(
+                person("Me", "me@home.example"),
+                &[person("Sam Home", "sam@home.example")],
+                now,
+                true,
+            ),
+            met(
+                person("Me", "me@home.example"),
+                &[person("Sara", "sara@home.example")],
+                now,
+                true,
+            ),
+        ]);
+        let seen = [person("Sam Seen", "sam@seen.example"), me()];
+        let mine = ["me@example.com".to_string(), "me@home.example".to_string()];
+        let present = ["sara@home.example".to_string()];
+        let found = rank(
+            "sa",
+            "home",
+            [("work", &work), ("home", &home)],
+            seen.iter(),
+            &mine,
+            &present,
+        );
+        let addresses: Vec<&str> = found.iter().map(|p| p.address.as_str()).collect();
+        assert_eq!(
+            addresses[0], "sam@home.example",
+            "the account written from counts double"
+        );
+        assert!(addresses.contains(&"sam@work.example") && addresses.contains(&"sam@seen.example"));
+        assert!(
+            !addresses.contains(&"sara@home.example") && !addresses.contains(&"me@example.com")
+        );
     }
 
     #[test]
