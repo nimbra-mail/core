@@ -1,7 +1,10 @@
 //! Preferences, kept in a small JSON file next to the mail store (not in it: they are not
 //! mail, and they stay when you sign out).
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -168,28 +171,234 @@ pub fn load() -> Settings {
         .unwrap_or_default()
 }
 
+/// Saves the settings on a writer thread and returns at once. Changes that come faster than
+/// the disk are written as one, the newest; `flush` waits for it.
 pub fn save(settings: &Settings) -> Result<()> {
+    writer().put(settings.clone());
+    Ok(())
+}
+
+/// Waits until the last settings saved are on disk (quitting), for a few seconds at most.
+/// Whether they are.
+pub fn flush() -> bool {
+    writer().flush(Instant::now() + Duration::from_secs(3))
+}
+
+fn writer() -> &'static Arc<Latest<Settings>> {
+    static WRITER: OnceLock<Arc<Latest<Settings>>> = OnceLock::new();
+    WRITER.get_or_init(|| Latest::new(write))
+}
+
+fn write(settings: &Settings) -> Result<()> {
     let path = path().context("no home folder")?;
-    let dir = path.parent().context("no settings folder")?;
-    std::fs::create_dir_all(dir)?;
     let mut settings = settings.clone();
     settings.signature = settings.signature.chars().take(SIGNATURE_LIMIT).collect();
-    let json = serde_json::to_vec_pretty(&settings)?;
-    // Written next to the file and then moved over it, so a crash never leaves half a file.
+    write_atomically(&path, &serde_json::to_vec_pretty(&settings)?)
+}
+
+/// Written next to the file, flushed to the disk and then moved over it, so that neither a
+/// crash nor a power cut leaves half a file.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("no settings folder")?;
+    std::fs::create_dir_all(dir)?;
     let partial = path.with_extension("json.partial");
-    std::fs::write(&partial, json)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&partial)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&partial, &path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&partial, path)?;
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
     Ok(())
+}
+
+/// Writes the newest of what it is given on a thread of its own, one at a time.
+struct Latest<T> {
+    state: Mutex<Waiting<T>>,
+    changed: Condvar,
+    write: fn(&T) -> Result<()>,
+}
+
+struct Waiting<T> {
+    next: Option<T>,
+    /// How many were given, and how many of those are written (or replaced by a newer one
+    /// that is).
+    given: u64,
+    written: u64,
+    started: bool,
+}
+
+impl<T: Send + 'static> Latest<T> {
+    fn new(write: fn(&T) -> Result<()>) -> Arc<Self> {
+        Arc::new(Latest {
+            state: Mutex::new(Waiting {
+                next: None,
+                given: 0,
+                written: 0,
+                started: false,
+            }),
+            changed: Condvar::new(),
+            write,
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Waiting<T>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn put(self: &Arc<Self>, value: T) {
+        let mut state = self.lock();
+        state.next = Some(value);
+        state.given += 1;
+        if !state.started {
+            let latest = self.clone();
+            state.started = std::thread::Builder::new()
+                .name("nimbra-settings".into())
+                .spawn(move || latest.run())
+                .is_ok();
+            if !state.started {
+                // No thread to write on: written here rather than lost.
+                let value = state.next.take();
+                let given = state.given;
+                drop(state);
+                if let Some(value) = value {
+                    self.write_one(&value, given);
+                }
+                return;
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    fn run(&self) {
+        loop {
+            let (value, given) = {
+                let mut state = self.lock();
+                while state.next.is_none() {
+                    state = self
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                (state.next.take(), state.given)
+            };
+            if let Some(value) = value {
+                self.write_one(&value, given);
+            }
+        }
+    }
+
+    fn write_one(&self, value: &T, given: u64) {
+        if let Err(error) = (self.write)(value) {
+            eprintln!("nimbra: could not save settings: {error:#}");
+        }
+        let mut state = self.lock();
+        state.written = state.written.max(given);
+        self.changed.notify_all();
+    }
+
+    fn flush(&self, deadline: Instant) -> bool {
+        let state = self.lock();
+        let given = state.given;
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, left, |state| state.written < given)
+            .unwrap_or_else(PoisonError::into_inner);
+        state.written >= given
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    /// What a test writer saw, and a gate that holds up the first write.
+    struct Probe {
+        seen: Mutex<Vec<u32>>,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        gate: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    fn probe_write(value: &(u32, Arc<Probe>)) -> Result<()> {
+        if let Some(entered) = value.1.entered.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            let gate = value.1.gate.lock().unwrap().take().unwrap();
+            gate.recv().ok();
+        }
+        value.1.seen.lock().unwrap().push(value.0);
+        Ok(())
+    }
+
+    #[test]
+    fn changes_made_while_one_is_written_are_written_as_the_newest_only() {
+        let (entered, has_entered) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let probe = Arc::new(Probe {
+            seen: Mutex::new(Vec::new()),
+            entered: Mutex::new(Some(entered)),
+            gate: Mutex::new(Some(gate)),
+        });
+        let latest = Latest::new(probe_write);
+        latest.put((1, probe.clone()));
+        has_entered.recv().unwrap();
+        for n in 2..=4 {
+            latest.put((n, probe.clone()));
+        }
+        assert!(
+            !latest.flush(Instant::now()),
+            "the first is still being written"
+        );
+        release.send(()).unwrap();
+        assert!(latest.flush(Instant::now() + Duration::from_secs(30)));
+        assert_eq!(*probe.seen.lock().unwrap(), [1, 4]);
+    }
+
+    #[test]
+    fn flushing_waits_for_the_last_change() {
+        let probe = Arc::new(Probe {
+            seen: Mutex::new(Vec::new()),
+            entered: Mutex::new(None),
+            gate: Mutex::new(None),
+        });
+        let latest = Latest::new(probe_write);
+        for n in 1..=50 {
+            latest.put((n, probe.clone()));
+            if n % 10 == 0 {
+                assert!(latest.flush(Instant::now() + Duration::from_secs(30)));
+                assert_eq!(probe.seen.lock().unwrap().last(), Some(&n));
+            }
+        }
+    }
+
+    #[test]
+    fn settings_are_moved_into_place_whole_and_private() {
+        let dir = std::env::temp_dir().join(format!("nimbra-settings-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        write_atomically(&path, b"{\"signature\":\"one\"}").unwrap();
+        write_atomically(&path, b"{\"signature\":\"two\"}").unwrap();
+        let back: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back.signature, "two");
+        assert!(!path.with_extension("json.partial").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn missing_fields_take_their_defaults() {

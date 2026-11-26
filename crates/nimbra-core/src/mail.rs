@@ -234,7 +234,49 @@ pub struct Outgoing {
 pub struct OutgoingFile {
     pub name: String,
     pub mime: String,
+    #[serde(with = "file_bytes")]
     pub bytes: Vec<u8>,
+}
+
+/// A file's bytes as base64 text: as a list of numbers, the JSON a message being sent is
+/// kept as was 3.5 times their size. Reads that list too, from what was kept before.
+mod file_bytes {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct Bytes;
+        impl<'de> Visitor<'de> for Bytes {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("base64 text or a list of bytes")
+            }
+
+            fn visit_str<E: Error>(self, text: &str) -> Result<Vec<u8>, E> {
+                STANDARD.decode(text).map_err(E::custom)
+            }
+
+            fn visit_bytes<E: Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(bytes.to_vec())
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::with_capacity(list.size_hint().unwrap_or(0).min(1 << 20));
+                while let Some(byte) = list.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_any(Bytes)
+    }
 }
 
 /// Every address in a To, Cc or Bcc field, each validated.

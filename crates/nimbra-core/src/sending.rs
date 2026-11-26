@@ -4,7 +4,7 @@
 //! for Drafts only.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -46,12 +46,40 @@ struct Record {
     mail: QueuedMail,
 }
 
+/// A `Record` as it is written, from what a job holds.
+#[derive(Serialize)]
+struct Written<'a> {
+    stage: Stage,
+    mail: WrittenMail<'a>,
+}
+
+#[derive(Serialize)]
+struct WrittenMail<'a> {
+    draft_id: &'a Option<String>,
+    outgoing: &'a mail::Outgoing,
+}
+
 struct State {
-    record: Record,
+    stage: Stage,
+    draft_id: Option<String>,
+    /// Shared with a write under way, so that taking a copy to write is no work.
+    outgoing: Arc<mail::Outgoing>,
     store: Option<Arc<Store>>,
     /// Held for as long as this copy of Nimbra looks after the message, so that another
     /// does not send it as left behind. The system lets go of it however the app ends.
     claim: Option<std::fs::File>,
+}
+
+impl State {
+    fn new(stage: Stage, mail: QueuedMail, store: Option<Arc<Store>>) -> Self {
+        State {
+            stage,
+            draft_id: mail.draft_id,
+            outgoing: Arc::new(mail.outgoing),
+            store,
+            claim: None,
+        }
+    }
 }
 
 pub struct Job {
@@ -60,10 +88,14 @@ pub struct Job {
     pub composer: Option<u64>,
     client: Arc<mail::Client>,
     name: String,
-    /// It is on disk. Outside the lock, which a write holds while the keychain is asked.
+    /// It is on disk.
     kept: AtomicBool,
+    /// Held only for moments, never while writing or asking the keychain: the main thread
+    /// takes it (Undo, the subject for a notice).
     state: Mutex<State>,
     changed: Condvar,
+    /// One write at a time, in order, outside `state`.
+    writing: Mutex<()>,
 }
 
 impl Job {
@@ -81,15 +113,9 @@ impl Job {
             client,
             name: format!("{RECORD}{}", mail::random_hex(8)?),
             kept: AtomicBool::new(false),
-            state: Mutex::new(State {
-                record: Record {
-                    stage: Stage::Held,
-                    mail,
-                },
-                store,
-                claim: None,
-            }),
+            state: Mutex::new(State::new(Stage::Held, mail, store)),
             changed: Condvar::new(),
+            writing: Mutex::new(()),
         }))
     }
 
@@ -103,7 +129,7 @@ impl Job {
         stage: Stage,
     ) -> anyhow::Result<Arc<Self>> {
         let job = Job::new(account, composer, client, store, mail)?;
-        job.state.lock().unwrap().record.stage = stage;
+        job.state().stage = stage;
         Ok(job)
     }
 
@@ -138,45 +164,42 @@ impl Job {
             let Some(record) = store.load::<Record>(&name) else {
                 continue;
             };
+            let mut state = State::new(record.stage, record.mail, Some(store.clone()));
+            state.claim = Some(claim);
             found.push(Arc::new(Self {
                 account: account.to_string(),
                 composer: None,
                 client: client.clone(),
                 name,
                 kept: AtomicBool::new(true),
-                state: Mutex::new(State {
-                    record,
-                    store: Some(store.clone()),
-                    claim: Some(claim),
-                }),
+                state: Mutex::new(state),
                 changed: Condvar::new(),
+                writing: Mutex::new(()),
             }));
         }
         found
     }
 
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn stage(&self) -> Stage {
-        self.state.lock().unwrap().record.stage
+        self.state().stage
     }
 
     pub fn subject(&self) -> String {
-        self.state
-            .lock()
-            .unwrap()
-            .record
-            .mail
-            .outgoing
-            .subject
-            .clone()
+        self.state().outgoing.subject.clone()
     }
 
-    fn mail(&self) -> QueuedMail {
-        self.state.lock().unwrap().record.mail.clone()
+    fn mail(&self) -> (Option<String>, Arc<mail::Outgoing>) {
+        let state = self.state();
+        (state.draft_id.clone(), state.outgoing.clone())
     }
 
     /// Writes it down; whether that worked. Blocking.
     pub fn keep(&self) -> bool {
-        self.write(&mut self.state.lock().unwrap())
+        self.write()
     }
 
     /// The same on Send, which is worth asking the keychain again for. Blocking.
@@ -184,12 +207,7 @@ impl Job {
         if Store::unreadable(&self.account)
             && let Ok(store) = Store::open(&self.account)
         {
-            // Not under the lock while asking: the main thread takes that too.
-            self.state
-                .lock()
-                .unwrap()
-                .store
-                .get_or_insert(Arc::new(store));
+            self.state().store.get_or_insert(Arc::new(store));
         }
         self.keep()
     }
@@ -199,20 +217,41 @@ impl Job {
         self.kept.load(Ordering::Relaxed)
     }
 
-    fn write(&self, state: &mut State) -> bool {
-        if state.record.stage == Stage::Over {
-            return false;
-        }
-        if state.store.is_none() {
-            state.store = Store::open_quietly(&self.account).ok().map(Arc::new);
-        }
-        let Some(store) = state.store.clone() else {
-            return false;
+    fn write(&self) -> bool {
+        let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        let store = self.state().store.clone();
+        let store = match store {
+            Some(store) => store,
+            None => match Store::open_quietly(&self.account) {
+                Ok(store) => self.state().store.get_or_insert(Arc::new(store)).clone(),
+                Err(_) => return false,
+            },
         };
-        if state.claim.is_none() {
-            state.claim = store.claim(&self.name);
+        let (stage, draft_id, outgoing) = {
+            let mut state = self.state();
+            if state.stage == Stage::Over {
+                return false;
+            }
+            if state.claim.is_none() {
+                state.claim = store.claim(&self.name);
+            }
+            (state.stage, state.draft_id.clone(), state.outgoing.clone())
+        };
+        let written = Written {
+            stage,
+            mail: WrittenMail {
+                draft_id: &draft_id,
+                outgoing: &outgoing,
+            },
+        };
+        let saved = store.save(&self.name, &written).is_ok();
+        // Taken back while it was written: what was just written goes too. Here or in
+        // `forget`, whichever is last, as both look under the lock.
+        let state = self.state();
+        if state.stage == Stage::Over {
+            store.remove(&self.name);
+            return false;
         }
-        let saved = store.save(&self.name, &state.record).is_ok();
         self.kept.store(saved, Ordering::Relaxed);
         if !saved {
             eprintln!("nimbra: could not save the message being sent");
@@ -221,11 +260,15 @@ impl Job {
     }
 
     /// Taken back or handed on: nothing is left of it on disk. This does not wait for a
-    /// background thread, as quitting straight after Undo must not send it.
+    /// write under way (that removes what it wrote itself), nor for a background thread,
+    /// as quitting straight after Undo must not send it.
     pub fn forget(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.record.stage = Stage::Over;
-        if let Some(store) = &state.store {
+        let store = {
+            let mut state = self.state();
+            state.stage = Stage::Over;
+            state.store.clone()
+        };
+        if let Some(store) = store {
             store.remove(&self.name);
         }
         self.changed.notify_all();
@@ -234,41 +277,45 @@ impl Job {
     /// The draft saved since Send, which sending then uses up.
     pub fn set_draft(&self, draft_id: Option<String>) {
         if draft_id.is_some() {
-            self.state.lock().unwrap().record.mail.draft_id = draft_id;
+            self.state().draft_id = draft_id;
         }
     }
 
     /// Sends it, once however often it is called: `None` if it was not waiting. Blocking.
     pub fn send(&self) -> Option<anyhow::Result<()>> {
-        let mail = {
-            let mut state = self.state.lock().unwrap();
-            if state.record.stage != Stage::Held {
+        {
+            let mut state = self.state();
+            if state.stage != Stage::Held {
                 return None;
             }
-            state.record.stage = Stage::Out;
-            self.write(&mut state);
-            state.record.mail.clone()
+            state.stage = Stage::Out;
+        }
+        // On disk as possibly sent before the request leaves.
+        self.write();
+        let (draft_id, outgoing) = self.mail();
+        let result = match &draft_id {
+            Some(id) => self.client.send_draft(id, &outgoing),
+            None => self.client.send_message(&outgoing),
         };
-        let result = match &mail.draft_id {
-            Some(id) => self.client.send_draft(id, &mail.outgoing),
-            None => self.client.send_message(&mail.outgoing),
-        };
-        let mut state = self.state.lock().unwrap();
-        if state.record.stage == Stage::Out {
-            state.record.stage = match &result {
+        let mut state = self.state();
+        if state.stage == Stage::Out {
+            state.stage = match &result {
                 Ok(()) => Stage::Over,
                 Err(error) if error.is::<mail::MayHaveArrived>() => Stage::Unsure,
                 Err(error) if error.is::<mail::Offline>() => Stage::Held,
                 Err(_) => Stage::Refused,
             };
-            if state.record.stage == Stage::Over {
+            if state.stage == Stage::Over {
                 if let Some(store) = &state.store {
                     store.remove(&self.name);
                 }
             } else {
-                self.write(&mut state);
+                drop(state);
+                self.write();
+                state = self.state();
             }
         }
+        drop(state);
         self.changed.notify_all();
         Some(result)
     }
@@ -280,10 +327,10 @@ impl Job {
 
     /// The same, for who needs the draft's id.
     pub fn saved_as_draft(&self) -> Option<String> {
-        let mail = self.mail();
+        let (draft_id, outgoing) = self.mail();
         let id = self
             .client
-            .keep_as_draft(mail.draft_id.as_deref(), &mail.outgoing)
+            .keep_as_draft(draft_id.as_deref(), &outgoing)
             .ok()?;
         self.forget();
         Some(id)
@@ -292,7 +339,7 @@ impl Job {
     /// Deletes what was saved of a discarded message. Until that works it stays on disk.
     /// Blocking.
     pub fn discard(&self) -> bool {
-        let deleted = match self.mail().draft_id {
+        let deleted = match self.mail().0 {
             None => true,
             Some(id) => match self.client.delete_draft(&id) {
                 Ok(()) => true,
@@ -306,11 +353,11 @@ impl Job {
     }
 
     fn wait(&self) {
-        let state = self.state.lock().unwrap();
+        let state = self.state();
         drop(
             self.changed
-                .wait_while(state, |state| state.record.stage == Stage::Out)
-                .unwrap(),
+                .wait_while(state, |state| state.stage == Stage::Out)
+                .unwrap_or_else(PoisonError::into_inner),
         );
     }
 }
@@ -334,5 +381,118 @@ pub fn finish(jobs: &[Arc<Job>], deadline: Instant) {
         if finished.recv_timeout(left).is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client() -> Arc<mail::Client> {
+        let server =
+            |port| crate::servers::Server::new("localhost", port, crate::servers::Security::Tls);
+        Arc::new(crate::imap_mail::Client::new(
+            String::new(),
+            String::new(),
+            crate::servers::Servers {
+                username: "me".into(),
+                imap: server(1),
+                smtp: server(1),
+            },
+            crate::imap_mail::Credential::Password(String::new()),
+        ))
+    }
+
+    fn with_file(bytes: Vec<u8>) -> QueuedMail {
+        QueuedMail {
+            draft_id: None,
+            outgoing: mail::Outgoing {
+                subject: "Report".into(),
+                files: vec![mail::OutgoingFile {
+                    name: "a.bin".into(),
+                    mime: "application/octet-stream".into(),
+                    bytes,
+                }],
+                ..mail::Outgoing::default()
+            },
+        }
+    }
+
+    #[test]
+    fn taking_back_does_not_wait_for_a_write_and_leaves_nothing_on_disk() {
+        let (store, release) = Store::temp_held();
+        let job = Job::new(
+            String::new(),
+            1,
+            client(),
+            Some(store.clone()),
+            with_file(vec![1; 64]),
+        )
+        .unwrap();
+        // Its record is busy on the writer, so a write of it waits.
+        drop(store.read_soon::<u32>(&job.name));
+        let writing = std::thread::spawn({
+            let job = job.clone();
+            move || job.keep()
+        });
+        while job.writing.try_lock().is_ok() {
+            std::thread::yield_now();
+        }
+        job.forget();
+        assert_eq!(job.stage(), Stage::Over);
+        release.send(()).unwrap();
+        assert!(!writing.join().unwrap());
+        assert!(store.load::<serde_json::Value>(&job.name).is_none());
+        assert!(job.send().is_none(), "taken back: never sent");
+    }
+
+    #[test]
+    fn a_kept_message_is_written_compactly_and_reads_back() {
+        let store = Arc::new(Store::temp());
+        let bytes: Vec<u8> = (0..=255).cycle().take(30_000).collect();
+        let job = Job::new(
+            String::new(),
+            1,
+            client(),
+            Some(store.clone()),
+            with_file(bytes.clone()),
+        )
+        .unwrap();
+        assert!(job.keep() && job.kept());
+        let raw: serde_json::Value = store.load(&job.name).unwrap();
+        let written = raw["mail"]["outgoing"]["files"][0]["bytes"]
+            .as_str()
+            .unwrap();
+        assert!(
+            written.len() < bytes.len() * 3 / 2,
+            "base64, not a list of numbers"
+        );
+        drop(job.state().claim.take());
+        let found = Job::left_behind("", &client(), &store);
+        assert_eq!(found[0].mail().1.files[0].bytes, bytes);
+        assert_eq!(found[0].stage(), Stage::Held);
+    }
+
+    #[test]
+    fn a_message_kept_by_an_earlier_version_still_reads_back() {
+        let store = Arc::new(Store::temp());
+        // As written before files were base64: each byte a number.
+        let old = serde_json::json!({
+            "stage": "Held",
+            "mail": {
+                "draft_id": "r123",
+                "outgoing": {
+                    "to": "ana@example.com", "cc": "", "bcc": "", "subject": "Old",
+                    "body": "Hi", "html": null, "kept": [], "reply": null,
+                    "files": [{"name": "a.txt", "mime": "text/plain", "bytes": [104, 105, 0, 255]}]
+                }
+            }
+        });
+        store.save("sending-0123456789abcdef", &old).unwrap();
+        let found = Job::left_behind("", &client(), &store);
+        let (draft, outgoing) = found[0].mail();
+        assert_eq!(draft.as_deref(), Some("r123"));
+        assert_eq!(outgoing.files[0].bytes, [104, 105, 0, 255]);
+        assert_eq!(found[0].subject(), "Old");
     }
 }
