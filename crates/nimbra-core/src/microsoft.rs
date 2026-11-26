@@ -63,13 +63,20 @@ pub struct Config {
 }
 
 impl Config {
+    /// The stand-in that sample copies use to show the Microsoft button: it never signs in.
+    pub const PLACEHOLDER: &str = "00000000-0000-0000-0000-000000000000";
+
+    pub fn is_placeholder(&self) -> bool {
+        self.client_id == Self::PLACEHOLDER
+    }
+
     /// Reads the app's client id from `NIMBRA_MICROSOFT_CLIENT_ID` (the environment, then
     /// `~/.config/nimbra/oauth.env`). `None` when it is not there or not a GUID.
     pub fn load() -> Option<Self> {
         Self::new(&oauth_setting("NIMBRA_MICROSOFT_CLIENT_ID")?)
     }
 
-    fn new(client_id: &str) -> Option<Self> {
+    pub fn new(client_id: &str) -> Option<Self> {
         let client_id = client_id.trim();
         if !is_guid(client_id) {
             eprintln!("nimbra: NIMBRA_MICROSOFT_CLIENT_ID is not a GUID, so it is not used");

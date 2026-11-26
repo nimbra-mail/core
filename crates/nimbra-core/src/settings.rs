@@ -12,8 +12,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Added under new messages, replies and forwards. Plain text, one line per line.
+    /// The one plain-text signature of earlier versions, one line per line. Read only to
+    /// make it each account's first signature (`migrate`), then emptied.
     pub signature: String,
+    /// Every account's signatures, in the order they were made. Their HTML is always
+    /// `signature::clean`ed before it is kept here.
+    pub signatures: Vec<Signature>,
+    /// Each account's default signature, by account id: a signature's id, or "" for none.
+    /// An account not in here (or whose default was deleted) starts with its first one.
+    pub default_signature: std::collections::HashMap<String, String>,
     /// Notify about new mail in the inbox.
     pub notifications: bool,
     /// Open mail in its original formatting (the web view) rather than the reader.
@@ -63,6 +70,17 @@ pub struct Settings {
     pub usage_counts: bool,
     /// Look for new versions of Nimbra and get them ready (`update.rs`).
     pub auto_update: bool,
+}
+
+/// One of an account's signatures.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Signature {
+    /// Random, and never reused.
+    pub id: String,
+    /// The account it belongs to (its id; the first account's is "").
+    pub account: String,
+    pub name: String,
+    pub html: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -121,6 +139,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             signature: String::new(),
+            signatures: Vec::new(),
+            default_signature: Default::default(),
             notifications: true,
             original_view: true,
             load_images: true,
@@ -187,8 +207,113 @@ impl Settings {
     }
 }
 
-/// The signature can be a few lines; anything longer is cut.
+/// The old signature could be a few lines; anything longer is cut.
 pub const SIGNATURE_LIMIT: usize = 2000;
+/// An account can have this many signatures.
+pub const SIGNATURES_PER_ACCOUNT: usize = 20;
+
+impl Settings {
+    /// An account's signatures, in order.
+    pub fn signatures_of<'a>(&'a self, account: &'a str) -> impl Iterator<Item = &'a Signature> {
+        self.signatures.iter().filter(move |s| s.account == account)
+    }
+
+    pub fn signature(&self, id: &str) -> Option<&Signature> {
+        self.signatures.iter().find(|s| s.id == id)
+    }
+
+    /// The signature new messages from `account` start with: the one chosen, or with
+    /// none chosen (or the chosen one deleted) its first. `None`: no signature.
+    pub fn default_signature<'a>(&'a self, account: &'a str) -> Option<&'a Signature> {
+        match self.default_signature.get(account).map(String::as_str) {
+            Some("") => None,
+            Some(id) => self
+                .signature(id)
+                .filter(|s| s.account == account)
+                .or_else(|| self.signatures_of(account).next()),
+            None => self.signatures_of(account).next(),
+        }
+    }
+
+    /// Makes `id` (or, with `None`, no signature) the account's default.
+    pub fn set_default_signature(&mut self, account: &str, id: Option<&str>) {
+        self.default_signature
+            .insert(account.to_string(), id.unwrap_or("").to_string());
+    }
+
+    /// Adds an empty signature to the account and returns its id (`None` once the account
+    /// has as many as it may). Its name is "Signature", numbered when that is taken.
+    pub fn add_signature(&mut self, account: &str) -> Option<String> {
+        if self.signatures_of(account).count() >= SIGNATURES_PER_ACCOUNT {
+            return None;
+        }
+        let taken: Vec<&str> = self
+            .signatures_of(account)
+            .map(|s| s.name.as_str())
+            .collect();
+        let name = std::iter::once("Signature".to_string())
+            .chain((2..).map(|n| format!("Signature {n}")))
+            .find(|name| !taken.contains(&name.as_str()))?;
+        let id = self.new_signature_id();
+        self.signatures.push(Signature {
+            id: id.clone(),
+            account: account.to_string(),
+            name,
+            html: String::new(),
+        });
+        Some(id)
+    }
+
+    /// Deletes a signature. When it was its account's default, the account falls back to
+    /// its first one (or none, with none left).
+    pub fn delete_signature(&mut self, id: &str) {
+        self.signatures.retain(|s| s.id != id);
+        self.default_signature.retain(|_, chosen| chosen != id);
+    }
+
+    /// Forgets the signatures of an account that was removed.
+    pub fn forget_signatures(&mut self, account: &str) {
+        self.signatures.retain(|s| s.account != account);
+        self.default_signature.remove(account);
+    }
+
+    fn new_signature_id(&self) -> String {
+        let mut n = self.signatures.len();
+        loop {
+            let id = crate::mail::random_hex(6).unwrap_or_else(|_| {
+                n += 1;
+                format!("s{n}")
+            });
+            if self.signature(&id).is_none() {
+                return id;
+            }
+        }
+    }
+
+    /// Settings from before signatures belonged to accounts: the one plain-text signature
+    /// becomes each account's first (and default) signature. Done once, when there are
+    /// accounts to give it to; the old text is emptied so a signature deleted later stays
+    /// deleted.
+    pub fn migrate(&mut self) {
+        let old = self.signature.trim_end();
+        if old.trim().is_empty() || !self.signatures.is_empty() || self.accounts.is_empty() {
+            return;
+        }
+        let html = crate::signature::clean(&crate::editor::text_to_html(old));
+        let accounts: Vec<String> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        for account in accounts {
+            let id = self.new_signature_id();
+            self.signatures.push(Signature {
+                id: id.clone(),
+                account: account.clone(),
+                name: "Signature".into(),
+                html: html.clone(),
+            });
+            self.set_default_signature(&account, Some(&id));
+        }
+        self.signature.clear();
+    }
+}
 
 fn path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -197,10 +322,12 @@ fn path() -> Option<PathBuf> {
 
 /// The saved settings, or the defaults.
 pub fn load() -> Settings {
-    path()
+    let mut settings: Settings = path()
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    settings.migrate();
+    settings
 }
 
 /// Saves the settings on a writer thread and returns at once. Changes that come faster than
@@ -225,6 +352,13 @@ fn write(settings: &Settings) -> Result<()> {
     let path = path().context("no home folder")?;
     let mut settings = settings.clone();
     settings.signature = settings.signature.chars().take(SIGNATURE_LIMIT).collect();
+    // Cleaned and cut as they were made; a file edited by hand is held to the same.
+    for signature in &mut settings.signatures {
+        signature.name = crate::signature::clean_name(&signature.name);
+        if signature.html.len() > crate::signature::HTML_LIMIT {
+            signature.html = crate::signature::clean(&signature.html);
+        }
+    }
     write_atomically(&path, &serde_json::to_vec_pretty(&settings)?)
 }
 
@@ -539,6 +673,75 @@ mod tests {
         chosen.default_account = Some("bbbbbbbbbbbb".into());
         let back: Settings = serde_json::from_slice(&serde_json::to_vec(&chosen).unwrap()).unwrap();
         assert_eq!(back.default_account(), Some("bbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn the_old_signature_becomes_each_accounts_first() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"signature":"Luan <UX>\n\nNimbra"}"#).unwrap();
+        // Nothing to give it to yet: kept for later.
+        settings.migrate();
+        assert!(settings.signatures.is_empty());
+        assert_eq!(settings.signature, "Luan <UX>\n\nNimbra");
+        settings.accounts = two().accounts;
+        settings.migrate();
+        assert_eq!(settings.signatures.len(), 2);
+        assert!(settings.signature.is_empty());
+        for (signature, account) in settings.signatures.iter().zip(["", "bbbbbbbbbbbb"]) {
+            assert_eq!(signature.account, account);
+            assert_eq!(signature.name, "Signature");
+            assert_eq!(
+                signature.html,
+                "<div>Luan &lt;UX&gt;</div><div><br></div><div>Nimbra</div>"
+            );
+            assert_eq!(
+                settings.default_signature(account).map(|s| &s.id),
+                Some(&signature.id)
+            );
+        }
+        assert_ne!(settings.signatures[0].id, settings.signatures[1].id);
+        // Once only: deleting them all does not bring it back.
+        let before = settings.clone();
+        settings.migrate();
+        assert_eq!(settings, before);
+        for id in before.signatures.iter().map(|s| s.id.clone()) {
+            settings.delete_signature(&id);
+        }
+        settings.migrate();
+        assert!(settings.signatures.is_empty());
+        // Saved and read back.
+        let back: Settings = serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
+        assert_eq!(back, before);
+    }
+
+    #[test]
+    fn a_default_signature_is_the_chosen_one_the_first_or_none() {
+        let mut settings = two();
+        assert!(settings.default_signature("").is_none());
+        let first = settings.add_signature("").unwrap();
+        let second = settings.add_signature("").unwrap();
+        let other = settings.add_signature("bbbbbbbbbbbb").unwrap();
+        assert_eq!(settings.signature(&second).unwrap().name, "Signature 2");
+        assert_eq!(settings.signature(&other).unwrap().name, "Signature");
+        // None chosen: the first.
+        assert_eq!(settings.default_signature("").unwrap().id, first);
+        settings.set_default_signature("", Some(&second));
+        assert_eq!(settings.default_signature("").unwrap().id, second);
+        // Another account's signature is never this one's default.
+        settings.set_default_signature("", Some(&other));
+        assert_eq!(settings.default_signature("").unwrap().id, first);
+        // None, on purpose.
+        settings.set_default_signature("", None);
+        assert!(settings.default_signature("").is_none());
+        // The default deleted: the first again.
+        settings.set_default_signature("", Some(&second));
+        settings.delete_signature(&second);
+        assert_eq!(settings.default_signature("").unwrap().id, first);
+        assert_eq!(settings.signatures_of("").count(), 1);
+        settings.forget_signatures("bbbbbbbbbbbb");
+        assert!(settings.default_signature("bbbbbbbbbbbb").is_none());
+        while settings.add_signature("").is_some() {}
+        assert_eq!(settings.signatures_of("").count(), SIGNATURES_PER_ACCOUNT);
     }
 
     #[test]
