@@ -56,6 +56,8 @@ pub struct Settings {
     pub reader_text: TextSize,
     /// Count launches anonymously (`usage.rs`).
     pub usage_counts: bool,
+    /// Look for new versions of Nimbra and get them ready (`update.rs`).
+    pub auto_update: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -134,6 +136,7 @@ impl Default for Settings {
             dock_badge: true,
             reader_text: TextSize::Default,
             usage_counts: true,
+            auto_update: true,
         }
     }
 }
