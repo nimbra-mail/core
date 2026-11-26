@@ -73,6 +73,10 @@ pub struct Settings {
     pub usage_counts: bool,
     /// Look for new versions of Nimbra and get them ready (`update.rs`).
     pub auto_update: bool,
+    /// The version of Nimbra that ran last, so the first run of a new one can open its
+    /// release notes. Empty until a version that keeps it has run.
+    #[serde(default)]
+    pub last_version: String,
 }
 
 /// One of an account's signatures.
@@ -168,6 +172,7 @@ impl Default for Settings {
             reader_text: TextSize::Default,
             usage_counts: true,
             auto_update: true,
+            last_version: String::new(),
         }
     }
 }
