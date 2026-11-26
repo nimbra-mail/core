@@ -10,8 +10,8 @@ import Foundation
 import PackageDescription
 
 /// The release the package points at when there is no local build.
-let releaseURL = ""
-let releaseChecksum = ""
+let releaseURL = "https://github.com/nimbra-mail/core/releases/download/v0.1.0/NimbraFFI.xcframework.zip"
+let releaseChecksum = "aee4c46ef935bb9cb6033b1cdeec8db53a3f7604d9e610df4872fb6addf56b74"
 
 let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let localBuild = FileManager.default.fileExists(atPath: "\(packageDir)/NimbraFFI.xcframework")
