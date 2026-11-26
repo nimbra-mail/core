@@ -29,6 +29,9 @@ To see a change in an app, check out [desktop](https://github.com/nimbra-mail/de
   `Sources/NimbraCore/NimbraCore.swift` (CI checks it is current).
 - **Security first.** Secrets never in code, logs, errors or the repo. Untrusted mail is parsed with limits. TLS
   certificates are always checked.
+- **A line in the changelog.** Add one under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) with each change
+  to the engine or the Swift API, and mark anything that breaks either **Breaking**
+  ([docs/releasing.md](docs/releasing.md)).
 - **No em dashes** in comments, docs or messages.
 
 ## Commits and pull requests

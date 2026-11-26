@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# Releases nimbra-core: ./scripts/release <version> [--dry-run]
+#
+# In order, stopping at the first problem:
+#   1. checks: on main, in sync with origin, clean (only CHANGELOG.md may differ), the
+#      version semver and newer than the last tag, the tag free, gh signed in, the iOS
+#      Rust targets installed
+#   2. CHANGELOG.md: uses its section for <version>, or turns Unreleased into it (with a
+#      fresh empty Unreleased above), or drafts it from the commits since the last tag
+#      (feat: Added, fix/perf: Fixed, a ! or BREAKING CHANGE: Breaking) for you to review;
+#      refuses a release without notes
+#   3. sets the version of both crates (and Cargo.lock), so core_version() matches the tag
+#   4. cargo fmt --check, clippy -D warnings, cargo test
+#   5. builds the XCFramework zip (scripts/build-ios-core.sh --release-zip) and stops if
+#      the regenerated Swift bindings differ from the committed ones
+#   6. points Package.swift's releaseURL and releaseChecksum at this release
+#   7. commits "chore(release): v<version>" (CHANGELOG.md, Package.swift, the crates'
+#      Cargo.toml and Cargo.lock), tags v<version>, pushes both
+#   8. publishes the GitHub Release with the zip and the changelog section as its notes,
+#      then downloads the zip back and checks its checksum against Package.swift
+# --dry-run does steps 1 to 6 and puts the versions and Package.swift back: nothing is
+# committed, tagged, pushed or published. docs/releasing.md has the details.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+fail() { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+
+REPO=nimbra-mail/core
+ASSET=NimbraFFI.xcframework.zip
+SWIFT_API=Sources/NimbraCore/NimbraCore.swift
+
+VERSION=""
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) fail "Unknown option: $arg" ;;
+    *) [ -z "$VERSION" ] || fail "One version only."; VERSION="$arg" ;;
+  esac
+done
+[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+  || fail "Usage: ./scripts/release <version like 0.2.0> [--dry-run]"
+TAG="v$VERSION"
+RELEASE_URL="https://github.com/$REPO/releases/download/$TAG/$ASSET"
+
+# What the release commit carries besides CHANGELOG.md. From the version step until that
+# commit, any stop (and every dry run) puts these back as they were.
+RELEASE_FILES=(Package.swift crates/nimbra-core/Cargo.toml crates/nimbra-ffi/Cargo.toml Cargo.lock)
+# The release notes and the downloaded zip live here.
+WORK="$(mktemp -d)"
+RESTORE=0
+cleanup() {
+  if [ "$RESTORE" = 1 ]; then
+    git checkout --quiet -- "${RELEASE_FILES[@]}"
+    echo "Package.swift, the crates' versions and Cargo.lock are back as they were." >&2
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# rustup's own cargo, as scripts/build-ios-core.sh uses: Homebrew's Rust may come first on
+# PATH and has no iOS targets.
+command -v rustup >/dev/null || fail "rustup is needed (https://rustup.rs)."
+CARGO_BIN="$(rustup which --toolchain stable cargo)" || fail "rustup has no stable toolchain: rustup toolchain install stable"
+RUSTC="$(rustup which --toolchain stable rustc)"
+export RUSTC
+# Its cargo-fmt, cargo-clippy and clippy-driver too, so that no other Rust's mix in.
+PATH="$(dirname "$CARGO_BIN"):$PATH"
+cargo() { "$CARGO_BIN" "$@"; }
+
+# 1. Checks.
+say "Checking"
+[ "$(git rev-parse --abbrev-ref HEAD)" = main ] || fail "Release from main."
+DIRTY="$(git status --porcelain | { grep -v ' CHANGELOG.md$' || true; })"
+[ -z "$DIRTY" ] || fail "Commit or stash your changes first (only CHANGELOG.md may differ):
+$DIRTY"
+git fetch --quiet origin main --tags
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || fail "main differs from origin/main: pull or push first."
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then fail "$TAG already exists."; fi
+
+LAST_TAG="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)"
+python3 - "$VERSION" "${LAST_TAG#v}" <<'PY' || fail "$VERSION is not newer than the last release (${LAST_TAG:-none})."
+import sys
+new = tuple(int(x) for x in sys.argv[1].split("."))
+last = tuple(int(x) for x in sys.argv[2].split(".")) if sys.argv[2] else None
+sys.exit(0 if last is None or new > last else 1)
+PY
+
+gh auth status >/dev/null 2>&1 || fail "Sign in to GitHub first: gh auth login"
+installed=$'\n'"$(rustup target list --toolchain stable --installed)"$'\n'
+for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+  [[ "$installed" == *$'\n'"$target"$'\n'* ]] \
+    || fail "Missing Rust target $target: rustup target add aarch64-apple-ios aarch64-apple-ios-sim"
+done
+components=$'\n'"$(rustup component list --toolchain stable --installed | sed 's/-[a-z0-9_]*-apple-darwin$//')"$'\n'
+for component in rustfmt clippy; do
+  [[ "$components" == *$'\n'"$component"$'\n'* ]] \
+    || fail "Missing Rust component $component: rustup component add rustfmt clippy --toolchain stable"
+done
+echo "Releasing $TAG (last release: ${LAST_TAG:-none})"
+[ "$DRY_RUN" = 0 ] || echo "Dry run: nothing will be committed, tagged, pushed or published."
+
+# 2. The changelog.
+say "Changelog"
+# Prints what happened: "kept" (a section for the version is there), "moved" (Unreleased
+# became it), "drafted" (from the commits), or "empty" (nothing to draft).
+CHANGELOG_STEP="$(python3 - "$VERSION" "$LAST_TAG" <<'PY'
+import datetime, re, subprocess, sys
+
+version, last = sys.argv[1], sys.argv[2]
+path = "CHANGELOG.md"
+text = open(path).read()
+today = datetime.date.today().isoformat()
+heading = f"## [{version}] - {today}"
+
+if re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
+    print("kept")
+    sys.exit()
+
+m = re.search(r"^## \[Unreleased\][^\n]*\n(.*?)(?=^## \[|\Z)", text, re.S | re.M)
+if not m:
+    sys.exit("CHANGELOG.md has no ## [Unreleased] section.")
+body = m.group(1).strip()
+step = "moved"
+
+if not body:
+    span = f"{last}..HEAD" if last else "HEAD"
+    log = subprocess.run(
+        ["git", "log", "--format=%s%x1f%b%x1e", span],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    breaking, added, fixed = [], [], []
+    for entry in log.split("\x1e"):
+        if not entry.strip():
+            continue
+        subject, _, message = entry.strip().partition("\x1f")
+        c = re.match(r"^(\w+)(\([^)]*\))?(!)?: (.+)$", subject)
+        if not c:
+            continue
+        line = c.group(4).strip().rstrip(".")
+        line = "- " + line[:1].upper() + line[1:]
+        if c.group(3) or re.search(r"^BREAKING[ -]CHANGE:", message, re.M):
+            breaking.append(line)
+        elif c.group(1) == "feat":
+            added.append(line)
+        elif c.group(1) in ("fix", "perf"):
+            fixed.append(line)
+    parts = []
+    for title, lines in (("Breaking", breaking), ("Added", added), ("Fixed", fixed)):
+        if lines:
+            parts.append(f"### {title}\n" + "\n".join(lines))
+    body = "\n\n".join(parts)
+    step = "drafted" if body else "empty"
+
+if body:
+    section = f"## [Unreleased]\n\n{heading}\n\n{body}\n\n"
+    text = text[: m.start()] + section + text[m.end():]
+    open(path, "w").write(text)
+print(step)
+PY
+)" || fail "Couldn't update CHANGELOG.md."
+
+case "$CHANGELOG_STEP" in
+  kept) echo "Using the $VERSION section already in CHANGELOG.md." ;;
+  moved) echo "Turned Unreleased into the $VERSION section of CHANGELOG.md." ;;
+  drafted)
+    echo "Drafted the $VERSION section of CHANGELOG.md from the commits since ${LAST_TAG:-the start}."
+    if [ -t 0 ]; then
+      if [ -n "${EDITOR:-}" ]; then
+        "$EDITOR" CHANGELOG.md
+      else
+        read -r -p "Review it in CHANGELOG.md (what changed in the engine and the Swift API, Breaking first), then press Return… "
+      fi
+    elif [ "$DRY_RUN" = 0 ]; then
+      fail "Review the drafted $VERSION section in CHANGELOG.md, then run this again."
+    fi
+    ;;
+  empty) fail "CHANGELOG.md has nothing under Unreleased, and no feat, fix or perf commits since ${LAST_TAG:-the start} to draft from. Write the notes under ## [Unreleased] first." ;;
+  *) fail "Couldn't update CHANGELOG.md: $CHANGELOG_STEP" ;;
+esac
+
+NOTES="$WORK/notes.md"
+python3 - "$VERSION" > "$NOTES" <<'PY'
+import re, sys
+text = open("CHANGELOG.md").read()
+m = re.search(rf"^## \[{re.escape(sys.argv[1])}\][^\n]*\n(.*?)(?=^## \[|^\[[^\]]+\]: |\Z)", text, re.S | re.M)
+print((m.group(1) if m else "").strip())
+PY
+grep -q '[^[:space:]]' "$NOTES" || fail "CHANGELOG.md has no notes for $VERSION."
+sed 's/^/  /' "$NOTES"
+
+# 3. The version, before anything is built, so the engine and its zip report it.
+say "Version $VERSION"
+RESTORE=1
+python3 - "$VERSION" crates/nimbra-core/Cargo.toml crates/nimbra-ffi/Cargo.toml <<'PY' || fail "Couldn't set the crates' version."
+import re, sys
+version, *paths = sys.argv[1:]
+for path in paths:
+    text = open(path).read()
+    # The [package] table's own version line, before any other table starts.
+    head, sep, rest = text.partition("\n[")
+    head, count = re.subn(r'(?m)^version = "[^"\n]*"$', f'version = "{version}"', head, count=1)
+    if count != 1 or not text.startswith("[package]"):
+        sys.exit(f"{path} has no [package] version line.")
+    open(path, "w").write(head + sep + rest)
+PY
+cargo metadata --offline --format-version 1 >/dev/null || fail "Couldn't refresh Cargo.lock."
+python3 - "$VERSION" <<'PY' || fail "The crates or Cargo.lock aren't at $VERSION."
+import re, sys
+version = sys.argv[1]
+lock = open("Cargo.lock").read()
+for path, crate in (("crates/nimbra-core/Cargo.toml", "nimbra-core"), ("crates/nimbra-ffi/Cargo.toml", "nimbra-ffi")):
+    if not re.search(rf'^version = "{re.escape(version)}"$', open(path).read(), re.M):
+        sys.exit(f"{path} isn't at {version}.")
+    if not re.search(rf'^name = "{crate}"\nversion = "{re.escape(version)}"$', lock, re.M):
+        sys.exit(f"Cargo.lock doesn't have {crate} at {version}.")
+PY
+echo "nimbra-core and nimbra-ffi are at $VERSION (Cargo.toml and Cargo.lock)."
+
+# 4. Format, lint, test (what CI runs).
+say "Format, lint and test"
+cargo fmt --all --check || fail "Run cargo fmt --all and commit the result."
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+
+# 5. The XCFramework.
+say "Building $ASSET"
+BUILD_LOG="$WORK/build.log"
+./scripts/build-ios-core.sh --release-zip | tee "$BUILD_LOG"
+CHECKSUM="$(sed -n 's/^Checksum: \([0-9a-f]\{64\}\)$/\1/p' "$BUILD_LOG" | tail -1)"
+[ -n "$CHECKSUM" ] || fail "scripts/build-ios-core.sh printed no checksum."
+[ "$(shasum -a 256 "$ASSET" | cut -d' ' -f1)" = "$CHECKSUM" ] || fail "$ASSET doesn't match the checksum printed for it."
+git diff --quiet HEAD -- "$SWIFT_API" || fail "The regenerated $SWIFT_API differs from the committed one.
+Commit it with the change that needed it, then release again."
+
+# 6. Package.swift.
+say "Package.swift"
+python3 - "$RELEASE_URL" "$CHECKSUM" <<'PY' || fail "Couldn't set releaseURL and releaseChecksum in Package.swift."
+import re, sys
+url, checksum = sys.argv[1:3]
+text = open("Package.swift").read()
+for name, value in (("releaseURL", url), ("releaseChecksum", checksum)):
+    text, count = re.subn(rf'(?m)^let {name} = "[^"\n]*"$', f'let {name} = "{value}"', text)
+    if count != 1:
+        sys.exit(f"Package.swift has {count} lines like `let {name} = \"…\"`, not one.")
+open("Package.swift", "w").write(text)
+PY
+grep -qxF "let releaseURL = \"$RELEASE_URL\"" Package.swift || fail "Package.swift's releaseURL isn't $RELEASE_URL."
+grep -qxF "let releaseChecksum = \"$CHECKSUM\"" Package.swift || fail "Package.swift's releaseChecksum isn't $CHECKSUM."
+echo "releaseURL      $RELEASE_URL"
+echo "releaseChecksum $CHECKSUM"
+
+if [ "$DRY_RUN" = 1 ]; then
+  say "Dry run: nothing committed, tagged, pushed or published."
+  echo "$ASSET is ready (checksum $CHECKSUM). CHANGELOG.md keeps its $VERSION section; the versions and Package.swift are put back."
+  exit 0
+fi
+
+# 7. Commit, tag, push.
+say "Committing and tagging $TAG"
+git add CHANGELOG.md "${RELEASE_FILES[@]}"
+git commit --quiet -m "chore(release): $TAG"
+RESTORE=0
+git tag -a "$TAG" -m "nimbra-core $VERSION"
+git push --quiet origin main
+git push --quiet origin "$TAG"
+
+# 8. Publish, then check what GitHub serves.
+say "Publishing the GitHub Release"
+gh release create "$TAG" "$ASSET" --repo "$REPO" --title "$TAG" --notes-file "$NOTES" --verify-tag \
+  || fail "The release failed after $TAG was pushed. Publish it by hand:
+  gh release create $TAG $ASSET --repo $REPO --title $TAG --notes-file <the $VERSION section of CHANGELOG.md>"
+
+say "Checking the published zip"
+mkdir "$WORK/download"
+gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir "$WORK/download"
+PUBLISHED="$(shasum -a 256 "$WORK/download/$ASSET" | cut -d' ' -f1)"
+EXPECTED="$(sed -n 's/^let releaseChecksum = "\([0-9a-f]*\)"$/\1/p' Package.swift)"
+[ "$PUBLISHED" = "$EXPECTED" ] || fail "The published $ASSET ($PUBLISHED) doesn't match Package.swift ($EXPECTED).
+Don't move the tag: fix it and release the next patch version."
+echo "The published zip matches Package.swift ($EXPECTED)."
+
+say "Released $TAG"
+gh release view "$TAG" --repo "$REPO" --json url -q .url
+cat <<EOF
+
+To use it, in desktop's Cargo.toml (both lines):
+  nimbra-core = { git = "https://github.com/$REPO", tag = "$TAG" }
+  nimbra-core = { git = "https://github.com/$REPO", tag = "$TAG", features = ["test-support"] }
+
+In ios's project.yml, then run xcodegen:
+  packages:
+    NimbraCore:
+      url: https://github.com/$REPO
+      exactVersion: $VERSION
+EOF

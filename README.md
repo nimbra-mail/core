@@ -16,7 +16,9 @@ with a key kept there, and nothing secret is logged or put into an error.
 | `crates/nimbra-ffi` | The engine for Swift, through [UniFFI](https://mozilla.github.io/uniffi-rs): one `Engine` object, a `SecretStore` the app implements, and a few free functions. |
 | `Package.swift`, `Sources/NimbraCore` | The Swift package iOS uses: the generated Swift API (kept in git, never edited by hand) over `NimbraFFI.xcframework`. |
 | `scripts/build-ios-core.sh` | Builds the XCFramework (iPhone and Apple silicon simulator) and generates the Swift API. |
+| `scripts/release` | Releases a version: checks, the XCFramework zip, `Package.swift`, the tag and the GitHub Release. |
 | `docs/testing.md` | The live IMAP and SMTP tests against local servers. |
+| `CHANGELOG.md`, `docs/releasing.md` | What changed in each version, and how a release is made. |
 
 ## Checking a change
 
@@ -31,12 +33,14 @@ the Mac app's own folders.
 
 ## How the apps use it
 
-**macOS** ([desktop](https://github.com/nimbra-mail/desktop)) depends on the crate. Until this repo has a release
-tag, by path, from a checkout next to it:
+Both apps use a published release, and both have `scripts/local-core.sh` to build against a checkout of this repo
+next to them (`../core`) while trying a change: `on` switches to it, `off` goes back to the release (run it before
+committing there), and `status` says which one is in use.
+
+**macOS** ([desktop](https://github.com/nimbra-mail/desktop)) depends on the crate by its release tag, in
+`Cargo.toml`:
 
 ```toml
-nimbra-core = { path = "../core/crates/nimbra-core" }
-# once tagged:
 nimbra-core = { git = "https://github.com/nimbra-mail/core", tag = "v0.1.0" }
 ```
 
@@ -44,8 +48,17 @@ The app brings the modules in by name (`use nimbra_core::{mail, gmail, …}`), s
 before. The `test-support` feature gives the app's own tests temporary stores. The Mac app keeps its folders where
 they have always been (`~/Library/Application Support/Nimbra`).
 
-**iOS** ([ios](https://github.com/nimbra-mail/ios)) depends on the Swift package: by local path (`../core`) while
-developing, or by this repo's URL once a release carries the XCFramework. In Swift:
+**iOS** ([ios](https://github.com/nimbra-mail/ios)) depends on the Swift package by this repo's URL, in
+`project.yml`; SwiftPM takes the release's XCFramework by URL and checksum, without building Rust:
+
+```yaml
+packages:
+  NimbraCore:
+    url: https://github.com/nimbra-mail/core
+    exactVersion: 0.1.0
+```
+
+In Swift:
 
 ```swift
 import NimbraCore
@@ -92,13 +105,10 @@ there.
 
 ## Releasing
 
-A release carries the XCFramework, so that iOS can depend on the package by URL and checksum without building Rust:
-
-1. `./scripts/build-ios-core.sh --release-zip` makes `NimbraFFI.xcframework.zip` and prints its checksum.
-2. In `Package.swift`, set `releaseURL` to
-   `https://github.com/nimbra-mail/core/releases/download/vX.Y.Z/NimbraFFI.xcframework.zip` and `releaseChecksum`
-   to the checksum; commit, then tag `vX.Y.Z`.
-3. Publish the GitHub release for the tag with the zip attached.
+`./scripts/release <version>` checks the engine, builds the XCFramework zip, points `Package.swift` at it, tags the
+version and publishes the GitHub Release with the [CHANGELOG.md](CHANGELOG.md) section as its notes. A release carries
+the XCFramework, so that iOS can depend on the package by URL and checksum without building Rust.
+[docs/releasing.md](docs/releasing.md) has the details.
 
 ## Contributing
 
