@@ -599,8 +599,12 @@ fn is_public(ip: std::net::IpAddr) -> bool {
             match s {
                 // Unspecified, loopback and the old IPv4-compatible form.
                 [0, 0, 0, 0, 0, 0, _, _] => false,
+                // IPv4-translated.
+                [0, 0, 0, 0, 0xffff, 0, _, _] => false,
                 // NAT64.
                 [0x64, 0xff9b, 0, 0, 0, 0, high, low] => v4(embedded(high, low)),
+                // Local NAT64 and Teredo: what they lead to cannot be told from here.
+                [0x64, 0xff9b, 1, ..] | [0x2001, 0, ..] => false,
                 // 6to4.
                 [0x2002, high, low, ..] => v4(embedded(high, low)),
                 // Documentation.
@@ -820,6 +824,11 @@ mod tests {
             "::ffff:10.0.0.1",
             "64:ff9b::a00:1",
             "2002:c0a8:101::1",
+            "::ffff:0:7f00:1",
+            "::ffff:0:5db8:d70e",
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1:ffff::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
         ] {
             let ip: std::net::IpAddr = ip.parse().unwrap();
             assert!(!is_public(ip), "{ip} should not count as public");

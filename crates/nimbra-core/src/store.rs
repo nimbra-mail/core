@@ -10,12 +10,14 @@
 //! The main thread never writes or waits: it hands records to one writer thread
 //! (`save_soon`, `update_soon`), which writes them in the order they were handed over, the
 //! newest copy of a record only. Reads wait for what was handed over before them, and
-//! quitting waits for all of it (`flush`).
+//! quitting waits for all of it (`flush`). What the writer has of a record is shared by
+//! every `Store` of its account (keyed by its path), as one account often has two at once.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -41,6 +43,17 @@ static UNREADABLE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 const EVERY_RECORD: &str = "";
 /// How long a read waits for the writer before it reads what is on disk all the same.
 const READ_WAIT: Duration = Duration::from_secs(10);
+
+static LANES: LazyLock<Mutex<HashMap<PathBuf, Lane>>> = LazyLock::new(Default::default);
+/// Held while a record is written, so that a change reads the copy before it.
+static RECORDS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Default::default);
+/// The snapshot each record saved with `save_newest` has.
+static NEWEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Default::default);
+static SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static ON_WRITER: Cell<bool> = const { Cell::new(false) };
+}
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -70,15 +83,27 @@ impl Writer {
         WRITER.get_or_init(Writer::new).clone()
     }
 
+    #[cfg(test)]
     fn hand_over(self: &Arc<Self>, task: Task) {
-        locked(&self.counts).0 += 1;
+        self.hand_over_marked(|_| {}, task);
+    }
+
+    /// Hands a task over, after `mark` is told its place in the queue.
+    fn hand_over_marked(self: &Arc<Self>, mark: impl FnOnce(u64), task: Task) {
         let mut queue = locked(&self.queue);
+        let ticket = {
+            let mut counts = locked(&self.counts);
+            counts.0 += 1;
+            counts.0
+        };
+        mark(ticket);
         if queue.is_none() {
             let (sender, tasks) = mpsc::channel::<Task>();
             let writer = Arc::downgrade(self);
             let started = std::thread::Builder::new()
                 .name("nimbra-store".into())
                 .spawn(move || {
+                    ON_WRITER.set(true);
                     for task in tasks {
                         // A task that panics must not take the writes after it down too.
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
@@ -108,14 +133,28 @@ impl Writer {
 
     /// Waits until everything handed over so far is written, or `deadline`. Whether it was.
     fn flush(&self, deadline: Instant) -> bool {
+        let asked = locked(&self.counts).0;
+        self.wait_for(asked, Some(deadline))
+    }
+
+    /// Waits until the task with this place in the queue is done, or `deadline`.
+    fn wait_for(&self, ticket: u64, deadline: Option<Instant>) -> bool {
         let counts = locked(&self.counts);
-        let asked = counts.0;
-        let left = deadline.saturating_duration_since(Instant::now());
-        let (counts, _) = self
-            .done
-            .wait_timeout_while(counts, left, |counts| counts.1 < asked)
-            .unwrap_or_else(PoisonError::into_inner);
-        counts.1 >= asked
+        let behind = |counts: &mut (u64, u64)| counts.1 < ticket;
+        let counts = match deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                self.done
+                    .wait_timeout_while(counts, left, behind)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
+            None => self
+                .done
+                .wait_while(counts, behind)
+                .unwrap_or_else(PoisonError::into_inner),
+        };
+        counts.1 >= ticket
     }
 }
 
@@ -132,26 +171,41 @@ pub fn flush_store(store: &Store, deadline: Instant) -> bool {
 }
 
 /// What the writer has of one record.
-#[derive(Default)]
 struct Lane {
     /// Handed over and not written yet.
     waiting: usize,
-    /// The newest whole copy handed over, and the newest change.
+    /// The newest whole copy handed over, and the newest change or read.
     saved: u64,
     changed: u64,
+    /// The writer of the last task handed over, and its place in that writer's queue.
+    last: (Arc<Writer>, u64),
+}
+
+/// Runs `work` while holding the record at `key`, for every store of the process.
+fn holding<R>(key: &Path, work: impl FnOnce() -> R) -> R {
+    let record = locked(&RECORDS)
+        .entry(key.to_path_buf())
+        .or_default()
+        .clone();
+    let result = {
+        let _writing = locked(&record);
+        work()
+    };
+    let mut records = locked(&RECORDS);
+    drop(record);
+    if records
+        .get(key)
+        .is_some_and(|record| Arc::strong_count(record) == 1)
+    {
+        records.remove(key);
+    }
+    result
 }
 
 pub struct Store {
     dir: PathBuf,
     cipher: ChaCha20Poly1305,
-    snapshots: AtomicU64,
-    /// The snapshot each record saved with `save_newest` has.
-    newest: Mutex<HashMap<String, u64>>,
     writer: Arc<Writer>,
-    lanes: Mutex<HashMap<String, Lane>>,
-    landed: Condvar,
-    /// Held while a record is written, so that a change reads the copy before it.
-    records: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Store {
@@ -198,12 +252,7 @@ impl Store {
         Ok(Self {
             dir,
             cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
-            snapshots: AtomicU64::new(0),
-            newest: Mutex::new(HashMap::new()),
             writer,
-            lanes: Mutex::new(HashMap::new()),
-            landed: Condvar::new(),
-            records: Mutex::new(HashMap::new()),
         })
     }
 
@@ -243,10 +292,8 @@ impl Store {
     /// Saves a record under `name`, replacing any previous one, after what was handed to
     /// the writer for it. Blocking.
     pub fn save<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
-        self.wait_for_writer(name);
-        let record = self.record(name);
-        let _writing = locked(&record);
-        self.write(name, value)
+        self.wait_for_writer(name, None);
+        holding(&self.key(name), || self.write(name, value))
     }
 
     fn write<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
@@ -288,7 +335,9 @@ impl Store {
     /// older format, or that fails to decrypt (tampered with, or written with another key)
     /// reads as nothing. Blocking.
     pub fn load<T: DeserializeOwned>(&self, name: &str) -> Option<T> {
-        self.wait_for_writer(name);
+        if !self.wait_for_writer(name, Some(READ_WAIT)) {
+            eprintln!("nimbra: read “{name}” before the writer got to it");
+        }
         self.read(name)
     }
 
@@ -312,18 +361,24 @@ impl Store {
 
     /// Numbers a copy that is about to be saved in the background, for `save_newest`.
     pub fn snapshot(&self) -> u64 {
-        self.snapshots.fetch_add(1, Ordering::Relaxed) + 1
+        SNAPSHOTS.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Saves a copy unless a newer one already is: background saves land in any order.
     pub fn save_newest<T: Serialize>(&self, name: &str, value: &T, taken: u64) -> Result<()> {
-        let mut newest = locked(&self.newest);
-        if newest.get(name).is_some_and(|saved| *saved > taken) {
-            return Ok(());
-        }
-        self.save(name, value)?;
-        newest.insert(name.to_string(), taken);
-        Ok(())
+        self.wait_for_writer(name, None);
+        let key = self.key(name);
+        holding(&key, || {
+            if locked(&NEWEST)
+                .get(&key)
+                .is_some_and(|saved| *saved > taken)
+            {
+                return Ok(());
+            }
+            self.write(name, value)?;
+            locked(&NEWEST).insert(key.clone(), taken);
+            Ok(())
+        })
     }
 
     /// Changes a record as it now is on disk. Blocking.
@@ -332,13 +387,13 @@ impl Store {
         name: &str,
         change: impl FnOnce(&mut T),
     ) -> Result<T> {
-        self.wait_for_writer(name);
-        let record = self.record(name);
-        let _writing = locked(&record);
-        let mut value: T = self.read(name).unwrap_or_default();
-        change(&mut value);
-        self.write(name, &value)?;
-        Ok(value)
+        self.wait_for_writer(name, None);
+        holding(&self.key(name), || {
+            let mut value: T = self.read(name).unwrap_or_default();
+            change(&mut value);
+            self.write(name, &value)?;
+            Ok(value)
+        })
     }
 
     /// Hands a copy of a record to the writer and returns at once. A newer copy handed over
@@ -395,9 +450,11 @@ impl Store {
         name: &str,
     ) -> futures::channel::oneshot::Receiver<Option<T>> {
         let (answer, answered) = futures::channel::oneshot::channel();
+        let taken = self.snapshot();
+        // Marked as a change, so that a copy handed over before it is written, not replaced.
         self.hand_over(
             name,
-            |_| {},
+            |lane| lane.changed = taken,
             move |store, name| {
                 answer.send(store.read(name)).ok();
             },
@@ -417,56 +474,69 @@ impl Store {
         mark: impl FnOnce(&mut Lane),
         work: impl FnOnce(&Store, &str) + Send + 'static,
     ) {
-        {
-            let mut lanes = locked(&self.lanes);
-            let lane = lanes.entry(name.to_string()).or_default();
-            lane.waiting += 1;
-            mark(lane);
-        }
-        let (store, name) = (self.clone(), name.to_string());
-        self.writer.hand_over(Box::new(move || {
-            // Counted as written however the work ends, or reads would wait for it forever.
-            struct Landed<'a>(&'a Store, &'a str);
-            impl Drop for Landed<'_> {
-                fn drop(&mut self) {
-                    let mut lanes = locked(&self.0.lanes);
-                    if let Some(lane) = lanes.get_mut(self.1) {
-                        lane.waiting -= 1;
-                        if lane.waiting == 0 {
-                            lanes.remove(self.1);
+        let key = self.key(name);
+        let writer = self.writer.clone();
+        let (store, name, landing) = (self.clone(), name.to_string(), key.clone());
+        self.writer.hand_over_marked(
+            move |ticket| {
+                let mut lanes = locked(&LANES);
+                let lane = lanes.entry(key).or_insert_with(|| Lane {
+                    waiting: 0,
+                    saved: 0,
+                    changed: 0,
+                    last: (writer.clone(), ticket),
+                });
+                lane.waiting += 1;
+                lane.last = (writer, ticket);
+                mark(lane);
+            },
+            Box::new(move || {
+                // Counted as written however the work ends, or the lane would stay forever.
+                struct Landed<'a>(&'a Path);
+                impl Drop for Landed<'_> {
+                    fn drop(&mut self) {
+                        let mut lanes = locked(&LANES);
+                        if let Some(lane) = lanes.get_mut(self.0) {
+                            lane.waiting -= 1;
+                            if lane.waiting == 0 {
+                                lanes.remove(self.0);
+                            }
                         }
                     }
-                    self.0.landed.notify_all();
                 }
-            }
-            let _landed = Landed(&store, &name);
-            let record = store.record(&name);
-            let _writing = locked(&record);
-            work(&store, &name);
-        }));
-    }
-
-    fn lane<R>(&self, name: &str, look: impl FnOnce(&Lane) -> R) -> Option<R> {
-        locked(&self.lanes).get(name).map(look)
-    }
-
-    /// Waits until what was handed to the writer for `name` is written.
-    fn wait_for_writer(&self, name: &str) {
-        let lanes = locked(&self.lanes);
-        drop(
-            self.landed
-                .wait_timeout_while(lanes, READ_WAIT, |lanes| {
-                    lanes.contains_key(name) || lanes.contains_key(EVERY_RECORD)
-                })
-                .unwrap_or_else(PoisonError::into_inner),
+                let _landed = Landed(&landing);
+                holding(&landing, || work(&store, &name));
+            }),
         );
     }
 
-    fn record(&self, name: &str) -> Arc<Mutex<()>> {
-        locked(&self.records)
-            .entry(name.to_string())
-            .or_default()
-            .clone()
+    /// Where the writer keeps what it has of a record, for every store of the process.
+    fn key(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+
+    fn lane<R>(&self, name: &str, look: impl FnOnce(&Lane) -> R) -> Option<R> {
+        locked(&LANES).get(&self.key(name)).map(look)
+    }
+
+    /// Waits until what was handed to a writer for `name`, by any store of the account, is
+    /// written, or `patience` runs out. Whether it was.
+    fn wait_for_writer(&self, name: &str, patience: Option<Duration>) -> bool {
+        // On the writer, everything handed over before is written already.
+        if ON_WRITER.get() {
+            return true;
+        }
+        let waits: Vec<(Arc<Writer>, u64)> = {
+            let lanes = locked(&LANES);
+            [self.key(name), self.key(EVERY_RECORD)]
+                .iter()
+                .filter_map(|key| lanes.get(key).map(|lane| lane.last.clone()))
+                .collect()
+        };
+        let deadline = patience.map(|patience| Instant::now() + patience);
+        waits
+            .iter()
+            .all(|(writer, ticket)| writer.wait_for(*ticket, deadline))
     }
 
     /// The records whose name starts with `prefix`.
@@ -725,6 +795,80 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(futures::executor::block_on(changed).unwrap().unwrap(), 2);
         assert_eq!(store.load::<Vec<u32>>("snoozed").unwrap(), [1, 2]);
+        assert!(flush_store(
+            &store,
+            Instant::now() + Duration::from_secs(30)
+        ));
+        std::fs::remove_dir_all(&store.dir).unwrap();
+    }
+
+    /// Two stores over one folder, sharing a writer: one account's store that a background
+    /// check holds, and the one opened when that account is switched to.
+    fn two_stores_of_one_account() -> (Arc<Store>, Arc<Store>) {
+        let writer = Writer::new();
+        let dir = std::env::temp_dir().join(format!("nimbra-test-{}", random_suffix().unwrap()));
+        let open = || Arc::new(Store::open_with(dir.clone(), &[9; 32], writer.clone()).unwrap());
+        (open(), open())
+    }
+
+    #[test]
+    fn a_change_on_one_store_of_an_account_waits_for_one_queued_on_another() {
+        let (shown, away) = two_stores_of_one_account();
+        shown.save("snoozed", &vec![1u32]).unwrap();
+        let (entered, has_entered) = mpsc::channel();
+        let (go, gate) = mpsc::channel::<()>();
+        let added = shown.update_soon("snoozed", move |list: &mut Vec<u32>| {
+            entered.send(()).unwrap();
+            gate.recv().ok();
+            list.push(2);
+        });
+        has_entered.recv().unwrap();
+        let (removed, has_removed) = mpsc::channel();
+        let woken = std::thread::spawn({
+            let away = away.clone();
+            move || {
+                let done = away.update("snoozed", |list: &mut Vec<u32>| list.retain(|n| *n != 1));
+                removed.send(()).ok();
+                done
+            }
+        });
+        // Time for a change that does not wait to land first.
+        has_removed.recv_timeout(Duration::from_millis(200)).ok();
+        go.send(()).unwrap();
+        futures::executor::block_on(added).unwrap().unwrap();
+        assert_eq!(woken.join().unwrap().unwrap(), [2]);
+        assert_eq!(
+            Store::temp_like(&shown)
+                .load::<Vec<u32>>("snoozed")
+                .unwrap(),
+            [2]
+        );
+        std::fs::remove_dir_all(&shown.dir).unwrap();
+    }
+
+    #[test]
+    fn a_store_opened_again_reads_after_what_the_earlier_one_queued() {
+        let (old, release) = held_store();
+        drop(old.update_soon("snoozed", |list: &mut Vec<u32>| list.push(5)));
+        let fresh = Store::open_with(old.dir.clone(), &[9; 32], old.writer.clone()).unwrap();
+        let (read, has_read) = mpsc::channel();
+        std::thread::spawn(move || read.send(fresh.load::<Vec<u32>>("snoozed")).unwrap());
+        let early = has_read.recv_timeout(Duration::from_millis(200)).ok();
+        release.send(()).unwrap();
+        let read = early.unwrap_or_else(|| has_read.recv().unwrap());
+        assert_eq!(read, Some(vec![5]));
+        std::fs::remove_dir_all(&old.dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_between_two_saves_sees_the_first() {
+        let (store, release) = held_store();
+        store.save_soon("outbox", vec![1u32]);
+        let read = store.read_soon::<Vec<u32>>("outbox");
+        store.save_soon("outbox", vec![2u32]);
+        release.send(()).unwrap();
+        assert_eq!(futures::executor::block_on(read).unwrap(), Some(vec![1]));
+        assert_eq!(store.load::<Vec<u32>>("outbox"), Some(vec![2]));
         std::fs::remove_dir_all(&store.dir).unwrap();
     }
 
