@@ -4,6 +4,8 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-27
+
 ### Breaking
 - `NimbraError.SignedOut(account:)` is now `SignedOut(accountId: String?)`: always an account id on this device, or `nil` when the address being added (`addImapAccount`, a new account's `finish…SignIn`) did not take the password or sign-in. It was an empty string there before. A refused SMTP password while adding is now `SignedOut` too, not `Failed`. Match on `accountId` instead of `account`.
 - `ThreadRow` has a new field, `senderAddress` (see Added): code that builds a `ThreadRow` itself (previews, tests) passes it. In the crate, so does code that builds a `mail::Summary` (`sender_address`).
