@@ -51,6 +51,8 @@ pub struct Settings {
     pub dock_badge: bool,
     /// The size of text in the reader.
     pub reader_text: TextSize,
+    /// Count launches anonymously (`usage.rs`).
+    pub usage_counts: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -128,6 +130,7 @@ impl Default for Settings {
             notify_sound: true,
             dock_badge: true,
             reader_text: TextSize::Default,
+            usage_counts: true,
         }
     }
 }
