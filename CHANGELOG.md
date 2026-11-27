@@ -9,6 +9,7 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ### Added
 - `TextSize::ExtraLarge` (saved as `"extralarge"`): 19pt text on 32pt lines in the reader.
+- `Settings::interface_zoom` (percent, saved as `interface_zoom`, 100 when missing) and `Settings::zoom()`, which keeps it to one of `ZOOM_STEPS` (90, 100, 110, 125): how large the whole interface is drawn.
 
 ## [0.1.2] - 2026-11-27
 
