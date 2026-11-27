@@ -4,6 +4,8 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-27
+
 ### Breaking
 - In the crate, `View::AllInboxes` is now `View::ALL_INBOXES`, one of the new `View::Every` mailboxes (see Added). A `match` on `View` covers `View::Every(_)`.
 
