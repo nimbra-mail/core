@@ -4,6 +4,12 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Breaking
+- `TextSize` has a new variant, `ExtraLarge`: a `match` on it covers that too.
+
+### Added
+- `TextSize::ExtraLarge` (saved as `"extralarge"`): 19pt text on 32pt lines in the reader.
+
 ## [0.1.2] - 2026-11-27
 
 ### Breaking
