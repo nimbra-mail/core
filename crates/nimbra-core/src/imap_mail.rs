@@ -480,42 +480,17 @@ impl Client {
             return Ok(folders);
         }
         let names = connection.session.list(Some(""), Some("*"))?;
-        let mut folders = Vec::new();
-        for name in names.iter() {
-            use imap_proto::NameAttribute as A;
-            let attributes = name.attributes();
-            if attributes.iter().any(|a| matches!(a, A::NoSelect))
-                || attributes.iter().any(
-                    |a| matches!(a, A::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent")),
-                )
-            {
-                continue;
-            }
-            let raw = name.name().to_string();
-            if !folder_name_ok(&raw) {
-                continue;
-            }
-            let special = attributes.iter().find_map(|a| match a {
-                A::Sent => Some(Role::Sent),
-                A::Drafts => Some(Role::Drafts),
-                A::Trash => Some(Role::Trash),
-                A::Junk => Some(Role::Junk),
-                A::Archive => Some(Role::Archive),
-                // Gmail's All Mail and the like: every message again. Not a label.
-                A::All | A::Flagged => Some(Role::Inbox),
-                _ => None,
-            });
-            let role = if raw.eq_ignore_ascii_case("INBOX") {
-                Role::Inbox
-            } else {
-                match special {
-                    Some(Role::Inbox) => continue,
-                    Some(role) => role,
-                    None => role_by_name(&raw),
-                }
-            };
-            folders.push(Folder { name: raw, role });
-        }
+        let mut folders: Vec<Folder> = names
+            .iter()
+            .filter(|name| folder_name_ok(name.name()))
+            .filter_map(|name| {
+                let role = role_of(name.name(), name.attributes())?;
+                Some(Folder {
+                    name: name.name().to_string(),
+                    role,
+                })
+            })
+            .collect();
         // One folder per role (the first said to be it), the rest are labels.
         let mut seen = HashSet::new();
         for folder in &mut folders {
@@ -1316,6 +1291,10 @@ impl Client {
             }
         })?;
         self.writes.fetch_add(1, Ordering::Relaxed);
+        // Gmail files what goes through its SMTP server in Sent Mail itself.
+        if self.servers.is_gmail() {
+            return Ok(());
+        }
         // Sent: some servers file it themselves a moment later.
         std::thread::sleep(Duration::from_millis(1500));
         if !self.in_sent(message_id).unwrap_or(true) {
@@ -2044,10 +2023,19 @@ fn signed_in_or_refused<S: Read + Write>(
         Ok(session) => Ok(session),
         // What the server said goes along (cleaned, short): "enable IMAP first" and the like
         // is what tells someone setting up an account what to do.
-        Err((::imap::Error::No(no), _)) => Err(anyhow!(SignedOut {
-            account: account.to_string(),
-        })
-        .context(ServerSaid(said(&no.information)))),
+        Err((::imap::Error::No(no), _)) => {
+            let said = said(&no.information);
+            let app_password = crate::mail::asks_for_app_password(&said);
+            let refused = anyhow!(SignedOut {
+                account: account.to_string(),
+            })
+            .context(ServerSaid(said));
+            Err(if app_password {
+                refused.context(crate::mail::NeedsAppPassword)
+            } else {
+                refused
+            })
+        }
         Err((::imap::Error::Bad(_), _)) => Err(SignedOut {
             account: account.to_string(),
         }
@@ -2559,6 +2547,38 @@ fn folder_name_ok(name: &str) -> bool {
     !name.is_empty() && name.len() <= 1000 && !name.chars().any(char::is_control)
 }
 
+/// What a listed folder is for, from its special-use attributes first, then its name.
+/// `None` for one that is not a folder of its own: not selectable, or one that shows
+/// messages kept elsewhere again (Gmail's All Mail, Starred and Important).
+fn role_of(name: &str, attributes: &[imap_proto::NameAttribute<'_>]) -> Option<Role> {
+    use imap_proto::NameAttribute as A;
+    let extension = |wanted: &str| {
+        attributes
+            .iter()
+            .any(|a| matches!(a, A::Extension(e) if e.eq_ignore_ascii_case(wanted)))
+    };
+    if attributes.iter().any(|a| matches!(a, A::NoSelect)) || extension("\\NonExistent") {
+        return None;
+    }
+    if name.eq_ignore_ascii_case("INBOX") {
+        return Some(Role::Inbox);
+    }
+    // RFC 8457's \Important, which Gmail gives its Important.
+    if extension("\\Important") {
+        return None;
+    }
+    let special = attributes.iter().find_map(|a| match a {
+        A::Sent => Some(Some(Role::Sent)),
+        A::Drafts => Some(Some(Role::Drafts)),
+        A::Trash => Some(Some(Role::Trash)),
+        A::Junk => Some(Some(Role::Junk)),
+        A::Archive => Some(Some(Role::Archive)),
+        A::All | A::Flagged => Some(None),
+        _ => None,
+    });
+    special.unwrap_or_else(|| Some(role_by_name(name)))
+}
+
 fn role_by_name(name: &str) -> Role {
     let last = name
         .rsplit(['/', '.'])
@@ -2831,6 +2851,55 @@ mod tests {
         assert!(
             sent.contains("AUTHENTICATE PLAIN") && sent.contains(&b64("\0ana@outlook.com\0pw"))
         );
+    }
+
+    #[test]
+    fn gmails_own_password_with_two_step_verification_asks_for_an_app_password() {
+        let caps = "* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=XOAUTH2\r\na1 OK done\r\n";
+        let (result, _) = scripted_sign_in(
+            &format!(
+                "{caps}+ \r\na2 NO [ALERT] Application-specific password required: https://support.google.com/accounts/answer/185833 (Failure)\r\n"
+            ),
+            &Secret::Password("typed-secret".into()),
+        );
+        let error = result.unwrap_err();
+        assert!(error.is::<crate::mail::NeedsAppPassword>(), "{error:#}");
+        assert!(
+            error
+                .downcast_ref::<SignedOut>()
+                .is_some_and(|e| e.account == "acct")
+        );
+        assert!(!format!("{error:#}").contains("typed-secret"));
+    }
+
+    #[test]
+    fn a_wrong_app_password_is_only_signed_out() {
+        let caps = "* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=XOAUTH2\r\na1 OK done\r\n";
+        let (result, _) = scripted_sign_in(
+            &format!("{caps}+ \r\na2 NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n"),
+            &Secret::Password("wrongwrongwrongw".into()),
+        );
+        let error = result.unwrap_err();
+        assert!(error.is::<SignedOut>());
+        assert!(!error.is::<crate::mail::NeedsAppPassword>());
+    }
+
+    #[test]
+    fn gmails_virtual_folders_are_not_labels() {
+        use imap_proto::NameAttribute as A;
+        let important = [A::NoInferiors, A::Extension("\\Important".into())];
+        for (name, attributes) in [
+            ("[Gmail]/All Mail", &[A::All][..]),
+            ("[Gmail]/Starred", &[A::Flagged][..]),
+            ("[Gmail]/Important", &important[..]),
+            ("[Gmail]", &[A::NoSelect][..]),
+        ] {
+            assert_eq!(role_of(name, attributes), None, "{name}");
+        }
+        assert_eq!(role_of("[Gmail]/Sent Mail", &[A::Sent]), Some(Role::Sent));
+        assert_eq!(role_of("[Gmail]/Spam", &[A::Junk]), Some(Role::Junk));
+        assert_eq!(role_of("INBOX", &[]), Some(Role::Inbox));
+        assert_eq!(role_of("Receipts", &[]), Some(Role::Label));
     }
 
     #[test]

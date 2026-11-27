@@ -25,8 +25,9 @@
 //! - A server that is only reached in plain text is never offered, and POP3 is ignored.
 //!   Host names from the network are checked like typed ones, so a hostile file cannot
 //!   carry anything else into a connection.
-//! - Microsoft and Google no longer take passwords over IMAP, so their addresses come back
-//!   as `NeedsOAuth`, as does any config that only offers OAuth2.
+//! - Microsoft no longer takes passwords over IMAP, so its addresses come back as
+//!   `NeedsOAuth`, as does any config that only offers OAuth2. Google's come back as
+//!   `Google`: its own sign-in first, and Gmail's servers for an app password.
 
 use std::io::Read as _;
 use std::time::Duration;
@@ -34,7 +35,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 
 use crate::mail::is_address;
-use crate::servers::{Security, Server, Servers, is_host};
+use crate::servers::{Security, Server, Servers, gmail, is_host};
 
 /// How long one request may take, from connecting to the last byte.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,6 +49,9 @@ const MAX_REDIRECTS: u32 = 3;
 pub enum Found {
     /// The servers to use, with the name to sign in with.
     Servers(Servers),
+    /// A Google account (gmail.com, or a domain whose mail Google runs). Signing in with
+    /// Google is the way in; these are Gmail's servers, for an app password instead.
+    Google(Servers),
     /// The provider only lets mail apps in through its own sign-in (OAuth), not a password.
     NeedsOAuth { provider: &'static str },
     /// Nothing answered: the servers have to be typed in.
@@ -66,6 +70,7 @@ pub fn known(email: &str) -> Option<Found> {
         .iter()
         .find(|preset| preset.domains.contains(&domain.as_str()))?;
     Some(match preset.servers {
+        Preset::Google => Found::Google(gmail(email)),
         Preset::OAuth(provider) => Found::NeedsOAuth { provider },
         Preset::Password { imap, smtp } => Found::Servers(Servers {
             username: email.to_string(),
@@ -220,12 +225,12 @@ fn starttls_ok(host: &str) -> bool {
 }
 
 /// The provider behind a mail server (MX host) that is known without asking anyone:
-/// Google and Microsoft sign in with their own pages, and Zoho's regions have presets. The
-/// user name is the full address on the user's own domain.
+/// Google (Workspace) and Microsoft, and Zoho's regions, which have presets. The user name
+/// is the full address on the user's own domain.
 fn by_mx(host: &str, email: &str) -> Option<Found> {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if under(&host, "google.com") || under(&host, "googlemail.com") {
-        return Some(Found::NeedsOAuth { provider: "Google" });
+    if is_google(&host) {
+        return Some(Found::Google(gmail(email)));
     }
     // `*.mail.protection.outlook.com`, and the newer `*.mx.microsoft` (with DNSSEC).
     if under(&host, "outlook.com") || under(&host, "mx.microsoft") {
@@ -333,6 +338,9 @@ fn parse(xml: &str, email: &str) -> Option<Found> {
     }
     let incoming = offers(&xml, "incomingServer", "imap", email);
     let outgoing = offers(&xml, "outgoingServer", "smtp", email);
+    if incoming.iter().any(|offer| is_google(&offer.server.host)) {
+        return Some(Found::Google(gmail(email)));
+    }
     // Implicit TLS first, then the file's own order.
     let pick = |offers: &[Offer]| {
         let mut usable: Vec<&Offer> = offers.iter().filter(|offer| offer.password).collect();
@@ -411,6 +419,10 @@ fn under(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+fn is_google(host: &str) -> bool {
+    under(host, "google.com") || under(host, "googlemail.com") || under(host, "gmail.com")
+}
+
 /// Fastmail's autoconfig lists only OAuth2 (for Thunderbird's own client), but its servers
 /// take app passwords, which is what its custom-domain users are told to make.
 fn takes_app_passwords(host: &str) -> bool {
@@ -422,8 +434,6 @@ fn oauth_provider(host: &str) -> &'static str {
     let under = |domain: &str| under(host, domain);
     if under("outlook.com") || under("office365.com") || under("hotmail.com") {
         "Microsoft"
-    } else if under("gmail.com") || under("googlemail.com") || under("google.com") {
-        "Google"
     } else if under("yahoo.com") {
         "Yahoo"
     } else if under("aol.com") {
@@ -526,6 +536,7 @@ enum Preset {
         imap: (&'static str, u16, Security),
         smtp: (&'static str, u16, Security),
     },
+    Google,
     OAuth(&'static str),
 }
 
@@ -545,7 +556,7 @@ const fn tls(imap: &'static str, smtp: &'static str) -> Preset {
 const PRESETS: &[Provider] = &[
     Provider {
         domains: &["gmail.com", "googlemail.com"],
-        servers: Preset::OAuth("Google"),
+        servers: Preset::Google,
     },
     Provider {
         domains: &[
@@ -731,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn microsoft_and_google_need_their_sign_in() {
+    fn microsoft_needs_its_sign_in() {
         for email in ["a@outlook.com", "a@hotmail.com", "a@live.com", "a@msn.com"] {
             assert_eq!(
                 known(email),
@@ -740,9 +751,24 @@ mod tests {
                 })
             );
         }
+    }
+
+    fn gmail_servers(username: &str) -> Servers {
+        Servers {
+            username: username.into(),
+            imap: Server::new("imap.gmail.com", 993, Security::Tls),
+            smtp: Server::new("smtp.gmail.com", 465, Security::Tls),
+        }
+    }
+
+    #[test]
+    fn gmail_addresses_offer_google_sign_in_and_gmails_servers() {
+        for email in ["a@gmail.com", "a@googlemail.com"] {
+            assert_eq!(known(email), Some(Found::Google(gmail_servers(email))));
+        }
         assert_eq!(
-            known("a@gmail.com"),
-            Some(Found::NeedsOAuth { provider: "Google" })
+            known(" Jo@GMail.com "),
+            Some(Found::Google(gmail_servers("Jo@GMail.com")))
         );
     }
 
@@ -997,6 +1023,29 @@ mod tests {
             found.imap,
             Server::new("imap.fastmail.com", 993, Security::Tls)
         );
+        // Google's servers, whatever the file says about signing in to them.
+        let google = config(
+            &server(
+                "incomingServer",
+                "imap",
+                "imap.gmail.com",
+                993,
+                "SSL",
+                &["OAuth2"],
+            ),
+            &server(
+                "outgoingServer",
+                "smtp",
+                "smtp.gmail.com",
+                465,
+                "SSL",
+                &["OAuth2"],
+            ),
+        );
+        assert_eq!(
+            parse(&google, "jo@acme.dev"),
+            Some(Found::Google(gmail_servers("jo@acme.dev")))
+        );
         // Any other provider's name is a generic one.
         let other = config(
             &server(
@@ -1025,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn google_and_microsoft_mail_servers_need_their_sign_in() {
+    fn a_domain_whose_mail_google_runs_gets_gmails_servers_with_its_own_address() {
         for host in [
             "aspmx.l.google.com",
             "ALT1.ASPMX.L.GOOGLE.COM.",
@@ -1033,11 +1082,15 @@ mod tests {
             "aspmx2.googlemail.com",
         ] {
             assert_eq!(
-                by_mx(host, "a@acme.dev"),
-                Some(Found::NeedsOAuth { provider: "Google" }),
+                by_mx(host, "Jo@acme.dev"),
+                Some(Found::Google(gmail_servers("Jo@acme.dev"))),
                 "{host}"
             );
         }
+    }
+
+    #[test]
+    fn a_domain_whose_mail_microsoft_runs_needs_its_sign_in() {
         for host in [
             "acme-dev.mail.protection.outlook.com",
             "acme-dev.o-v1.mx.microsoft",

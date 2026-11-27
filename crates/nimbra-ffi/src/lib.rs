@@ -153,7 +153,15 @@ Friday at noon?\r\n";
     #[test]
     fn known_providers_are_found_offline() {
         match known_servers("someone@gmail.com".into()) {
-            Some(Discovery::NeedsOAuth { provider }) => assert_eq!(provider, "Google"),
+            Some(Discovery::Google { servers }) => {
+                assert_eq!(servers.username, "someone@gmail.com");
+                assert_eq!(servers.imap.host, "imap.gmail.com");
+                assert_eq!(servers.smtp.host, "smtp.gmail.com");
+            }
+            other => panic!("{other:?}"),
+        }
+        match known_servers("someone@outlook.com".into()) {
+            Some(Discovery::NeedsOAuth { provider }) => assert_eq!(provider, "Microsoft"),
             other => panic!("{other:?}"),
         }
         assert_eq!(known_servers("someone@example.invalid".into()), None);

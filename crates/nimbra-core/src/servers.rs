@@ -69,12 +69,50 @@ pub struct Servers {
 }
 
 impl Servers {
+    /// Gmail's own servers, both of them, which take an app password.
+    pub fn is_gmail(&self) -> bool {
+        matches!(
+            self.imap.host.as_str(),
+            "imap.gmail.com" | "imap.googlemail.com"
+        ) && matches!(
+            self.smtp.host.as_str(),
+            "smtp.gmail.com" | "smtp.googlemail.com"
+        )
+    }
+
+    /// The password to sign in with, from what was typed or pasted: without a line break
+    /// or tab around it, and for Gmail, a Google app password without the spaces Google
+    /// shows it with. Any other provider's password may hold spaces, so they stay.
+    pub fn normalize_password(&self, typed: &str) -> String {
+        let typed = typed.trim_matches(|c: char| c.is_control());
+        if !self.is_gmail() {
+            return typed.to_string();
+        }
+        let joined: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+        if joined.len() == 16 && joined.chars().all(|c| c.is_ascii_alphabetic()) {
+            joined
+        } else {
+            typed.trim().to_string()
+        }
+    }
+
     pub fn check(&self) -> Result<()> {
         if self.username.trim().is_empty() || self.username.chars().any(char::is_control) {
             bail!("The user name is empty or not valid.");
         }
         self.imap.check()?;
         self.smtp.check()
+    }
+}
+
+/// Gmail's IMAP and SMTP servers for a Google account (gmail.com or Google Workspace),
+/// signed in to with the full address. From
+/// <https://developers.google.com/workspace/gmail/imap/imap-smtp>.
+pub fn gmail(email: &str) -> Servers {
+    Servers {
+        username: email.trim().to_string(),
+        imap: Server::new("imap.gmail.com", 993, Security::Tls),
+        smtp: Server::new("smtp.gmail.com", 465, Security::Tls),
     }
 }
 
@@ -185,6 +223,75 @@ mod tests {
             ("a b@c.d", "t"),
         ] {
             assert!(xoauth2(user, token).is_err(), "{user:?} {token:?}");
+        }
+    }
+
+    fn on(host: &str) -> Servers {
+        Servers {
+            username: "jo@example.com".into(),
+            imap: Server::new(host, 993, Security::Tls),
+            smtp: Server::new("smtp.example.com", 465, Security::Tls),
+        }
+    }
+
+    #[test]
+    fn a_google_app_password_loses_the_spaces_it_is_shown_with() {
+        let gmail = gmail("jo@example.com");
+        for typed in [
+            "abcd efgh ijkl mnop",
+            "abcdefghijklmnop",
+            " abcd efgh ijkl mnop\n",
+            "\tabcd\u{a0}efgh ijkl  mnop\r\n",
+        ] {
+            assert_eq!(
+                gmail.normalize_password(typed),
+                "abcdefghijklmnop",
+                "{typed:?}"
+            );
+        }
+        assert_eq!(
+            gmail.normalize_password("ABCD EFGH IJKL MNOP"),
+            "ABCDEFGHIJKLMNOP"
+        );
+    }
+
+    #[test]
+    fn a_google_password_that_is_not_an_app_password_keeps_its_inner_spaces() {
+        let gmail = gmail("jo@example.com");
+        assert_eq!(gmail.normalize_password(" my old pass \n"), "my old pass");
+        assert_eq!(
+            gmail.normalize_password("abcd efgh ijkl mno1"),
+            "abcd efgh ijkl mno1"
+        );
+    }
+
+    #[test]
+    fn another_providers_password_keeps_its_spaces_and_loses_a_pasted_line_break() {
+        let other = on("imap.example.com");
+        assert_eq!(
+            other.normalize_password("abcd efgh ijkl mnop"),
+            "abcd efgh ijkl mnop"
+        );
+        assert_eq!(other.normalize_password(" pass word \r\n"), " pass word ");
+    }
+
+    #[test]
+    fn a_password_of_only_whitespace_is_empty() {
+        assert_eq!(gmail("jo@example.com").normalize_password(" \n"), "");
+        assert_eq!(on("imap.example.com").normalize_password("\r\n"), "");
+    }
+
+    #[test]
+    fn only_gmails_own_hosts_are_gmail() {
+        assert!(gmail("jo@example.com").is_gmail());
+        let older = Servers {
+            imap: Server::new("imap.googlemail.com", 993, Security::Tls),
+            smtp: Server::new("smtp.googlemail.com", 587, Security::StartTls),
+            ..gmail("jo@example.com")
+        };
+        assert!(older.is_gmail());
+        for host in ["imap.gmail.com", "imap.gmail.com.evil.net", "gmail.com"] {
+            assert!(!on(host).is_gmail(), "{host}");
         }
     }
 

@@ -12,6 +12,9 @@ pub enum NimbraError {
     /// added (`add_imap_account`, a new account's `finish_*_sign_in`) did not take it, and
     /// nothing was kept. Never an email address.
     SignedOut { account_id: Option<String> },
+    /// As `SignedOut`, and the password was the Google account's own: with 2-Step
+    /// Verification on, Gmail takes only an app password (or Continue with Google).
+    NeedsAppPassword { account_id: Option<String> },
     /// No connection to the server.
     Offline,
     /// The thread, message, draft or label is gone.
@@ -32,6 +35,9 @@ impl std::fmt::Display for NimbraError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NimbraError::SignedOut { .. } => f.write_str("Signed out. Please sign in again."),
+            NimbraError::NeedsAppPassword { .. } => {
+                f.write_str("Google needs an app password here, not the account’s own password.")
+            }
             NimbraError::Offline => f.write_str("You’re offline."),
             NimbraError::NotFound => f.write_str("It is not there any more."),
             NimbraError::HistoryExpired => f.write_str("The mailbox has to be listed again."),
@@ -61,6 +67,9 @@ impl NimbraError {
             NimbraError::SignedOut { account_id: None } => NimbraError::SignedOut {
                 account_id: Some(account_id.to_string()),
             },
+            NimbraError::NeedsAppPassword { account_id: None } => NimbraError::NeedsAppPassword {
+                account_id: Some(account_id.to_string()),
+            },
             other => other,
         }
     }
@@ -68,16 +77,19 @@ impl NimbraError {
 
 impl From<anyhow::Error> for NimbraError {
     fn from(error: anyhow::Error) -> Self {
-        if let Some(out) = error.downcast_ref::<mail::SignedOut>() {
-            // Empty while a sign-in is not yet any account's (`mail::SignedOut`).
-            return NimbraError::SignedOut {
-                account_id: Some(out.account.clone()).filter(|id| !id.is_empty()),
-            };
-        }
-        // Only checking a password gives it bare (`smtp::check_login`): a connection's
+        // Empty while a sign-in is not yet any account's (`mail::SignedOut`). Only checking a
+        // password gives `smtp::AuthFailed` bare (`smtp::check_login`): a connection's
         // sending turns it into `SignedOut` for its account.
-        if error.is::<smtp::AuthFailed>() {
-            return NimbraError::SignedOut { account_id: None };
+        let refused = match error.downcast_ref::<mail::SignedOut>() {
+            Some(out) => Some(Some(out.account.clone()).filter(|id| !id.is_empty())),
+            None => error.is::<smtp::AuthFailed>().then_some(None),
+        };
+        if let Some(account_id) = refused {
+            return if error.is::<mail::NeedsAppPassword>() {
+                NimbraError::NeedsAppPassword { account_id }
+            } else {
+                NimbraError::SignedOut { account_id }
+            };
         }
         if error.is::<mail::Offline>() {
             return NimbraError::Offline;
@@ -135,6 +147,34 @@ mod tests {
         assert!(matches!(
             NimbraError::Offline.for_account("c3"),
             NimbraError::Offline
+        ));
+    }
+
+    #[test]
+    fn a_google_password_where_an_app_password_is_needed_says_so_from_either_server() {
+        let imap = anyhow::Error::from(mail::SignedOut {
+            account: String::new(),
+        })
+        .context(mail::NeedsAppPassword);
+        let smtp = anyhow::Error::from(smtp::AuthFailed).context(mail::NeedsAppPassword);
+        for error in [imap, smtp] {
+            let refused = NimbraError::from(error);
+            assert!(matches!(
+                refused,
+                NimbraError::NeedsAppPassword { account_id: None }
+            ));
+            assert!(matches!(
+                refused.for_account("c3"),
+                NimbraError::NeedsAppPassword { account_id: Some(id) } if id == "c3"
+            ));
+        }
+        let theirs = anyhow::Error::from(mail::SignedOut {
+            account: "a1b2".into(),
+        })
+        .context(mail::NeedsAppPassword);
+        assert!(matches!(
+            NimbraError::from(theirs),
+            NimbraError::NeedsAppPassword { account_id: Some(id) } if id == "a1b2"
         ));
     }
 }

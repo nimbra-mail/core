@@ -129,7 +129,12 @@ fn sign_in<S: Read + Write>(
 ) -> Result<()> {
     let refused = |reply: &Reply| -> anyhow::Error {
         if matches!(reply.code, 535 | 534) {
-            AuthFailed.into()
+            let refused = anyhow::Error::from(AuthFailed);
+            if mail::asks_for_app_password(&reply.text()) {
+                refused.context(mail::NeedsAppPassword)
+            } else {
+                refused
+            }
         } else {
             reply.error("signing in")
         }
@@ -656,6 +661,27 @@ mod tests {
         let error = signed_in(&mut session, "me", &pw("pw")).unwrap_err();
         assert!(!error.is::<AuthFailed>());
         assert_eq!(sent(&session), "EHLO [127.0.0.1]\r\n");
+    }
+
+    #[test]
+    fn gmails_own_password_with_two_step_verification_asks_for_an_app_password() {
+        let mut session = Fake::new(&format!(
+            "{EHLO}534-5.7.9 Application-specific password required. Learn more at\r\n534 5.7.9  https://support.google.com/mail/?p=InvalidSecondFactor x\r\n"
+        ));
+        let error = signed_in(&mut session, "jo@gmail.com", &pw("typed-secret")).unwrap_err();
+        assert!(error.is::<AuthFailed>());
+        assert!(error.is::<crate::mail::NeedsAppPassword>());
+        assert!(!format!("{error:#}").contains("typed-secret"));
+    }
+
+    #[test]
+    fn a_wrong_app_password_is_only_auth_failed() {
+        let mut session = Fake::new(&format!(
+            "{EHLO}535-5.7.8 Username and Password not accepted. For more information, go to\r\n535 5.7.8  https://support.google.com/mail/?p=BadCredentials x\r\n"
+        ));
+        let error = signed_in(&mut session, "jo@gmail.com", &pw("wrong")).unwrap_err();
+        assert!(error.is::<AuthFailed>());
+        assert!(!error.is::<crate::mail::NeedsAppPassword>());
     }
 
     #[test]
