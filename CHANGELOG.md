@@ -4,6 +4,8 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-27
+
 ### Breaking
 - `TextSize` has a new variant, `ExtraLarge`: a `match` on it covers that too.
 - `Summary` has a new field, `brand_domain`: code that builds a `Summary` sets it too (`None` when unknown).
