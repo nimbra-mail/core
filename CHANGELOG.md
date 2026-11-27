@@ -6,6 +6,7 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ### Breaking
 - `TextSize` has a new variant, `ExtraLarge`: a `match` on it covers that too.
+- `Settings` has a new field, `interface_zoom`: code that builds a `Settings` field by field sets it too (or uses `..Settings::default()`).
 
 ### Added
 - `TextSize::ExtraLarge` (saved as `"extralarge"`): 19pt text on 32pt lines in the reader.
