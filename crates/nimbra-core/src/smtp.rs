@@ -92,7 +92,8 @@ fn open(
             Session::new(tls::upgrade(plain.stream, &server.host)?)
         }
     };
-    let extensions = signed_in(&mut session, username, secret).map_err(mail::before_sending)?;
+    let extensions =
+        signed_in(&mut session, server, username, secret).map_err(mail::before_sending)?;
     Ok((session, extensions))
 }
 
@@ -113,16 +114,18 @@ fn start_tls<S: Read + Write>(session: &mut Session<S>) -> Result<()> {
 /// Once the connection is secure: EHLO (again, after STARTTLS) and AUTH.
 fn signed_in<S: Read + Write>(
     session: &mut Session<S>,
+    server: &Server,
     username: &str,
     secret: &Secret,
 ) -> Result<Extensions> {
     let extensions = session.ehlo()?;
-    sign_in(session, &extensions, username, secret)?;
+    sign_in(session, server, &extensions, username, secret)?;
     Ok(extensions)
 }
 
 fn sign_in<S: Read + Write>(
     session: &mut Session<S>,
+    server: &Server,
     extensions: &Extensions,
     username: &str,
     secret: &Secret,
@@ -130,7 +133,7 @@ fn sign_in<S: Read + Write>(
     let refused = |reply: &Reply| -> anyhow::Error {
         if matches!(reply.code, 535 | 534) {
             let refused = anyhow::Error::from(AuthFailed);
-            if mail::asks_for_app_password(&reply.text()) {
+            if server.is_gmail_smtp() && mail::asks_for_app_password(&reply.text()) {
                 refused.context(mail::NeedsAppPassword)
             } else {
                 refused
@@ -517,6 +520,14 @@ mod tests {
         Secret::Password(password.into())
     }
 
+    fn gmail() -> Server {
+        Server::new("smtp.gmail.com", 465, Security::Tls)
+    }
+
+    fn other() -> Server {
+        Server::new("smtp.example.com", 587, Security::StartTls)
+    }
+
     fn sent(session: &Session<Fake>) -> String {
         String::from_utf8(session.stream.sent.clone()).unwrap()
     }
@@ -536,7 +547,8 @@ mod tests {
         );
         let mut session = Fake::new(&answers);
         session.greeting().unwrap();
-        let extensions = signed_in(&mut session, "me@example.com", &pw("secret")).unwrap();
+        let extensions =
+            signed_in(&mut session, &other(), "me@example.com", &pw("secret")).unwrap();
         let message = b"Subject: Hi\nTo: a@example.com\n\n.hidden\r\n..two\rlast";
         deliver(
             &mut session,
@@ -629,7 +641,7 @@ mod tests {
         let mut session = Fake::new(
             "250-mail.example.com\r\n250 AUTH LOGIN\r\n334 VXNlcm5hbWU6\r\n334 UGFzc3dvcmQ6\r\n235 OK\r\n",
         );
-        signed_in(&mut session, "me", &pw("pa ss")).unwrap();
+        signed_in(&mut session, &other(), "me", &pw("pa ss")).unwrap();
         assert_eq!(
             sent(&session),
             format!(
@@ -643,14 +655,14 @@ mod tests {
     #[test]
     fn a_rejected_password_is_auth_failed() {
         let mut session = Fake::new(&format!("{EHLO}535 5.7.8 Authentication failed\r\n"));
-        let error = signed_in(&mut session, "me", &pw("wrong")).unwrap_err();
+        let error = signed_in(&mut session, &other(), "me", &pw("wrong")).unwrap_err();
         assert!(error.is::<AuthFailed>());
         assert!(!format!("{error:#}").contains("wrong"));
 
         let mut session =
             Fake::new("250-x\r\n250 AUTH LOGIN\r\n334 VXNlcm5hbWU6\r\n535 No such user\r\n");
         assert!(
-            signed_in(&mut session, "me", &pw("pw"))
+            signed_in(&mut session, &other(), "me", &pw("pw"))
                 .unwrap_err()
                 .is::<AuthFailed>()
         );
@@ -658,9 +670,19 @@ mod tests {
         assert!(!sent(&session).contains(&STANDARD.encode("pw")));
 
         let mut session = Fake::new("250-x\r\n250 SIZE 10\r\n");
-        let error = signed_in(&mut session, "me", &pw("pw")).unwrap_err();
+        let error = signed_in(&mut session, &other(), "me", &pw("pw")).unwrap_err();
         assert!(!error.is::<AuthFailed>());
         assert_eq!(sent(&session), "EHLO [127.0.0.1]\r\n");
+    }
+
+    #[test]
+    fn another_server_asking_for_an_app_password_is_only_auth_failed() {
+        let mut session = Fake::new(&format!(
+            "{EHLO}535 5.7.8 Application-specific password required\r\n"
+        ));
+        let error = signed_in(&mut session, &other(), "me", &pw("pw")).unwrap_err();
+        assert!(error.is::<AuthFailed>());
+        assert!(!error.is::<crate::mail::NeedsAppPassword>());
     }
 
     #[test]
@@ -668,7 +690,8 @@ mod tests {
         let mut session = Fake::new(&format!(
             "{EHLO}534-5.7.9 Application-specific password required. Learn more at\r\n534 5.7.9  https://support.google.com/mail/?p=InvalidSecondFactor x\r\n"
         ));
-        let error = signed_in(&mut session, "jo@gmail.com", &pw("typed-secret")).unwrap_err();
+        let error =
+            signed_in(&mut session, &gmail(), "jo@gmail.com", &pw("typed-secret")).unwrap_err();
         assert!(error.is::<AuthFailed>());
         assert!(error.is::<crate::mail::NeedsAppPassword>());
         assert!(!format!("{error:#}").contains("typed-secret"));
@@ -679,7 +702,7 @@ mod tests {
         let mut session = Fake::new(&format!(
             "{EHLO}535-5.7.8 Username and Password not accepted. For more information, go to\r\n535 5.7.8  https://support.google.com/mail/?p=BadCredentials x\r\n"
         ));
-        let error = signed_in(&mut session, "jo@gmail.com", &pw("wrong")).unwrap_err();
+        let error = signed_in(&mut session, &gmail(), "jo@gmail.com", &pw("wrong")).unwrap_err();
         assert!(error.is::<AuthFailed>());
         assert!(!error.is::<crate::mail::NeedsAppPassword>());
     }
@@ -688,7 +711,7 @@ mod tests {
     fn a_token_signs_in_with_xoauth2() {
         let mut session = Fake::new("250-x\r\n250 AUTH LOGIN XOAUTH2\r\n235 2.7.0 OK\r\n");
         let token = Secret::Bearer("EwBtoken".into());
-        signed_in(&mut session, "ana@outlook.com", &token).unwrap();
+        signed_in(&mut session, &other(), "ana@outlook.com", &token).unwrap();
         let initial = STANDARD.encode("user=ana@outlook.com\x01auth=Bearer EwBtoken\x01\x01");
         assert_eq!(
             sent(&session),
@@ -700,14 +723,14 @@ mod tests {
         let mut session = Fake::new(&format!(
             "250-x\r\n250 AUTH XOAUTH2\r\n334 {challenge}\r\n535 5.7.3 Authentication unsuccessful\r\n"
         ));
-        let error = signed_in(&mut session, "ana@outlook.com", &token).unwrap_err();
+        let error = signed_in(&mut session, &other(), "ana@outlook.com", &token).unwrap_err();
         assert!(error.is::<AuthFailed>());
         assert!(sent(&session).ends_with(&format!("AUTH XOAUTH2 {initial}\r\n\r\n")));
         assert!(!format!("{error:#}").contains("EwBtoken"));
 
         // Not offered: nothing is sent.
         let mut session = Fake::new(EHLO);
-        assert!(signed_in(&mut session, "ana@outlook.com", &token).is_err());
+        assert!(signed_in(&mut session, &other(), "ana@outlook.com", &token).is_err());
         assert_eq!(sent(&session), "EHLO [127.0.0.1]\r\n");
     }
 

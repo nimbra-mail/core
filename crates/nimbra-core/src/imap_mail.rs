@@ -480,11 +480,12 @@ impl Client {
             return Ok(folders);
         }
         let names = connection.session.list(Some(""), Some("*"))?;
+        let gmail = self.servers.is_gmail();
         let mut folders: Vec<Folder> = names
             .iter()
             .filter(|name| folder_name_ok(name.name()))
             .filter_map(|name| {
-                let role = role_of(name.name(), name.attributes())?;
+                let role = role_of(name.name(), name.attributes(), gmail)?;
                 Some(Folder {
                     name: name.name().to_string(),
                     role,
@@ -1997,7 +1998,7 @@ fn sign_in<S: Read + Write>(
                     sent: std::cell::Cell::new(false),
                 },
             );
-            return signed_in_or_refused(signed_in, account);
+            return signed_in_or_refused(signed_in, servers, account);
         }
     };
     let signed_in = if plain {
@@ -2011,12 +2012,13 @@ fn sign_in<S: Read + Write>(
     } else {
         client.login(&servers.username, password)
     };
-    signed_in_or_refused(signed_in, account)
+    signed_in_or_refused(signed_in, servers, account)
 }
 
 /// The session, or why there is none: NO or BAD is a refused sign-in.
 fn signed_in_or_refused<S: Read + Write>(
     signed_in: std::result::Result<::imap::Session<S>, (::imap::Error, ::imap::Client<S>)>,
+    servers: &Servers,
     account: &str,
 ) -> Result<::imap::Session<S>> {
     match signed_in {
@@ -2025,7 +2027,7 @@ fn signed_in_or_refused<S: Read + Write>(
         // is what tells someone setting up an account what to do.
         Err((::imap::Error::No(no), _)) => {
             let said = said(&no.information);
-            let app_password = crate::mail::asks_for_app_password(&said);
+            let app_password = servers.is_gmail() && crate::mail::asks_for_app_password(&said);
             let refused = anyhow!(SignedOut {
                 account: account.to_string(),
             })
@@ -2550,7 +2552,7 @@ fn folder_name_ok(name: &str) -> bool {
 /// What a listed folder is for, from its special-use attributes first, then its name.
 /// `None` for one that is not a folder of its own: not selectable, or one that shows
 /// messages kept elsewhere again (Gmail's All Mail, Starred and Important).
-fn role_of(name: &str, attributes: &[imap_proto::NameAttribute<'_>]) -> Option<Role> {
+fn role_of(name: &str, attributes: &[imap_proto::NameAttribute<'_>], gmail: bool) -> Option<Role> {
     use imap_proto::NameAttribute as A;
     let extension = |wanted: &str| {
         attributes
@@ -2563,8 +2565,9 @@ fn role_of(name: &str, attributes: &[imap_proto::NameAttribute<'_>]) -> Option<R
     if name.eq_ignore_ascii_case("INBOX") {
         return Some(Role::Inbox);
     }
-    // RFC 8457's \Important, which Gmail gives its Important.
-    if extension("\\Important") {
+    // Gmail's Important (RFC 8457's \Important) only shows mail kept elsewhere; on other
+    // servers it can be a real folder.
+    if gmail && extension("\\Important") {
         return None;
     }
     let special = attributes.iter().find_map(|a| match a {
@@ -2782,18 +2785,26 @@ mod tests {
     }
 
     fn scripted_sign_in(answers: &str, secret: &Secret) -> (Result<()>, String) {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let stream = Scripted {
-            answers: std::io::Cursor::new(answers.as_bytes().to_vec()),
-            sent: sent.clone(),
-        };
         // STARTTLS servers: no greeting is read here (`starttls` read it).
         let servers = Servers {
             username: "ana@outlook.com".into(),
             imap: crate::servers::Server::new("imap.example.com", 143, Security::StartTls),
             smtp: crate::servers::Server::new("smtp.example.com", 587, Security::StartTls),
         };
-        let result = sign_in(&servers, secret, "acct", stream).map(|_| ());
+        scripted_sign_in_to(&servers, answers, secret)
+    }
+
+    fn scripted_sign_in_to(
+        servers: &Servers,
+        answers: &str,
+        secret: &Secret,
+    ) -> (Result<()>, String) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let stream = Scripted {
+            answers: std::io::Cursor::new(answers.as_bytes().to_vec()),
+            sent: sent.clone(),
+        };
+        let result = sign_in(servers, secret, "acct", stream).map(|_| ());
         let sent = String::from_utf8(sent.lock().unwrap().clone()).unwrap();
         (result, sent)
     }
@@ -2853,13 +2864,27 @@ mod tests {
         );
     }
 
+    const ASP_REQUIRED: &str = "+ \r\na2 NO [ALERT] Application-specific password required: https://support.google.com/accounts/answer/185833 (Failure)\r\n";
+
+    #[test]
+    fn another_server_asking_for_an_app_password_is_only_signed_out() {
+        let caps = "* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\na1 OK done\r\n";
+        let (result, _) = scripted_sign_in(
+            &format!("{caps}{ASP_REQUIRED}"),
+            &Secret::Password("pw".into()),
+        );
+        let error = result.unwrap_err();
+        assert!(error.is::<SignedOut>());
+        assert!(!error.is::<crate::mail::NeedsAppPassword>());
+    }
+
     #[test]
     fn gmails_own_password_with_two_step_verification_asks_for_an_app_password() {
-        let caps = "* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=XOAUTH2\r\na1 OK done\r\n";
-        let (result, _) = scripted_sign_in(
-            &format!(
-                "{caps}+ \r\na2 NO [ALERT] Application-specific password required: https://support.google.com/accounts/answer/185833 (Failure)\r\n"
-            ),
+        let caps =
+            "* OK Gimap ready\r\n* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=XOAUTH2\r\na1 OK done\r\n";
+        let (result, _) = scripted_sign_in_to(
+            &crate::servers::gmail("jo@gmail.com"),
+            &format!("{caps}{ASP_REQUIRED}"),
             &Secret::Password("typed-secret".into()),
         );
         let error = result.unwrap_err();
@@ -2885,6 +2910,13 @@ mod tests {
     }
 
     #[test]
+    fn an_important_folder_elsewhere_is_a_label() {
+        use imap_proto::NameAttribute as A;
+        let important = [A::Extension("\\Important".into())];
+        assert_eq!(role_of("Important", &important, false), Some(Role::Label));
+    }
+
+    #[test]
     fn gmails_virtual_folders_are_not_labels() {
         use imap_proto::NameAttribute as A;
         let important = [A::NoInferiors, A::Extension("\\Important".into())];
@@ -2894,12 +2926,15 @@ mod tests {
             ("[Gmail]/Important", &important[..]),
             ("[Gmail]", &[A::NoSelect][..]),
         ] {
-            assert_eq!(role_of(name, attributes), None, "{name}");
+            assert_eq!(role_of(name, attributes, true), None, "{name}");
         }
-        assert_eq!(role_of("[Gmail]/Sent Mail", &[A::Sent]), Some(Role::Sent));
-        assert_eq!(role_of("[Gmail]/Spam", &[A::Junk]), Some(Role::Junk));
-        assert_eq!(role_of("INBOX", &[]), Some(Role::Inbox));
-        assert_eq!(role_of("Receipts", &[]), Some(Role::Label));
+        assert_eq!(
+            role_of("[Gmail]/Sent Mail", &[A::Sent], true),
+            Some(Role::Sent)
+        );
+        assert_eq!(role_of("[Gmail]/Spam", &[A::Junk], true), Some(Role::Junk));
+        assert_eq!(role_of("INBOX", &[], true), Some(Role::Inbox));
+        assert_eq!(role_of("Receipts", &[], true), Some(Role::Label));
     }
 
     #[test]

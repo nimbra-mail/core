@@ -9,7 +9,7 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 - `NimbraError` has a new case, `NeedsAppPassword(accountId:)`: as `SignedOut`, when Gmail refused the Google account's own password because, with 2-Step Verification on, it takes only an app password. A `switch` on `NimbraError` covers it.
 
 ### Added
-- In the crate: `servers::gmail(email)`, `Servers::is_gmail()`, `Servers::normalize_password(typed)` (a line break or tab around a password goes; a Google app password loses the spaces Google shows it with, and no other provider's password loses any) and `mail::NeedsAppPassword`, next to `mail::SignedOut` from IMAP and `smtp::AuthFailed` from SMTP. `addImapAccount` and `updateImapPassword` normalize the password before checking and keeping it.
+- In the crate: `servers::gmail(email)`, `Servers::is_gmail()`, `Servers::normalize_password(typed)` (control characters around a password, such as a line break or tab, go; a Google app password loses the spaces Google shows it with, and no other provider's password loses any) and `mail::NeedsAppPassword`, next to `mail::SignedOut` from IMAP and `smtp::AuthFailed` from SMTP. `addImapAccount` and `updateImapPassword` normalize the password before checking and keeping it.
 
 ### Fixed
 - Two `addImapAccount` (or sign-in) calls for the same address at once no longer both keep it: the second is refused as already here and its saved sign-in forgotten.

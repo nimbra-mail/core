@@ -45,6 +45,10 @@ impl Server {
         }
     }
 
+    pub(crate) fn is_gmail_smtp(&self) -> bool {
+        matches!(self.host.as_str(), "smtp.gmail.com" | "smtp.googlemail.com")
+    }
+
     /// Refuses a host that is not a plain DNS name (or IP address) and port 0.
     pub fn check(&self) -> Result<()> {
         if self.port == 0 {
@@ -74,15 +78,13 @@ impl Servers {
         matches!(
             self.imap.host.as_str(),
             "imap.gmail.com" | "imap.googlemail.com"
-        ) && matches!(
-            self.smtp.host.as_str(),
-            "smtp.gmail.com" | "smtp.googlemail.com"
-        )
+        ) && self.smtp.is_gmail_smtp()
     }
 
-    /// The password to sign in with, from what was typed or pasted: without a line break
-    /// or tab around it, and for Gmail, a Google app password without the spaces Google
-    /// shows it with. Any other provider's password may hold spaces, so they stay.
+    /// The password to sign in with, from what was typed or pasted: without control
+    /// characters (line breaks, tabs) around it, and for Gmail, a Google app password
+    /// without the spaces Google shows it with. Any other provider's password may hold
+    /// spaces, so they stay.
     pub fn normalize_password(&self, typed: &str) -> String {
         let typed = typed.trim_matches(|c: char| c.is_control());
         if !self.is_gmail() {
