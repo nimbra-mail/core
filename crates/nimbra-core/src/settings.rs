@@ -77,6 +77,29 @@ pub struct Settings {
     /// release notes. Empty until a version that keeps it has run.
     #[serde(default)]
     pub last_version: String,
+    /// How large the whole interface is drawn, in percent (`ZOOM_STEPS`); read it through
+    /// `zoom`, which keeps it to a step.
+    #[serde(default = "full_size")]
+    pub interface_zoom: u16,
+}
+
+/// The interface sizes on offer, in percent.
+pub const ZOOM_STEPS: [u16; 4] = [90, 100, 110, 125];
+
+fn full_size() -> u16 {
+    100
+}
+
+impl Settings {
+    /// The interface's scale (1 is its own size): the step nearest to what was saved, so a
+    /// value edited by hand can't draw it at a size it was never laid out for.
+    pub fn zoom(&self) -> f32 {
+        let step = ZOOM_STEPS
+            .into_iter()
+            .min_by_key(|step| step.abs_diff(self.interface_zoom))
+            .unwrap_or(100);
+        f32::from(step) / 100.
+    }
 }
 
 /// One of an account's signatures.
@@ -176,6 +199,7 @@ impl Default for Settings {
             usage_counts: true,
             auto_update: true,
             last_version: String::new(),
+            interface_zoom: full_size(),
         }
     }
 }
@@ -551,6 +575,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_zoom_is_always_one_of_the_steps() {
+        let with = |percent| Settings {
+            interface_zoom: percent,
+            ..Settings::default()
+        };
+        assert_eq!(Settings::default().zoom(), 1.);
+        assert_eq!(with(125).zoom(), 1.25);
+        assert_eq!(with(90).zoom(), 0.9);
+        // Saved by hand, or by a later version with other steps: the nearest one.
+        assert_eq!(with(300).zoom(), 1.25);
+        assert_eq!(with(0).zoom(), 0.9);
+        assert_eq!(with(104).zoom(), 1.);
+        // A settings file from before the option opens at full size.
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.zoom(), 1.);
+    }
 
     #[test]
     fn text_sizes_grow_in_order_and_are_saved_by_name() {
