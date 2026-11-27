@@ -67,7 +67,7 @@ pub struct Settings {
     pub welcomed: bool,
     /// The Dock icon shows the inbox's unread count.
     pub dock_badge: bool,
-    /// The size of text in the reader.
+    /// The size of mail text in the reader (the Mac app sizes its list and HTML view by it too).
     pub reader_text: TextSize,
     /// Count launches anonymously (`usage.rs`).
     pub usage_counts: bool,
@@ -107,6 +107,8 @@ pub enum TextSize {
     Small,
     Default,
     Large,
+    /// Saved as "extralarge".
+    ExtraLarge,
 }
 
 impl TextSize {
@@ -116,6 +118,7 @@ impl TextSize {
             TextSize::Small => (13.5, 23.),
             TextSize::Default => (15., 26.),
             TextSize::Large => (17., 29.),
+            TextSize::ExtraLarge => (19., 32.),
         }
     }
 }
@@ -548,6 +551,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn text_sizes_grow_in_order_and_are_saved_by_name() {
+        let sizes = [
+            TextSize::Small,
+            TextSize::Default,
+            TextSize::Large,
+            TextSize::ExtraLarge,
+        ];
+        for pair in sizes.windows(2) {
+            assert!(pair[0].metrics().0 < pair[1].metrics().0);
+            assert!(pair[0].metrics().1 < pair[1].metrics().1);
+        }
+        assert_eq!(
+            serde_json::to_string(&TextSize::ExtraLarge).unwrap(),
+            "\"extralarge\""
+        );
+        let large: TextSize = serde_json::from_str("\"large\"").unwrap();
+        assert_eq!(large, TextSize::Large);
+    }
     use std::sync::mpsc;
 
     /// What a test writer saw, and a gate that holds up the first write.
