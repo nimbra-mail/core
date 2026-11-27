@@ -34,6 +34,8 @@ pub struct Headers {
     pub cc: Vec<Person>,
     pub subject: String,
     pub timestamp_ms: i64,
+    /// The topmost Authentication-Results, the receiving server's (`mail::dmarc_domain`).
+    pub authentication: String,
 }
 
 /// One whole message. `message_key` is the backend's id for it, carried by its attachments.
@@ -139,6 +141,19 @@ pub fn headers(raw_header_bytes: &[u8]) -> Option<Headers> {
         cc: people_of(parsed.all_cc()),
         subject: parsed.subject().map(clean_header).unwrap_or_default(),
         timestamp_ms: timestamp_ms(&parsed),
+        // The first in the block, the topmost: `header_raw` would give the last one, which
+        // the sender could have written.
+        authentication: parsed
+            .headers()
+            .iter()
+            .find(|h| h.name().eq_ignore_ascii_case("Authentication-Results"))
+            .and_then(|h| {
+                parsed
+                    .raw_message()
+                    .get(h.offset_start as usize..h.offset_end as usize)
+            })
+            .map(|raw| String::from_utf8_lossy(raw).trim().to_string())
+            .unwrap_or_default(),
     })
 }
 
@@ -486,6 +501,20 @@ fn inline_images(html: &mut String, parsed: &Parsed) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_topmost_authentication_results_is_kept() {
+        let raw = b"Authentication-Results: mx.example.net; dmarc=pass header.from=shop.com\r\nAuthentication-Results: evil.example; dmarc=pass header.from=bank.com\r\nFrom: Shop <hi@shop.com>\r\nSubject: Hi\r\n\r\n";
+        let headers = headers(raw).unwrap();
+        assert_eq!(
+            headers.authentication,
+            "mx.example.net; dmarc=pass header.from=shop.com"
+        );
+        assert_eq!(
+            crate::mail::dmarc_domain(&headers.authentication, &headers.from.address),
+            Some("shop.com".into())
+        );
+    }
 
     fn crlf(text: &str) -> Vec<u8> {
         text.replace('\n', "\r\n").into_bytes()

@@ -139,6 +139,10 @@ struct Entry {
     snippet: String,
     seen: bool,
     flagged: bool,
+    /// The sender's domain when the message passed DMARC for it (`mail::dmarc_domain`).
+    /// (Indexes saved before this was kept still load.)
+    #[serde(default)]
+    dmarc_domain: Option<String>,
 }
 
 /// What is known of one folder.
@@ -744,11 +748,14 @@ impl Client {
                     .first()
                     .or(headers.in_reply_to.as_ref())
                     .unwrap_or(&message_id);
+                let dmarc_domain =
+                    crate::mail::dmarc_domain(&headers.authentication, &headers.from.address);
                 rows.push((
                     uid,
                     Entry {
                         thread: thread_id(root),
                         message_id,
+                        dmarc_domain,
                         from: headers.from,
                         to: headers.to,
                         cc: headers.cc,
@@ -1760,6 +1767,7 @@ impl Provider for Client {
                 snippet: String::new(),
                 seen: true,
                 flagged: false,
+                dmarc_domain: None,
             };
             self.delete_copy(
                 connection,
@@ -2457,10 +2465,14 @@ fn summary(id: &str, copies: &[(&Folder, &Entry)], recipient: bool) -> Summary {
             })
         }
     });
+    let brand_domain = latest
+        .filter(|_| !recipient)
+        .and_then(|m| m.dmarc_domain.clone());
     Summary {
         id: id.to_string(),
         sender,
         sender_address,
+        brand_domain,
         subject: messages
             .first()
             .map(|m| m.subject.clone())
@@ -3045,6 +3057,7 @@ mod tests {
             snippet: format!("snippet {id}"),
             seen,
             flagged: false,
+            dmarc_domain: None,
         }
     }
 

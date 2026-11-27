@@ -999,7 +999,8 @@ impl Client {
                 .query("metadataHeaders", "From")
                 .query("metadataHeaders", "To")
                 .query("metadataHeaders", "Cc")
-                .query("metadataHeaders", "Subject"),
+                .query("metadataHeaders", "Subject")
+                .query("metadataHeaders", "Authentication-Results"),
             None,
         )?;
         let first = thread.messages.first();
@@ -1018,6 +1019,13 @@ impl Client {
             id: thread.id,
             sender: sender_name(named),
             sender_address: address_of(named),
+            // Gmail lists a message's headers top down: the first is Google's own.
+            brand_domain: last.filter(|_| !recipient).and_then(|m| {
+                crate::mail::dmarc_domain(
+                    m.header("Authentication-Results"),
+                    &address_of(m.header("From")),
+                )
+            }),
             subject: first
                 .map(|m| m.header("Subject").trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -2191,6 +2199,7 @@ mod tests {
             id: "t".into(),
             sender: String::new(),
             sender_address: String::new(),
+            brand_domain: None,
             subject: String::new(),
             snippet: String::new(),
             timestamp_ms: 0,
