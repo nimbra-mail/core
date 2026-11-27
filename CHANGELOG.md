@@ -11,6 +11,7 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 - Every message of a thread keeps its original HTML: `Earlier::html` (from `Row::fill`), and kept threads (`MailThread`) carry it for each message, not only the latest.
 
 ### Changed
+- `composing::answer`: a reply to my own message (From is `me`) goes to its To (and Cc for reply-all) without me, not back to me; a note only to myself still comes back to me.
 - A reply whose `ReplyTo::thread_id` is empty (written from another account than its thread's) is sent and saved to Gmail without a thread, with its In-Reply-To and References as before; it used to be refused.
 - `Row::loaded` is kept as `fetched`. Rows kept before earlier messages had their HTML read as not fetched, so their messages are downloaded again when opened.
 
