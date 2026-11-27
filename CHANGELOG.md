@@ -4,6 +4,8 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-27
+
 ### Breaking
 - `Message` and `listing::Header` have a new field, `bcc` (who a sender's own copy went to unseen; `Header`'s reads as empty from data kept before it), and `composing::Answered` has new fields `cc` and `bcc`: code that builds them field by field sets them too.
 
