@@ -4,6 +4,15 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Breaking
+- `Earlier` has a new field, `html`: code that builds an `Earlier` field by field sets it too (`None` when the message has no HTML).
+
+### Added
+- Every message of a thread keeps its original HTML: `Earlier::html` (from `Row::fill`), and kept threads (`MailThread`) carry it for each message, not only the latest.
+
+### Changed
+- `Row::loaded` is kept as `fetched`. Rows kept before earlier messages had their HTML read as not fetched, so their messages are downloaded again when opened.
+
 ## [0.1.3] - 2026-11-27
 
 ### Breaking

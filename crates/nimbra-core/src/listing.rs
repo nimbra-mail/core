@@ -149,6 +149,9 @@ pub struct Earlier {
     pub expanded: bool,
     #[serde(default)]
     pub header: Header,
+    /// Its original HTML, if it has one, for the original view.
+    #[serde(default)]
+    pub html: Option<String>,
 }
 
 /// One thread in a mailbox's list: its row, and once fetched its messages.
@@ -176,7 +179,9 @@ pub struct Row {
     pub earlier: Shared<Vec<Earlier>>,
     /// The latest message's text.
     pub body: Shared<Vec<Block>>,
-    /// Whether `body` and `earlier` have been fetched.
+    /// Whether `body` and `earlier` have been fetched. Kept as `fetched`: rows kept as
+    /// `loaded`, before earlier messages kept their HTML, are fetched again when opened.
+    #[serde(rename = "fetched")]
     pub loaded: bool,
     /// Who and what a reply answers (the latest message), once the thread is loaded.
     pub reply: Option<(String, mail::ReplyTo)>,
@@ -256,6 +261,7 @@ impl Row {
                 sender: message.sender,
                 snippet: message.snippet,
                 blocks: message.blocks,
+                html: message.html,
                 expanded: false,
             })
             .collect::<Vec<_>>()
@@ -1191,7 +1197,43 @@ mod tests {
         assert_eq!(row.id.as_deref(), Some("t1"));
         assert_eq!(row.thread.as_deref(), Some("2"));
         assert_eq!(row.earlier[0].sender, "Ben");
-        assert!(row.loaded && row.unread);
+        assert!(row.unread);
+        // Kept before earlier messages kept their HTML: fetched again when opened.
+        assert!(!row.loaded);
+    }
+
+    #[test]
+    fn a_fetched_thread_keeps_every_messages_html() {
+        let message = |sender: &str, html: Option<&str>| mail::Message {
+            from: mail::Person::default(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            reply_to: None,
+            attachments: Vec::new(),
+            unsubscribe: None,
+            address: String::new(),
+            message_id: String::new(),
+            others: Vec::new(),
+            sender: sender.into(),
+            snippet: format!("from {sender}"),
+            timestamp_ms: 0,
+            blocks: Vec::new(),
+            html: html.map(str::to_string),
+        };
+        let mut row = Row::default();
+        row.fill(vec![
+            message("Ana", Some("<p>first</p>")),
+            message("Ben", None),
+            message("Cy", Some("<p>latest</p>")),
+        ]);
+        assert_eq!(row.html.as_deref(), Some("<p>latest</p>"));
+        // Newest first.
+        assert_eq!(row.earlier[0].html, None);
+        assert_eq!(row.earlier[1].html.as_deref(), Some("<p>first</p>"));
+        // And it stays fetched, with its HTML, once kept.
+        let kept: Row = serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert!(kept.loaded);
+        assert_eq!(kept.earlier[1].html.as_deref(), Some("<p>first</p>"));
     }
 
     #[test]
