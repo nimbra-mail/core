@@ -4,6 +4,13 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Breaking
+- `Message` and `listing::Header` have a new field, `bcc` (who a sender's own copy went to unseen; `Header`'s reads as empty from data kept before it), and `composing::Answered` has new fields `cc` and `bcc`: code that builds them field by field sets them too.
+
+### Changed
+- IMAP search understands more of Gmail's search words: `bcc:`, `has:attachment` (a multipart/mixed message), and `newer_than:` and `older_than:` with days, weeks, months or years (`7d`, `2w`, `3m`, `1y`). They used to be searched for as text.
+- `composing::answer`: reply-all keeps everyone in the field they were in. On someone else's message, the sender and their To go on To and their Cc on Cc (they all went on To before). On my own message, its To on To and, for reply-all, its Cc on Cc and its Bcc on Bcc.
+
 ## [0.1.4] - 2026-11-27
 
 ### Breaking

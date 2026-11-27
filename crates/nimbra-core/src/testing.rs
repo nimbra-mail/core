@@ -206,6 +206,7 @@ impl Provider for Fake {
                 address: self.email.clone(),
             }],
             cc: Vec::new(),
+            bcc: Vec::new(),
             reply_to: None,
             attachments: Vec::new(),
             unsubscribe: None,
