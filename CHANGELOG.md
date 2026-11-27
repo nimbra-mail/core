@@ -4,6 +4,11 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-27
+
+### Breaking
+- `Settings` has a new field, `list_width`: code that builds a `Settings` field by field sets it too (or uses `..Settings::default()`).
+
 ### Added
 - `Settings::list_width`: the mail list's width, as dragged (452 by default, and for settings kept before it).
 
