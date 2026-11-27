@@ -1173,6 +1173,7 @@ impl Client {
                 from: person(m.header("From")),
                 to: people(m.header("To")),
                 cc: people(m.header("Cc")),
+                bcc: people(m.header("Bcc")),
                 reply_to: people(m.header("Reply-To")).into_iter().next(),
                 attachments: m
                     .payload
@@ -1394,11 +1395,7 @@ impl Client {
         }
         let extra = self.kept_files(outgoing)?;
         let raw = outgoing.to_rfc822(true, &extra)?;
-        let thread_id = match &outgoing.reply {
-            Some(reply) if !is_id(&reply.thread_id) => bail!("unexpected thread id"),
-            Some(reply) => Some(reply.thread_id.clone()),
-            None => None,
-        };
+        let thread_id = thread_of(outgoing)?;
         let id = match id {
             Some(id) if is_draft_id(id) => Some(id),
             Some(_) => bail!("unexpected draft id"),
@@ -1492,11 +1489,7 @@ impl Client {
     pub fn send_message(&self, outgoing: &Outgoing) -> Result<()> {
         let extra = self.kept_files(outgoing).map_err(before_sending)?;
         let raw = outgoing.to_rfc822(false, &extra)?;
-        let thread_id = match &outgoing.reply {
-            Some(reply) if !is_id(&reply.thread_id) => bail!("unexpected thread id"),
-            Some(reply) => Some(reply.thread_id.clone()),
-            None => None,
-        };
+        let thread_id = thread_of(outgoing)?;
         if raw.len() > 1_000_000 {
             let mut metadata = serde_json::json!({});
             if let Some(thread_id) = thread_id {
@@ -1998,6 +1991,18 @@ fn met(message: &RawMessage) -> Met {
     }
 }
 
+/// The Gmail thread a message goes into: a reply's, unless it has none (a reply written
+/// from another account, whose thread is not this one's: its In-Reply-To and References
+/// still thread it for whoever gets it).
+fn thread_of(outgoing: &Outgoing) -> Result<Option<String>> {
+    match &outgoing.reply {
+        Some(reply) if reply.thread_id.is_empty() => Ok(None),
+        Some(reply) if !is_id(&reply.thread_id) => bail!("unexpected thread id"),
+        Some(reply) => Ok(Some(reply.thread_id.clone())),
+        None => Ok(None),
+    }
+}
+
 fn is_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric())
 }
@@ -2287,6 +2292,25 @@ mod tests {
             decode_entities("Tom &amp; Jerry&#39;s &lt;3 "),
             "Tom & Jerry’s <3"
         );
+    }
+
+    #[test]
+    fn a_reply_from_another_account_keeps_its_headers_but_no_thread() {
+        let mut message = outgoing("a@example.com", "Re: hi");
+        assert_eq!(thread_of(&message).unwrap(), None);
+        message.reply = Some(crate::mail::ReplyTo {
+            thread_id: "18c2f".into(),
+            message_id: "<m1@example.com>".into(),
+        });
+        assert_eq!(thread_of(&message).unwrap().as_deref(), Some("18c2f"));
+        // Written from another account: no Gmail thread, still a reply for whoever gets it.
+        message.reply.as_mut().unwrap().thread_id.clear();
+        assert_eq!(thread_of(&message).unwrap(), None);
+        let raw = String::from_utf8(message.to_rfc822(false, &[]).unwrap()).unwrap();
+        assert!(raw.contains("In-Reply-To: <m1@example.com>\r\n"));
+        // Anything else that is not an id is refused, as before.
+        message.reply.as_mut().unwrap().thread_id = "../x".into();
+        assert!(thread_of(&message).is_err());
     }
 
     fn outgoing(to: &str, subject: &str) -> Outgoing {

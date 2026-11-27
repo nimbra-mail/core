@@ -119,6 +119,10 @@ pub struct Answered {
     pub subject: String,
     /// The addresses it goes to (none for a forward).
     pub to: Vec<String>,
+    /// For reply-all, who was on Cc goes on Cc again, and on my own message who was on Bcc
+    /// goes on Bcc (`Header::bcc`): each where they were.
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     /// The earlier message, as text, folded under what is written and added when sent.
     pub quoted: Option<String>,
     /// The files that go along (a forward's).
@@ -193,6 +197,8 @@ pub fn answer(
         return Answered {
             subject,
             to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
             quoted: Some(quoted.join("\n").trim_end().to_string()),
             kept: header.attachments.clone(),
             reply: None,
@@ -203,23 +209,80 @@ pub fn answer(
     } else {
         Some(header.reply_address().to_string())
     };
-    let mut to = Vec::new();
-    if let Some(address) = address {
-        to.push(address);
-        if kind == Answer::ReplyAll {
-            let others = if header.from.address.is_empty() {
-                source.fallback_all.to_vec()
+    // Each address once, across the three fields, and never me.
+    #[derive(Default)]
+    struct Fields {
+        to: Vec<String>,
+        cc: Vec<String>,
+        bcc: Vec<String>,
+    }
+    impl Fields {
+        fn add(&mut self, field: usize, address: &str, me: &str) {
+            let known = |list: &[String]| list.iter().any(|a| a.eq_ignore_ascii_case(address));
+            if address.is_empty()
+                || address.eq_ignore_ascii_case(me)
+                || known(&self.to)
+                || known(&self.cc)
+                || known(&self.bcc)
+            {
+                return;
+            }
+            match field {
+                0 => self.to.push(address.to_string()),
+                1 => self.cc.push(address.to_string()),
+                _ => self.bcc.push(address.to_string()),
+            }
+        }
+        fn is_empty(&self) -> bool {
+            self.to.is_empty() && self.cc.is_empty() && self.bcc.is_empty()
+        }
+    }
+    let mut fields = Fields::default();
+    let all = kind == Answer::ReplyAll;
+    // My own message: answered to whom it went, as mail apps do, not back to me: its To,
+    // and for reply-all its Cc and Bcc, each in its own field. Only a note to myself comes
+    // back to me.
+    let mine = !header.from.address.is_empty() && header.from.address.eq_ignore_ascii_case(me);
+    if mine {
+        for person in &header.to {
+            fields.add(0, &person.address, me);
+        }
+        if all {
+            for person in &header.cc {
+                fields.add(1, &person.address, me);
+            }
+            for person in &header.bcc {
+                fields.add(2, &person.address, me);
+            }
+        }
+    }
+    if !(mine && !fields.is_empty())
+        && let Some(address) = address
+    {
+        if address.eq_ignore_ascii_case(me) {
+            // A note to myself.
+            fields.to.push(address);
+        } else {
+            fields.add(0, &address, me);
+        }
+        if all {
+            if header.from.address.is_empty() {
+                // Sample mail: who else, with no fields to tell them apart.
+                for other in source.fallback_all {
+                    fields.add(0, other, me);
+                }
             } else {
-                header.everyone()
-            };
-            for other in others {
-                let mine = other.eq_ignore_ascii_case(me);
-                if !mine && !to.iter().any(|known| known.eq_ignore_ascii_case(&other)) {
-                    to.push(other);
+                // The sender's To with the sender, and their Cc on Cc.
+                for person in &header.to {
+                    fields.add(0, &person.address, me);
+                }
+                for person in &header.cc {
+                    fields.add(1, &person.address, me);
                 }
             }
         }
     }
+    let Fields { to, cc, bcc } = fields;
     let intro = if when.is_empty() {
         format!("{from} wrote:")
     } else {
@@ -231,6 +294,8 @@ pub fn answer(
     Answered {
         subject,
         to,
+        cc,
+        bcc,
         quoted: quote_replies.then(|| quoted.join("\n").trim_end().to_string()),
         kept: Vec::new(),
         reply: source.reply_to.clone(),
@@ -326,10 +391,10 @@ mod tests {
         };
         let all = answer(Answer::ReplyAll, &source, "Me@example.com", "Tue", true);
         assert_eq!(all.subject, "Re: Lunch");
-        assert_eq!(
-            all.to,
-            ["ana@example.com", "ben@example.com", "cy@example.com"]
-        );
+        // The sender and their To on To, their Cc on Cc (Ana once, me never).
+        assert_eq!(all.to, ["ana@example.com", "ben@example.com"]);
+        assert_eq!(all.cc, ["cy@example.com"]);
+        assert!(all.bcc.is_empty());
         assert!(
             all.quoted
                 .unwrap()
@@ -337,6 +402,76 @@ mod tests {
         );
         let reply = answer(Answer::Reply, &source, "me@example.com", "", false);
         assert_eq!(reply.to, ["ana@example.com"]);
+        // My own message (sent from me): answered to whom it went, not to me.
+        let sent = Header {
+            from: Person {
+                name: "Me".into(),
+                address: "me@example.com".into(),
+            },
+            ..header.clone()
+        };
+        let mine = Source {
+            subject: "Lunch",
+            sender: "Me",
+            header: &sent,
+            body: &body,
+            reply_to: None,
+            fallback_to: None,
+            fallback_all: &[],
+        };
+        let reply = answer(Answer::Reply, &mine, "ME@example.com", "", false);
+        assert_eq!(reply.to, ["ben@example.com"]);
+        assert!(reply.cc.is_empty() && reply.bcc.is_empty());
+        let all = answer(Answer::ReplyAll, &mine, "me@example.com", "", false);
+        assert_eq!(all.to, ["ben@example.com"]);
+        assert_eq!(all.cc, ["ANA@example.com", "cy@example.com"]);
+        // Who I sent it to unseen stays unseen: on Bcc again, and only for reply-all.
+        let sent_bcc = Header {
+            bcc: vec![Person {
+                name: String::new(),
+                address: "hidden@example.com".into(),
+            }],
+            ..sent.clone()
+        };
+        let mine_bcc = Source {
+            subject: "Lunch",
+            sender: "Me",
+            header: &sent_bcc,
+            body: &body,
+            reply_to: None,
+            fallback_to: None,
+            fallback_all: &[],
+        };
+        let all = answer(Answer::ReplyAll, &mine_bcc, "me@example.com", "", false);
+        assert_eq!(all.bcc, ["hidden@example.com"]);
+        assert!(!all.to.contains(&"hidden@example.com".to_string()));
+        assert!(
+            answer(Answer::Reply, &mine_bcc, "me@example.com", "", false)
+                .bcc
+                .is_empty()
+        );
+        // A note to myself only: the reply comes back to me.
+        let note = Header {
+            to: vec![Person {
+                name: String::new(),
+                address: "me@example.com".into(),
+            }],
+            cc: Vec::new(),
+            ..sent.clone()
+        };
+        let to_me = Source {
+            subject: "Lunch",
+            sender: "Me",
+            header: &note,
+            body: &body,
+            reply_to: None,
+            fallback_to: None,
+            fallback_all: &[],
+        };
+        assert_eq!(
+            answer(Answer::Reply, &to_me, "me@example.com", "", false).to,
+            ["me@example.com"]
+        );
         assert!(reply.quoted.is_none(), "replies are quoted only when asked");
         let again = Source {
             subject: "RE: Lunch",

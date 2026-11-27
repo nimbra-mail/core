@@ -1056,6 +1056,9 @@ pub struct Message {
     pub from: Person,
     pub to: Vec<Person>,
     pub cc: Vec<Person>,
+    /// Who it was sent to unseen, when the mail says: only a sender's own copy does (Gmail
+    /// keeps it there; a copy saved over IMAP leaves it out).
+    pub bcc: Vec<Person>,
     pub reply_to: Option<Person>,
     pub attachments: Vec<Attachment>,
     /// Where to unsubscribe (`https:` or `mailto:`), from the List-Unsubscribe header.

@@ -44,6 +44,7 @@ pub fn message(raw: &[u8], message_key: &str) -> Option<Message> {
     let from = from_of(&parsed);
     let to = people_of(parsed.all_to());
     let cc = people_of(parsed.all_cc());
+    let bcc = people_of(parsed.bcc());
     let blocks = body_blocks(&parsed);
     let mut html = html_of(&parsed);
     // Images embedded in the message itself are inlined as data URLs, so the original
@@ -60,6 +61,7 @@ pub fn message(raw: &[u8], message_key: &str) -> Option<Message> {
         others: to.iter().chain(&cc).map(|p| p.address.clone()).collect(),
         to,
         cc,
+        bcc,
         reply_to: people_of(parsed.reply_to()).into_iter().next(),
         attachments: attachments(&parsed, message_key),
         unsubscribe: parsed

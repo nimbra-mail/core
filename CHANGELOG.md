@@ -15,6 +15,36 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 - Two `addImapAccount` (or sign-in) calls for the same address at once no longer both keep it: the second is refused as already here and its saved sign-in forgotten.
 - Gmail over IMAP: Important (`\Important`) is no longer listed as a label, as All Mail and Starred are not, and a message sent through Gmail is not filed in Sent again (Gmail files it itself).
 
+## [0.1.6] - 2026-11-27
+
+### Breaking
+- `Settings` has a new field, `list_width`: code that builds a `Settings` field by field sets it too (or uses `..Settings::default()`).
+
+### Added
+- `Settings::list_width`: the mail list's width, as dragged (452 by default, and for settings kept before it).
+
+## [0.1.5] - 2026-11-27
+
+### Breaking
+- `Message` and `listing::Header` have a new field, `bcc` (who a sender's own copy went to unseen; `Header`'s reads as empty from data kept before it), and `composing::Answered` has new fields `cc` and `bcc`: code that builds them field by field sets them too.
+
+### Changed
+- IMAP search understands more of Gmail's search words: `bcc:`, `has:attachment` (a multipart/mixed message), and `newer_than:` and `older_than:` with days, weeks, months or years (`7d`, `2w`, `3m`, `1y`). They used to be searched for as text.
+- `composing::answer`: reply-all keeps everyone in the field they were in. On someone else's message, the sender and their To go on To and their Cc on Cc (they all went on To before). On my own message, its To on To and, for reply-all, its Cc on Cc and its Bcc on Bcc.
+
+## [0.1.4] - 2026-11-27
+
+### Breaking
+- `Earlier` has a new field, `html`: code that builds an `Earlier` field by field sets it too (`None` when the message has no HTML).
+
+### Added
+- Every message of a thread keeps its original HTML: `Earlier::html` (from `Row::fill`), and kept threads (`MailThread`) carry it for each message, not only the latest.
+
+### Changed
+- `composing::answer`: a reply to my own message (From is `me`) goes to its To (and Cc for reply-all) without me, not back to me; a note only to myself still comes back to me.
+- A reply whose `ReplyTo::thread_id` is empty (written from another account than its thread's) is sent and saved to Gmail without a thread, with its In-Reply-To and References as before; it used to be refused.
+- `Row::loaded` is kept as `fetched`. Rows kept before earlier messages had their HTML read as not fetched, so their messages are downloaded again when opened.
+
 ## [0.1.3] - 2026-11-27
 
 ### Breaking

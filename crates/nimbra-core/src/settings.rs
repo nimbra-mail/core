@@ -50,6 +50,8 @@ pub struct Settings {
     pub sidebar_auto_hide: bool,
     /// The sidebar's width, as its right edge was dragged to (docked and floating alike).
     pub sidebar_width: f32,
+    /// The mail list's width, as its right edge was dragged to (the Mac app).
+    pub list_width: f32,
     /// The last few searches, newest first.
     pub recent_searches: Vec<String>,
     /// When an opened thread counts as read.
@@ -187,6 +189,7 @@ impl Default for Settings {
             sidebar_hidden: Vec::new(),
             sidebar_auto_hide: false,
             sidebar_width: 236.,
+            list_width: 452.,
             recent_searches: Vec::new(),
             mark_read: MarkRead::Open,
             check_every: 30,
