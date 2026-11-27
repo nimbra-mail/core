@@ -37,6 +37,7 @@ const MAX_RESOLVERS: usize = 3;
 
 const TYPE_CNAME: u16 = 5;
 const TYPE_MX: u16 = 15;
+const TYPE_TXT: u16 = 16;
 const CLASS_IN: u16 = 1;
 const RCODE_NXDOMAIN: u16 = 3;
 
@@ -45,6 +46,11 @@ const RCODE_NXDOMAIN: u16 = 3;
 /// none. Blocking, for at most a few seconds.
 pub trait Resolver: Send + Sync {
     fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>>;
+    /// The TXT records of `domain`, each one's strings joined. Not every app answers
+    /// these: then nothing that needs them (brand logos) is shown.
+    fn txt(&self, _domain: &str) -> Result<Vec<String>> {
+        bail!("TXT lookups are not available here")
+    }
 }
 
 static RESOLVER: std::sync::OnceLock<Box<dyn Resolver>> = std::sync::OnceLock::new();
@@ -80,6 +86,52 @@ pub fn mx(domain: &str) -> Result<Vec<String>> {
     if let Some(resolver) = RESOLVER.get() {
         return Ok(from_app(resolver.mx(domain.trim_end_matches('.'))?));
     }
+    Ok(mx_hosts(lookup(domain, TYPE_MX)?))
+}
+
+/// The MX hosts among `answers`, most preferred first, each once.
+fn mx_hosts(answers: Vec<Answer>) -> Vec<String> {
+    let mut found: Vec<(u16, String)> = answers
+        .into_iter()
+        .filter_map(|answer| match answer {
+            Answer::Mx(preference, host) => Some((preference, host)),
+            Answer::Txt(_) => None,
+        })
+        .collect();
+    found.sort_by_key(|(preference, _)| *preference);
+    let mut hosts: Vec<String> = Vec::new();
+    for (_, host) in found {
+        if !host.is_empty() && !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+/// The TXT records of `domain` (names may have `_` labels, as `_dmarc.example.com`), each
+/// one's strings joined. Empty when it has none. Blocks for up to six seconds.
+pub fn txt(domain: &str) -> Result<Vec<String>> {
+    if let Some(resolver) = RESOLVER.get() {
+        return resolver.txt(domain.trim_end_matches('.'));
+    }
+    Ok(lookup(domain, TYPE_TXT)?
+        .into_iter()
+        .filter_map(|answer| match answer {
+            Answer::Txt(text) => Some(text),
+            Answer::Mx(..) => None,
+        })
+        .collect())
+}
+
+/// What a reply answers.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    Mx(u16, String),
+    Txt(String),
+}
+
+/// Asks the system's resolvers, in turn, for `domain`'s records of `kind`.
+fn lookup(domain: &str, kind: u16) -> Result<Vec<Answer>> {
     let conf = std::fs::read_to_string("/etc/resolv.conf").context("reading /etc/resolv.conf")?;
     let resolvers = resolvers(&conf);
     if resolvers.is_empty() {
@@ -88,8 +140,8 @@ pub fn mx(domain: &str) -> Result<Vec<String>> {
     let deadline = Instant::now() + TOTAL;
     let mut last = anyhow!("no DNS resolver answered");
     for resolver in resolvers {
-        match ask(resolver, domain, deadline) {
-            Ok(hosts) => return Ok(hosts),
+        match ask(resolver, domain, kind, deadline) {
+            Ok(answers) => return Ok(answers),
             Err(error) => last = error,
         }
         if Instant::now() >= deadline {
@@ -100,11 +152,11 @@ pub fn mx(domain: &str) -> Result<Vec<String>> {
 }
 
 /// One query to one resolver, waiting until the reply or the time limit.
-fn ask(resolver: SocketAddr, domain: &str, deadline: Instant) -> Result<Vec<String>> {
+fn ask(resolver: SocketAddr, domain: &str, kind: u16, deadline: Instant) -> Result<Vec<Answer>> {
     let mut id = [0u8; 2];
     getrandom::getrandom(&mut id).map_err(|e| anyhow!("no secure random source: {e}"))?;
     let id = u16::from_be_bytes(id);
-    let packet = query(id, domain)?;
+    let packet = query(id, domain, kind)?;
     let local: IpAddr = match resolver {
         SocketAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
         SocketAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
@@ -126,7 +178,7 @@ fn ask(resolver: SocketAddr, domain: &str, deadline: Instant) -> Result<Vec<Stri
         if reply.len() < 2 || u16::from_be_bytes([reply[0], reply[1]]) != id {
             continue;
         }
-        return parse(reply, id, domain);
+        return parse(reply, id, domain, kind);
     }
 }
 
@@ -151,14 +203,27 @@ fn resolvers(conf: &str) -> Vec<SocketAddr> {
     found
 }
 
-/// The query packet: header with recursion desired, then one question for `domain`'s MX
-/// records.
-fn query(id: u16, domain: &str) -> Result<Vec<u8>> {
+/// A name that can be asked about: a host name, or one with `_` labels (`_dmarc.x.com`).
+fn askable(domain: &str) -> bool {
+    domain.len() <= MAX_NAME
+        && domain.parse::<IpAddr>().is_err()
+        && domain.split('.').count() >= 2
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= MAX_LABEL
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+/// The query packet: header with recursion desired, then one question for `domain`'s
+/// records of `kind`.
+fn query(id: u16, domain: &str, kind: u16) -> Result<Vec<u8>> {
     let domain = domain.trim_end_matches('.');
-    ensure!(
-        crate::servers::is_host(domain) && domain.parse::<IpAddr>().is_err(),
-        "not a domain name"
-    );
+    ensure!(askable(domain), "not a domain name");
     let mut packet = Vec::with_capacity(18 + domain.len());
     packet.extend_from_slice(&id.to_be_bytes());
     packet.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
@@ -169,14 +234,14 @@ fn query(id: u16, domain: &str) -> Result<Vec<u8>> {
         packet.extend_from_slice(label.as_bytes());
     }
     packet.push(0);
-    packet.extend_from_slice(&TYPE_MX.to_be_bytes());
+    packet.extend_from_slice(&kind.to_be_bytes());
     packet.extend_from_slice(&CLASS_IN.to_be_bytes());
     Ok(packet)
 }
 
-/// The MX hosts in a reply to `query(id, domain)`, most preferred first. Records for other
-/// names are ignored, except along a CNAME chain from `domain`.
-fn parse(reply: &[u8], id: u16, domain: &str) -> Result<Vec<String>> {
+/// The records in a reply to `query(id, domain, kind)`. Records for other names are
+/// ignored, except along a CNAME chain from `domain`.
+fn parse(reply: &[u8], id: u16, domain: &str, kind: u16) -> Result<Vec<Answer>> {
     let mut reader = Reader { data: reply, at: 0 };
     ensure!(reader.u16()? == id, "the DNS reply is for another query");
     let flags = reader.u16()?;
@@ -192,7 +257,7 @@ fn parse(reply: &[u8], id: u16, domain: &str) -> Result<Vec<String>> {
     ensure!(questions == 1, "the DNS reply does not repeat the question");
     let asked = domain.trim_end_matches('.').to_ascii_lowercase();
     ensure!(
-        reader.name()? == asked && reader.u16()? == TYPE_MX && reader.u16()? == CLASS_IN,
+        reader.name()? == asked && reader.u16()? == kind && reader.u16()? == CLASS_IN,
         "the DNS reply is for another question"
     );
     match flags & 0x000f {
@@ -201,30 +266,25 @@ fn parse(reply: &[u8], id: u16, domain: &str) -> Result<Vec<String>> {
         code => bail!("the DNS resolver failed (code {code})"),
     }
     let mut names = vec![asked];
-    let mut found: Vec<(u16, String)> = Vec::new();
+    let mut found: Vec<Answer> = Vec::new();
     for _ in 0..answers {
-        match record(&mut reader, &mut names, &mut found) {
+        match record(&mut reader, kind, &mut names, &mut found) {
             Ok(()) => {}
             // A cut-off reply: keep what came through whole.
             Err(_) if truncated => break,
             Err(error) => return Err(error),
         }
     }
-    found.sort_by_key(|(preference, _)| *preference);
-    let mut hosts: Vec<String> = Vec::new();
-    for (_, host) in found {
-        if !host.is_empty() && !hosts.contains(&host) {
-            hosts.push(host);
-        }
-    }
-    Ok(hosts)
+    Ok(found)
 }
 
-/// Reads one answer record, keeping MX hosts for any name in `names` and following CNAMEs.
+/// Reads one answer record, keeping those of `wanted` for any name in `names` and
+/// following CNAMEs.
 fn record(
     reader: &mut Reader,
+    wanted: u16,
     names: &mut Vec<String>,
-    found: &mut Vec<(u16, String)>,
+    found: &mut Vec<Answer>,
 ) -> Result<()> {
     let owner = reader.name()?;
     let kind = reader.u16()?;
@@ -237,11 +297,22 @@ fn record(
         .filter(|end| *end <= reader.data.len())
         .ok_or_else(|| anyhow!("a DNS record runs past the reply"))?;
     let ours = class == CLASS_IN && names.contains(&owner);
-    if ours && kind == TYPE_MX {
+    if ours && kind == TYPE_MX && wanted == TYPE_MX {
         let preference = reader.u16()?;
         let host = reader.name()?;
         ensure!(reader.at == end, "a DNS MX record has the wrong length");
-        found.push((preference, host));
+        found.push(Answer::Mx(preference, host));
+    } else if ours && kind == TYPE_TXT && wanted == TYPE_TXT {
+        // One or more strings, each after its length, read as one.
+        let mut text = Vec::new();
+        while reader.at < end {
+            let size = reader.data[reader.at] as usize;
+            let from = reader.at + 1;
+            ensure!(from + size <= end, "a DNS TXT string runs past its record");
+            text.extend_from_slice(&reader.data[from..from + size]);
+            reader.at = from + size;
+        }
+        found.push(Answer::Txt(String::from_utf8_lossy(&text).into_owned()));
     } else if ours && kind == TYPE_CNAME {
         let target = reader.name()?;
         ensure!(reader.at == end, "a DNS CNAME record has the wrong length");
@@ -340,6 +411,41 @@ impl Reader<'_> {
 mod tests {
     use super::*;
 
+    /// `parse` for MX, as `mx` gives it: hosts, most preferred first.
+    fn parse_mx(reply: &[u8], id: u16, domain: &str) -> Result<Vec<String>> {
+        parse(reply, id, domain, TYPE_MX).map(mx_hosts)
+    }
+
+    #[test]
+    fn txt_records_are_read_with_their_strings_joined() {
+        let mut packet = query(0x0b1, "default._bimi.github.com", TYPE_TXT).unwrap();
+        packet[2] = 0x81; // reply, recursion desired
+        packet[3] = 0x80;
+        packet[7] = 1; // one answer
+        packet.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 1, 0]);
+        let strings = b"\x0ev=BIMI1; l=htt\x19ps://github.com/logo.svg;";
+        packet.extend_from_slice(&(strings.len() as u16).to_be_bytes());
+        packet.extend_from_slice(strings);
+        assert_eq!(
+            parse(&packet, 0x0b1, "default._bimi.github.com", TYPE_TXT).unwrap(),
+            [Answer::Txt(
+                "v=BIMI1; l=https://github.com/logo.svg;".into()
+            )]
+        );
+        // An MX reply read for TXT gives nothing.
+        assert!(parse(&reply(), 0xbeef, "example.com", TYPE_TXT).is_err());
+    }
+
+    #[test]
+    fn names_with_underscore_labels_can_be_asked() {
+        for good in ["_dmarc.example.com", "default._bimi.mail.example.com"] {
+            assert!(query(1, good, TYPE_TXT).is_ok(), "{good:?}");
+        }
+        for bad in ["_", "a.-b.com", "a b._x.com", "1.2.3.4", "a..b"] {
+            assert!(query(1, bad, TYPE_TXT).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn an_apps_answer_is_checked_and_ordered() {
         let hosts = from_app(vec![
@@ -351,10 +457,10 @@ mod tests {
         assert_eq!(hosts, ["aspmx.l.google.com", "alt1.aspmx.l.google.com"]);
     }
 
-    /// A reply to `query(0xbeef, "example.com")` with two MX records, the second listed
+    /// A reply to `query(0xbeef, "example.com", TYPE_MX)` with two MX records, the second listed
     /// first by preference, both using compression as real resolvers do.
     fn reply() -> Vec<u8> {
-        let mut packet = query(0xbeef, "example.com").unwrap();
+        let mut packet = query(0xbeef, "example.com", TYPE_MX).unwrap();
         packet[2] = 0x81; // QR, RD
         packet[3] = 0x80; // RA, no error
         packet[7] = 2; // two answers
@@ -375,27 +481,27 @@ mod tests {
 
     #[test]
     fn the_query_packet_is_built_by_the_book() {
-        let packet = query(0x1234, "Mail.Example.com.").unwrap();
+        let packet = query(0x1234, "Mail.Example.com.", TYPE_MX).unwrap();
         let mut expected = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
         expected.extend_from_slice(b"\x04Mail\x07Example\x03com\x00");
         expected.extend_from_slice(&[0, 15, 0, 1]);
         assert_eq!(packet, expected);
         for bad in ["", "a b.com", "127.0.0.1", "a..b", &"x".repeat(64)] {
-            assert!(query(1, bad).is_err(), "{bad:?}");
+            assert!(query(1, bad, TYPE_MX).is_err(), "{bad:?}");
         }
     }
 
     #[test]
     fn a_compressed_reply_is_read_and_sorted_by_preference() {
         assert_eq!(
-            parse(&reply(), 0xbeef, "Example.com").unwrap(),
+            parse_mx(&reply(), 0xbeef, "Example.com").unwrap(),
             ["main.mx.example.net", "alt.mx.example.net"]
         );
     }
 
     #[test]
     fn mx_records_follow_a_cname_and_ignore_other_names() {
-        let mut packet = query(7, "a.org").unwrap();
+        let mut packet = query(7, "a.org", TYPE_MX).unwrap();
         packet[2] = 0x81;
         packet[3] = 0x80;
         packet[7] = 3;
@@ -408,26 +514,26 @@ mod tests {
         // b.org MX 5 mx.b.org
         packet.extend_from_slice(&[0xc0, 35, 0, 15, 0, 1, 0, 0, 0, 1, 0, 7, 0, 5, 2, b'm', b'x']);
         packet.extend_from_slice(&[0xc0, 35]);
-        assert_eq!(parse(&packet, 7, "a.org").unwrap(), ["mx.b.org"]);
+        assert_eq!(parse_mx(&packet, 7, "a.org").unwrap(), ["mx.b.org"]);
     }
 
     #[test]
     fn no_such_domain_and_null_mx_give_no_hosts() {
-        let mut packet = query(9, "none.example").unwrap();
+        let mut packet = query(9, "none.example", TYPE_MX).unwrap();
         packet[2] = 0x81;
         packet[3] = 0x83; // NXDOMAIN
         assert_eq!(
-            parse(&packet, 9, "none.example").unwrap(),
+            parse_mx(&packet, 9, "none.example").unwrap(),
             Vec::<String>::new()
         );
         // RFC 7505: "MX 0 ." means the domain takes no mail.
-        let mut packet = query(9, "none.example").unwrap();
+        let mut packet = query(9, "none.example", TYPE_MX).unwrap();
         packet[2] = 0x81;
         packet[3] = 0x80;
         packet[7] = 1;
         packet.extend_from_slice(&[0xc0, 12, 0, 15, 0, 1, 0, 0, 0, 1, 0, 3, 0, 0, 0]);
         assert_eq!(
-            parse(&packet, 9, "none.example").unwrap(),
+            parse_mx(&packet, 9, "none.example").unwrap(),
             Vec::<String>::new()
         );
     }
@@ -436,32 +542,32 @@ mod tests {
     fn bad_replies_are_errors() {
         let good = reply();
         // Wrong id, another question, a query rather than a reply, a server failure.
-        assert!(parse(&good, 0xbeee, "example.com").is_err());
-        assert!(parse(&good, 0xbeef, "example.org").is_err());
+        assert!(parse_mx(&good, 0xbeee, "example.com").is_err());
+        assert!(parse_mx(&good, 0xbeef, "example.org").is_err());
         let mut not_reply = good.clone();
         not_reply[2] &= 0x7f;
-        assert!(parse(&not_reply, 0xbeef, "example.com").is_err());
+        assert!(parse_mx(&not_reply, 0xbeef, "example.com").is_err());
         let mut failed = good.clone();
         failed[3] = 0x82;
-        assert!(parse(&failed, 0xbeef, "example.com").is_err());
+        assert!(parse_mx(&failed, 0xbeef, "example.com").is_err());
         // Every cut-off length is an error; with the truncated flag set, whole answers
         // before the cut are kept and nothing panics.
         for size in 0..good.len() {
             assert!(
-                parse(&good[..size], 0xbeef, "example.com").is_err(),
+                parse_mx(&good[..size], 0xbeef, "example.com").is_err(),
                 "{size}"
             );
             let mut cut = good[..size].to_vec();
             if cut.len() > 2 {
                 cut[2] |= 0x02;
             }
-            let _ = parse(&cut, 0xbeef, "example.com");
+            let _ = parse_mx(&cut, 0xbeef, "example.com");
         }
-        let first_answer = query(0xbeef, "example.com").unwrap().len() + 34;
+        let first_answer = query(0xbeef, "example.com", TYPE_MX).unwrap().len() + 34;
         let mut cut = good[..first_answer + 3].to_vec();
         cut[2] |= 0x02;
         assert_eq!(
-            parse(&cut, 0xbeef, "example.com").unwrap(),
+            parse_mx(&cut, 0xbeef, "example.com").unwrap(),
             ["alt.mx.example.net"]
         );
     }
@@ -469,7 +575,7 @@ mod tests {
     #[test]
     fn hostile_names_are_errors_not_panics() {
         let base = || {
-            let mut packet = query(1, "x.com").unwrap();
+            let mut packet = query(1, "x.com", TYPE_MX).unwrap();
             packet[2] = 0x81;
             packet[3] = 0x80;
             packet[7] = 1;
@@ -485,12 +591,12 @@ mod tests {
         // A pointer to itself, a pointer forwards, a pointer out of the packet.
         let here = base().len() + 2 + 2;
         let selfish = answer(&[0, 1, 0xc0 | (here >> 8) as u8, here as u8]);
-        assert!(parse(&selfish, 1, "x.com").is_err());
-        assert!(parse(&answer(&[0, 1, 0xc0, 0xff]), 1, "x.com").is_err());
-        assert!(parse(&answer(&[0, 1, 0xff, 0xff]), 1, "x.com").is_err());
+        assert!(parse_mx(&selfish, 1, "x.com").is_err());
+        assert!(parse_mx(&answer(&[0, 1, 0xc0, 0xff]), 1, "x.com").is_err());
+        assert!(parse_mx(&answer(&[0, 1, 0xff, 0xff]), 1, "x.com").is_err());
         // Reserved label types.
-        assert!(parse(&answer(&[0, 1, 0x40, 0]), 1, "x.com").is_err());
-        assert!(parse(&answer(&[0, 1, 0x80, 0]), 1, "x.com").is_err());
+        assert!(parse_mx(&answer(&[0, 1, 0x40, 0]), 1, "x.com").is_err());
+        assert!(parse_mx(&answer(&[0, 1, 0x80, 0]), 1, "x.com").is_err());
         // A name longer than 255 bytes.
         let mut long = vec![0, 1];
         for _ in 0..5 {
@@ -498,21 +604,21 @@ mod tests {
             long.extend_from_slice(&[b'a'; 60]);
         }
         long.push(0);
-        assert!(parse(&answer(&long), 1, "x.com").is_err());
+        assert!(parse_mx(&answer(&long), 1, "x.com").is_err());
         // A dot or a control character inside a label.
-        assert!(parse(&answer(b"\x00\x01\x03a.b\x00"), 1, "x.com").is_err());
-        assert!(parse(&answer(b"\x00\x01\x03a\nb\x00"), 1, "x.com").is_err());
+        assert!(parse_mx(&answer(b"\x00\x01\x03a.b\x00"), 1, "x.com").is_err());
+        assert!(parse_mx(&answer(b"\x00\x01\x03a\nb\x00"), 1, "x.com").is_err());
         // An rdata length that runs past the end, or does not fit the name.
         let mut over = base();
         over.extend_from_slice(&[0x10, 0x00, 0, 1, 0]);
-        assert!(parse(&over, 1, "x.com").is_err());
-        assert!(parse(&answer(b"\x00\x01\x01a\x00\x00"), 1, "x.com").is_err());
+        assert!(parse_mx(&over, 1, "x.com").is_err());
+        assert!(parse_mx(&answer(b"\x00\x01\x01a\x00\x00"), 1, "x.com").is_err());
         // A question that points into the header.
-        let mut looped = query(1, "x.com").unwrap();
+        let mut looped = query(1, "x.com", TYPE_MX).unwrap();
         looped[2] = 0x81;
         looped[12] = 0xc0;
         looped[13] = 12;
-        assert!(parse(&looped, 1, "x.com").is_err());
+        assert!(parse_mx(&looped, 1, "x.com").is_err());
     }
 
     #[test]

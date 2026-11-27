@@ -161,6 +161,9 @@ pub struct Row {
     /// The address of whoever `sender` names (`Summary::sender_address`). Empty for rows
     /// kept before it was (until the thread changes) and for sample data.
     pub sender_address: String,
+    /// Whose brand logo may stand for the sender (`Summary::brand_domain`).
+    #[serde(default)]
+    pub brand_domain: Option<String>,
     pub subject: String,
     pub snippet: String,
     /// How many messages, as shown beside the row when there is more than one.
@@ -199,6 +202,7 @@ impl Row {
             participants: summary.sender.clone(),
             sender: summary.sender,
             sender_address: summary.sender_address,
+            brand_domain: summary.brand_domain,
             subject: summary.subject,
             snippet: summary.snippet,
             timestamp_ms: summary.timestamp_ms,
@@ -381,6 +385,25 @@ pub struct Meta {
     /// Where each mailbox's change feed was last read, by record.
     #[serde(default)]
     pub synced_to: HashMap<String, String>,
+    /// The rows' format when they were kept (`ROWS`).
+    #[serde(default)]
+    pub rows: u32,
+}
+
+/// The rows' format: 1 added `Row::brand_domain`. Rows kept in an older one only gain what
+/// is new when their thread changes, so `Meta::current` lists each mailbox afresh once.
+pub const ROWS: u32 = 1;
+
+impl Meta {
+    /// As the current rows' format wants it: kept in an older one, without its sync points,
+    /// so each mailbox is listed afresh (its first page) rather than followed.
+    pub fn current(mut self) -> Self {
+        if self.rows < ROWS {
+            self.synced_to.clear();
+            self.rows = ROWS;
+        }
+        self
+    }
 }
 
 /// The labels counted for the sidebar: the system mailboxes, then the first few labels.
@@ -563,7 +586,7 @@ pub fn refresh(
     label_id: Option<&str>,
 ) -> Result<Refreshed> {
     let name = record(view, label_id);
-    let mut meta: Meta = store.load(META).unwrap_or_default();
+    let mut meta: Meta = store.load::<Meta>(META).unwrap_or_default().current();
     let cached: Vec<Row> = stored(store, view, label_id);
     let ids = count_ids(meta.labels.iter().map(|l| l.id.as_str()));
     let start = meta.synced_to.get(&name).cloned();
@@ -1199,6 +1222,7 @@ mod tests {
             id: id.into(),
             sender: "Ana".into(),
             sender_address: String::new(),
+            brand_domain: None,
             subject: "s".into(),
             snippet: "s".into(),
             timestamp_ms: at,
@@ -1230,6 +1254,26 @@ mod tests {
         );
         let ids: Vec<_> = list.iter().map(|r| r.id.clone().unwrap()).collect();
         assert_eq!(ids, ["b"]);
+    }
+
+    #[test]
+    fn rows_kept_in_an_older_format_are_listed_afresh_once() {
+        let mut old = Meta::default();
+        old.synced_to.insert("view-0".into(), "41".into());
+        let now = old.current();
+        assert!(now.synced_to.is_empty(), "listed afresh");
+        assert_eq!(now.rows, ROWS);
+        // Then followed again as before.
+        let mut kept = now;
+        kept.synced_to.insert("view-0".into(), "42".into());
+        assert_eq!(
+            kept.clone()
+                .current()
+                .synced_to
+                .get("view-0")
+                .map(String::as_str),
+            Some("42")
+        );
     }
 
     #[test]

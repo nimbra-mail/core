@@ -991,6 +991,10 @@ pub struct Summary {
     /// The address of whoever `sender` names, as written (empty when the message has none).
     #[serde(default)]
     pub sender_address: String,
+    /// The sender's domain when the latest message passed DMARC for it (`dmarc_domain`),
+    /// so a brand logo may stand for the sender (`bimi`). `None` for a recipient's row.
+    #[serde(default)]
+    pub brand_domain: Option<String>,
     pub subject: String,
     pub snippet: String,
     pub timestamp_ms: i64,
@@ -1219,9 +1223,70 @@ pub trait Provider: Send + Sync {
 /// The connection the app holds for an account.
 pub type Client = dyn Provider;
 
+/// The sender's domain, when the receiving provider says the message passed DMARC for it.
+/// Only the topmost `Authentication-Results` (`results`) counts: it is the provider's own,
+/// added last, while any below it came with the message and could say anything. The
+/// domain DMARC passed for (`header.from`) must be the From address's.
+pub fn dmarc_domain(results: &str, from_address: &str) -> Option<String> {
+    let from = from_address
+        .trim()
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim_end_matches('>').to_ascii_lowercase())
+        .filter(|domain| domain.contains('.') && !domain.is_empty())?;
+    results.split(';').skip(1).find_map(|method| {
+        let mut words = method.split_whitespace();
+        let result = words.next()?.to_ascii_lowercase();
+        if result != "dmarc=pass" {
+            return None;
+        }
+        let passed = method
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("header.from="))?
+            .trim_matches(|c| c == '"' || c == ';')
+            .to_ascii_lowercase();
+        (passed == from).then_some(from.clone())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dmarc_passes_only_for_the_senders_own_domain() {
+        let google = "mx.google.com; dkim=pass header.i=@github.com; spf=pass smtp.mailfrom=github.com; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=github.com";
+        assert_eq!(
+            dmarc_domain(google, "noreply@github.com"),
+            Some("github.com".into())
+        );
+        // Microsoft's way of writing it, and an address in any case.
+        let microsoft = "spf=pass (sender IP is 1.2.3.4) smtp.mailfrom=stripe.com; dkim=pass (signature was verified) header.d=stripe.com;dmarc=pass action=none header.from=stripe.com;compauth=pass reason=100";
+        assert_eq!(
+            dmarc_domain(
+                &format!("mx.microsoft.com; {microsoft}"),
+                "Receipts@Stripe.com"
+            ),
+            Some("stripe.com".into())
+        );
+        // Passed, but for another domain than the one the reader sees.
+        assert_eq!(dmarc_domain(google, "security@paypal.com"), None);
+        // Not a pass.
+        for result in ["fail", "none", "temperror", "bestguesspass"] {
+            let header = format!("mx.google.com; dmarc={result} header.from=github.com");
+            assert_eq!(
+                dmarc_domain(&header, "noreply@github.com"),
+                None,
+                "{result}"
+            );
+        }
+        // The server's own id is not a result, even when it looks like one.
+        assert_eq!(
+            dmarc_domain("dmarc=pass header.from=github.com", "noreply@github.com"),
+            None
+        );
+        assert_eq!(dmarc_domain("", "noreply@github.com"), None);
+        assert_eq!(dmarc_domain(google, "not an address"), None);
+    }
 
     #[test]
     fn safe_file_name_drops_a_right_to_left_override() {

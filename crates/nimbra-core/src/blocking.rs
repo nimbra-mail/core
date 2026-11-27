@@ -195,6 +195,7 @@ mod tests {
             id: "t".into(),
             sender: String::new(),
             sender_address: String::new(),
+            brand_domain: None,
             subject: String::new(),
             snippet: String::new(),
             timestamp_ms: 0,

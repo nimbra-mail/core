@@ -25,6 +25,7 @@
 //! - `testing` (with `test-support`): a mail server in memory, for tests.
 
 pub mod accounts;
+pub mod bimi;
 pub mod blocking;
 pub mod composing;
 pub mod contacts;
