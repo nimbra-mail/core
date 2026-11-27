@@ -183,11 +183,12 @@ pub struct MailboxEntry {
     pub name: Option<String>,
 }
 
-/// All inboxes: every account's inbox, newest first.
+/// Every account's mailbox (All inboxes: every account's inbox), newest first.
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct AllInboxesPage {
     pub threads: Vec<ThreadRow>,
-    /// Each account's unread inbox threads.
+    /// Each account's count of the mailbox, by account id: unread threads (every draft
+    /// for Drafts).
     pub unread: Vec<LabelCount>,
     /// Accounts that could not be listed (left out). All of them failing is an error.
     pub failed_accounts: u32,
@@ -666,7 +667,7 @@ impl Mailbox {
             mail::View::AllMail => Mailbox::AllMail,
             mail::View::Spam => Mailbox::Spam,
             mail::View::Trash => Mailbox::Trash,
-            mail::View::AllInboxes | mail::View::Search | mail::View::Label(_) => return None,
+            mail::View::Every(_) | mail::View::Search | mail::View::Label(_) => return None,
         })
     }
 

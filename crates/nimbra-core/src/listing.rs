@@ -351,26 +351,7 @@ pub fn sort_newest_first<T: Listed>(list: &mut [T]) {
 
 /// A stable number per mailbox: its record in the store (and the Mac's element ids).
 pub fn view_number(view: View) -> usize {
-    match view {
-        View::AllInboxes => 99,
-        View::Inbox => 0,
-        View::Primary => 1,
-        View::Updates => 2,
-        View::Promotions => 3,
-        View::Social => 4,
-        View::Starred => 5,
-        View::Snoozed => 6,
-        View::Reminders => 15,
-        View::Drafts => 7,
-        View::Sent => 8,
-        View::Done => 9,
-        View::Search => 10,
-        View::AllMail => 11,
-        View::Important => 12,
-        View::Spam => 13,
-        View::Trash => 14,
-        View::Label(index) => 100 + index,
-    }
+    view.number()
 }
 
 /// The store record a mailbox is kept under. A label's is named by its id (`label_id`),
@@ -564,7 +545,7 @@ pub struct Refreshed {
 /// A mailbox as the store keeps it, and the account's kept state. Search results are never
 /// kept. Blocking (disk).
 pub fn stored(store: &crate::store::Store, view: View, label_id: Option<&str>) -> Vec<Row> {
-    if matches!(view, View::Search | View::AllInboxes) {
+    if matches!(view, View::Search | View::Every(_)) {
         return Vec::new();
     }
     store.load(&record(view, label_id)).unwrap_or_default()
@@ -696,7 +677,7 @@ pub fn more(
         .filter(|summary| !known.contains(&summary.id))
         .map(Row::from_summary)
         .collect();
-    if !matches!(view, View::Search | View::AllInboxes) {
+    if !matches!(view, View::Search | View::Every(_)) {
         rows.extend(fresh.iter().cloned());
         store.save(&record(view, label_id), &kept(&rows))?;
     }
@@ -766,19 +747,14 @@ pub fn kept_thread(store: &crate::store::Store, thread_id: &str) -> Option<Row> 
 /// Snooze and Move take the thread out.
 pub fn inbox_like(view: View) -> bool {
     matches!(
-        view,
-        View::Inbox
-            | View::AllInboxes
-            | View::Primary
-            | View::Updates
-            | View::Promotions
-            | View::Social
+        view.base(),
+        View::Inbox | View::Primary | View::Updates | View::Promotions | View::Social
     )
 }
 
 /// What Move to Inbox does from `view`: out of Spam or Trash, else out of the archive.
 pub fn to_inbox(view: View) -> mail::Change {
-    match view {
+    match view.base() {
         View::Spam => mail::Change::NotSpam,
         View::Trash => mail::Change::Untrash,
         _ => mail::Change::Unarchive,
@@ -819,6 +795,42 @@ pub fn label_named<'a>(labels: &'a [Label], name: &str) -> Option<&'a Label> {
 /// The most labels an account lists.
 pub const LABELS_SHOWN: usize = 40;
 
+/// A label as every account's mailboxes list it: one name, and each account's label by
+/// that name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NamedLabel {
+    /// As the first account that has it spells it.
+    pub name: String,
+    /// By account id, that account's label id.
+    pub ids: Vec<(String, String)>,
+}
+
+/// Every account's labels, one per name in any case (a label is each account's own, so
+/// labels by the same name are one), sorted by name.
+pub fn labels_by_name<'a>(
+    accounts: impl IntoIterator<Item = (&'a str, &'a [Label])>,
+) -> Vec<NamedLabel> {
+    let mut named: Vec<NamedLabel> = Vec::new();
+    for (account, labels) in accounts {
+        for label in labels {
+            let id = (account.to_string(), label.id.clone());
+            match named
+                .iter_mut()
+                .find(|n| n.name.eq_ignore_ascii_case(label.name.trim()))
+            {
+                Some(known) if !known.ids.iter().any(|(a, _)| a == account) => known.ids.push(id),
+                Some(_) => {}
+                None => named.push(NamedLabel {
+                    name: label.name.trim().to_string(),
+                    ids: vec![id],
+                }),
+            }
+        }
+    }
+    named.sort_by_key(|n| n.name.to_lowercase());
+    named
+}
+
 /// The Split Inbox, in its default order: the inbox and Gmail's four categories. An account
 /// with its own servers (IMAP) has none: its server has no categories.
 pub fn split_mailboxes(own_servers: bool) -> Vec<View> {
@@ -858,30 +870,63 @@ pub fn mailboxes(own_servers: bool) -> Vec<View> {
     views
 }
 
-// ------------------------------------------------------------------ all inboxes
+// ------------------------------------------------------------------ every account's
 
-/// One account's part of All inboxes: its rows, where its next page starts, and its
-/// unread count.
+/// One account's part of every account's mailbox (All inboxes is one): its rows, where its
+/// next page starts, and its count.
 pub type AccountInbox<T> = (Vec<T>, Option<String>, u32);
 
-/// An account's next page of All inboxes: by account id, the page asked for, and what came.
+/// An account's next page of every account's mailbox: by account id, the page asked for,
+/// and what came.
 pub type MoreOfAccount = (String, String, Result<(Vec<Summary>, Option<String>)>);
 
-/// The most of one account's inbox All inboxes lists at once.
+/// The most of one account's mailbox every account's lists at once.
 pub const ALL_INBOXES_MOST: usize = 480;
 
-/// How many of an account's inbox threads All inboxes asks for, when `listed` of them are
-/// listed now: as far as it was scrolled, in whole pages, so listing again drops nothing.
+/// How many of an account's threads every account's mailbox asks for, when `listed` of
+/// them are listed now: as far as it was scrolled, in whole pages, so listing again drops
+/// nothing.
 pub fn all_inboxes_count(listed: usize) -> usize {
     listed.next_multiple_of(PAGE).clamp(PAGE, ALL_INBOXES_MOST)
 }
 
+/// Whether an account takes part in every account's `view`: Gmail's own mailboxes leave
+/// out the accounts with their own servers (IMAP).
+pub fn takes_part(view: View, own_servers: bool) -> bool {
+    !(own_servers && view.gmail_only())
+}
+
+/// The label a mailbox's sidebar count is read from, and whether it counts every thread
+/// (Drafts) rather than the unread ones. `None` for those without a count.
+pub fn count_of(view: View, label_id: Option<&str>) -> Option<(String, bool)> {
+    let unread = |id: &str| Some((id.to_string(), false));
+    match view.base() {
+        View::Inbox => unread("INBOX"),
+        View::Primary => unread("CATEGORY_PERSONAL"),
+        View::Updates => unread("CATEGORY_UPDATES"),
+        View::Promotions => unread("CATEGORY_PROMOTIONS"),
+        View::Social => unread("CATEGORY_SOCIAL"),
+        View::Label(_) => label_id.and_then(unread),
+        View::Drafts => Some(("DRAFT".to_string(), true)),
+        _ => None,
+    }
+}
+
+/// An account's sidebar count for a mailbox (see `count_of`), 0 for one without a count.
+/// Blocking (network).
+pub fn mailbox_count(client: &mail::Client, view: View, label_id: Option<&str>) -> u32 {
+    let Some((id, total)) = count_of(view, label_id) else {
+        return 0;
+    };
+    client
+        .counts(std::slice::from_ref(&id))
+        .get(&id)
+        .map_or(0, |(unread, all)| if total { *all } else { *unread })
+}
+
 /// The unread threads in an account's inbox (All inboxes, the badge).
 pub fn inbox_unread(client: &mail::Client) -> u32 {
-    client
-        .counts(&["INBOX".to_string()])
-        .get("INBOX")
-        .map_or(0, |(unread, _)| *unread)
+    mailbox_count(client, View::Inbox, None)
 }
 
 /// A row of `account`'s, for a list that mixes accounts.
@@ -898,8 +943,22 @@ pub fn account_inbox<T: Listed>(
     account: &str,
     count: usize,
 ) -> Result<AccountInbox<T>> {
-    let (threads, next) = client.threads_page(View::Inbox, None, count, None)?;
-    let unread = inbox_unread(client);
+    account_view(client, account, View::Inbox, None, count)
+}
+
+/// One account's part of every account's `view`: its newest `count` threads of the
+/// mailbox (`label_id`: this account's label, for a label), where its next page starts,
+/// and its count (`mailbox_count`). Blocking (network).
+pub fn account_view<T: Listed>(
+    client: &mail::Client,
+    account: &str,
+    view: View,
+    label_id: Option<&str>,
+    count: usize,
+) -> Result<AccountInbox<T>> {
+    let view = view.base();
+    let (threads, next) = client.threads_page(view, label_id, count, None)?;
+    let unread = mailbox_count(client, view, label_id);
     let rows = threads
         .into_iter()
         .map(|summary| of_account(summary, account))
@@ -1171,6 +1230,101 @@ mod tests {
         );
         let ids: Vec<_> = list.iter().map(|r| r.id.clone().unwrap()).collect();
         assert_eq!(ids, ["b"]);
+    }
+
+    #[test]
+    fn every_accounts_mailbox_is_made_of_its_base() {
+        for base in [
+            View::Inbox,
+            View::Primary,
+            View::Updates,
+            View::Promotions,
+            View::Social,
+            View::Starred,
+            View::Snoozed,
+            View::Reminders,
+            View::Drafts,
+            View::Sent,
+            View::Done,
+            View::AllMail,
+            View::Important,
+            View::Spam,
+            View::Trash,
+            View::Label(3),
+        ] {
+            let every = View::every(base);
+            assert!(every.is_every() && !base.is_every());
+            assert_eq!(every.base(), base);
+            assert_eq!(View::every(every), every, "never nested");
+            assert_ne!(view_number(every), view_number(base));
+            assert_eq!(inbox_like(every), inbox_like(base));
+        }
+        assert_eq!(View::ALL_INBOXES.base(), View::Inbox);
+        assert_eq!(View::Inbox.base(), View::Inbox);
+    }
+
+    #[test]
+    fn gmails_own_mailboxes_leave_out_accounts_with_their_own_servers() {
+        for view in [View::Primary, View::Social, View::Important] {
+            assert!(takes_part(View::every(view), false));
+            assert!(!takes_part(View::every(view), true));
+        }
+        for view in [
+            View::Inbox,
+            View::Trash,
+            View::Sent,
+            View::Drafts,
+            View::Snoozed,
+        ] {
+            assert!(takes_part(View::every(view), true));
+        }
+    }
+
+    #[test]
+    fn an_accounts_part_lists_its_mailbox_with_its_count() {
+        let fake = Fake::new("me@example.com");
+        fake.add(Fake::thread("in", &["INBOX", "UNREAD"], 1));
+        fake.add(Fake::thread("bin", &["TRASH", "UNREAD"], 2));
+        fake.add(Fake::thread("d1", &["DRAFT"], 3));
+        fake.add(Fake::thread("d2", &["DRAFT"], 4));
+        fake.add(Fake::thread(
+            "p",
+            &["INBOX", "CATEGORY_PERSONAL", "UNREAD"],
+            5,
+        ));
+        let client: Arc<mail::Client> = fake.clone();
+        let part = |view: View| -> AccountInbox<Row> {
+            account_view(&*client, "a1", View::every(view), None, PAGE).unwrap()
+        };
+        let (rows, _, count) = part(View::Trash);
+        assert_eq!(ids(&rows), ["bin"]);
+        assert_eq!(rows[0].account.as_deref(), Some("a1"));
+        assert_eq!(count, 0, "Trash has no count");
+        let (rows, _, count) = part(View::Drafts);
+        assert_eq!(ids(&rows), ["d2", "d1"]);
+        assert_eq!(count, 2, "every draft");
+        let (rows, _, count) = part(View::Primary);
+        assert_eq!(ids(&rows), ["p"]);
+        assert_eq!(count, 1);
+        assert_eq!(part(View::Inbox).2, 2);
+    }
+
+    #[test]
+    fn labels_by_the_same_name_are_one() {
+        let label = |id: &str, name: &str| Label {
+            id: id.into(),
+            name: name.into(),
+        };
+        let one = [label("L1", "Receipts"), label("L2", "Travel")];
+        let two = [label("L9", "receipts"), label("L1", "Work")];
+        let named = labels_by_name([("a", &one[..]), ("b", &two[..])]);
+        let names: Vec<&str> = named.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["Receipts", "Travel", "Work"]);
+        assert_eq!(
+            named[0].ids,
+            [("a".into(), "L1".into()), ("b".into(), "L9".into())]
+        );
+        assert_eq!(named[2].ids, [("b".into(), "L1".into())]);
     }
 
     #[test]

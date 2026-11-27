@@ -946,8 +946,10 @@ impl Client {
             }
             request = request.query("pageToken", page);
         }
-        let request = match view {
-            View::Inbox | View::AllInboxes => request.query("labelIds", "INBOX"),
+        // Every account's mailbox is listed here as this account's own.
+        let request = match view.base() {
+            // (A base is never every account's.)
+            View::Inbox | View::Every(_) => request.query("labelIds", "INBOX"),
             View::Primary => category(request, "CATEGORY_PERSONAL"),
             View::Updates => category(request, "CATEGORY_UPDATES"),
             View::Promotions => category(request, "CATEGORY_PROMOTIONS"),

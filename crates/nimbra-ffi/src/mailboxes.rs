@@ -148,14 +148,25 @@ impl Engine {
     /// All inboxes as kept: every account's inbox, newest first, each row with its account.
     /// Disk.
     pub fn cached_all_inboxes(&self) -> Result<Vec<ThreadRow>> {
+        self.cached_every_mailbox(Mailbox::Inbox)
+    }
+
+    /// Every account's `mailbox` as kept, newest first, each row with its account. Gmail's
+    /// own mailboxes (the Split Inbox categories, Important) leave out the accounts with
+    /// their own servers. Not for a label: labels are each account's own. Disk.
+    pub fn cached_every_mailbox(&self, mailbox: Mailbox) -> Result<Vec<ThreadRow>> {
+        let view = every_view(&mailbox)?;
         let mut all: Vec<Row> = Vec::new();
         for account in self.accounts() {
+            if !listing::takes_part(view, account.kind != AccountKind::Gmail) {
+                continue;
+            }
             // One that cannot be opened (signed out, or removed meanwhile) is left out.
             let Ok(open) = self.connect(&account.id) else {
                 continue;
             };
             all.extend(
-                listing::stored(&open.store, View::Inbox, None)
+                listing::stored(&open.store, view, None)
                     .into_iter()
                     .map(|mut row| {
                         row.account = Some(account.id.clone());
@@ -172,10 +183,22 @@ impl Engine {
     /// first. An account that fails is left out and counted; all failing is the error.
     /// Network.
     pub fn all_inboxes(&self, per_account: u32) -> Result<AllInboxesPage> {
+        self.every_mailbox(Mailbox::Inbox, per_account)
+    }
+
+    /// Every account's `mailbox`, as `all_inboxes` lists the inbox: each account's newest
+    /// `per_account` threads of it, merged newest first, with each account's count of it
+    /// (`unread`: unread threads, or every draft for Drafts). Gmail's own mailboxes leave
+    /// out the accounts with their own servers. Not for a label: labels are each account's
+    /// own. Network.
+    pub fn every_mailbox(&self, mailbox: Mailbox, per_account: u32) -> Result<AllInboxesPage> {
+        let view = every_view(&mailbox)?;
         let count = listing::all_inboxes_count(per_account as usize);
         let mut opened = Vec::new();
         for account in self.accounts() {
-            opened.push((account.id.clone(), self.connect(&account.id)));
+            if listing::takes_part(view, account.kind != AccountKind::Gmail) {
+                opened.push((account.id.clone(), self.connect(&account.id)));
+            }
         }
         let results: Vec<(String, anyhow::Result<listing::AccountInbox<Row>>)> =
             std::thread::scope(|scope| {
@@ -186,7 +209,9 @@ impl Engine {
                         let id = id.clone();
                         scope.spawn(move || {
                             let result = match open {
-                                Some(open) => listing::account_inbox(&*open.client, &id, count),
+                                Some(open) => {
+                                    listing::account_view(&*open.client, &id, view, None, count)
+                                }
                                 None => Err(anyhow::anyhow!("not connected")),
                             };
                             (id, result)
@@ -249,5 +274,15 @@ impl Engine {
         Ok(listing::kept_thread(&open.store, &thread_id)
             .as_ref()
             .map(MailThread::from))
+    }
+}
+
+/// Every account's view of `mailbox`; a label has none (labels are each account's own).
+fn every_view(mailbox: &Mailbox) -> Result<View> {
+    match mailbox.view() {
+        (View::Label(_), _) => Err(NimbraError::Invalid {
+            message: "Labels are each account's own.".into(),
+        }),
+        (view, _) => Ok(View::every(view)),
     }
 }

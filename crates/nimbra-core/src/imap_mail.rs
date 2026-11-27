@@ -800,8 +800,10 @@ impl Client {
     ) -> Result<Vec<Folder>> {
         let folders = self.folders(connection)?;
         let of = |role: Role| folders.iter().filter(|f| f.role == role).cloned().collect();
-        Ok(match view {
-            View::Inbox | View::AllInboxes | View::Primary => of(Role::Inbox),
+        // Every account's mailbox is listed here as this account's own.
+        Ok(match view.base() {
+            // (A base is never every account's.)
+            View::Inbox | View::Every(_) | View::Primary => of(Role::Inbox),
             View::Sent => of(Role::Sent),
             View::Drafts => of(Role::Drafts),
             View::Trash => of(Role::Trash),
@@ -940,11 +942,11 @@ impl Client {
     fn in_view(&self, row: &Summary, view: View, label_id: Option<&str>, shown: &[Folder]) -> bool {
         let labels: Vec<String> = shown.iter().map(Folder::label).collect();
         let in_shown = row.labels.iter().any(|l| labels.contains(l));
-        match view {
+        match view.base() {
             View::Starred => row.starred,
             View::AllMail => true,
             View::Done => in_shown,
-            _ => in_shown && view.holds(&row.labels, label_id) != Some(false),
+            view => in_shown && view.holds(&row.labels, label_id) != Some(false),
         }
     }
 

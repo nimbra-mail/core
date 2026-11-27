@@ -1367,6 +1367,13 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func cachedCounts(accountId: String) throws  -> [LabelCount]
     
     /**
+     * Every account's `mailbox` as kept, newest first, each row with its account. Gmail's
+     * own mailboxes (the Split Inbox categories, Important) leave out the accounts with
+     * their own servers. Not for a label: labels are each account's own. Disk.
+     */
+    func cachedEveryMailbox(mailbox: Mailbox) throws  -> [ThreadRow]
+    
+    /**
      * A thread as kept on the device, when its messages were downloaded: at once, also
      * offline. `None`: read it with `read_thread`. Disk.
      */
@@ -1377,6 +1384,15 @@ public protocol EngineProtocol: AnyObject, Sendable {
      * listed. Disk.
      */
     func cachedThreads(accountId: String, mailbox: Mailbox) throws  -> [ThreadRow]
+    
+    /**
+     * Every account's `mailbox`, as `all_inboxes` lists the inbox: each account's newest
+     * `per_account` threads of it, merged newest first, with each account's count of it
+     * (`unread`: unread threads, or every draft for Drafts). Gmail's own mailboxes leave
+     * out the accounts with their own servers. Not for a label: labels are each account's
+     * own. Network.
+     */
+    func everyMailbox(mailbox: Mailbox, perAccount: UInt32) throws  -> AllInboxesPage
     
     /**
      * The page after what is listed (`page` is the last `next_page`), kept after it.
@@ -2313,6 +2329,21 @@ open func cachedCounts(accountId: String)throws  -> [LabelCount]  {
 }
     
     /**
+     * Every account's `mailbox` as kept, newest first, each row with its account. Gmail's
+     * own mailboxes (the Split Inbox categories, Important) leave out the accounts with
+     * their own servers. Not for a label: labels are each account's own. Disk.
+     */
+open func cachedEveryMailbox(mailbox: Mailbox)throws  -> [ThreadRow]  {
+    return try  FfiConverterSequenceTypeThreadRow.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_cached_every_mailbox(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMailbox_lower(mailbox),uniffiCallStatus
+    )
+})
+}
+    
+    /**
      * A thread as kept on the device, when its messages were downloaded: at once, also
      * offline. `None`: read it with `read_thread`. Disk.
      */
@@ -2338,6 +2369,24 @@ open func cachedThreads(accountId: String, mailbox: Mailbox)throws  -> [ThreadRo
             self.uniffiCloneHandle(),
         FfiConverterString.lower(accountId),
         FfiConverterTypeMailbox_lower(mailbox),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Every account's `mailbox`, as `all_inboxes` lists the inbox: each account's newest
+     * `per_account` threads of it, merged newest first, with each account's count of it
+     * (`unread`: unread threads, or every draft for Drafts). Gmail's own mailboxes leave
+     * out the accounts with their own servers. Not for a label: labels are each account's
+     * own. Network.
+     */
+open func everyMailbox(mailbox: Mailbox, perAccount: UInt32)throws  -> AllInboxesPage  {
+    return try  FfiConverterTypeAllInboxesPage_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_every_mailbox(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMailbox_lower(mailbox),
+        FfiConverterUInt32.lower(perAccount),uniffiCallStatus
     )
 })
 }
@@ -3287,12 +3336,13 @@ public func FfiConverterTypeAccount_lift(_ buf: RustBuffer) throws -> Account {
 
 
 /**
- * All inboxes: every account's inbox, newest first.
+ * Every account's mailbox (All inboxes: every account's inbox), newest first.
  */
 public struct AllInboxesPage: Equatable, Hashable {
     public var threads: [ThreadRow]
     /**
-     * Each account's unread inbox threads.
+     * Each account's count of the mailbox, by account id: unread threads (every draft
+     * for Drafts).
      */
     public var unread: [LabelCount]
     /**
@@ -3304,7 +3354,8 @@ public struct AllInboxesPage: Equatable, Hashable {
     // declare one manually.
     public init(threads: [ThreadRow], 
         /**
-         * Each account's unread inbox threads.
+         * Each account's count of the mailbox, by account id: unread threads (every draft
+         * for Drafts).
          */unread: [LabelCount], 
         /**
          * Accounts that could not be listed (left out). All of them failing is an error.
@@ -9255,10 +9306,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_cached_counts() != 424) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nimbra_ffi_checksum_method_engine_cached_every_mailbox() != 30189) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nimbra_ffi_checksum_method_engine_cached_thread() != 43404) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_cached_threads() != 14555) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_every_mailbox() != 2638) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_load_more() != 24459) {
