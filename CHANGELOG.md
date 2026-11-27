@@ -12,6 +12,7 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ### Added
 - Brand logos (BIMI): `bimi::logo(store, domain)` gives a domain's logo (an SVG, at most 32 KB, kept in the store for a week) when its DMARC policy is enforced and its BIMI record names one; `Summary::brand_domain` and `Row::brand_domain` say whose logo may stand for the sender (the latest message passed DMARC for that domain, by the receiving server's own Authentication-Results); `mail::dmarc_domain`; `dns::txt`, and `Resolver::txt` (an app's resolver may answer TXT; by default it doesn't).
+- `Store::open_shared(name)`: an app-wide store, no account's, encrypted with its own key; the Mac app keeps brand logos there, once for every account.
 - `TextSize::ExtraLarge` (saved as `"extralarge"`): 19pt text on 32pt lines in the reader.
 - `Settings::interface_zoom` (percent, saved as `interface_zoom`, 100 when missing) and `Settings::zoom()`, which keeps it to one of `ZOOM_STEPS` (90, 100, 110, 125): how large the whole interface is drawn.
 

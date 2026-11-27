@@ -224,6 +224,18 @@ impl Store {
         Self::open_at(dir, &key?)
     }
 
+    /// An app-wide store, no account's: for what every account's mail shares (brand logos).
+    /// `name` is a few lowercase letters. Its own folder and key, so it is encrypted as an
+    /// account's store is. Blocking: may wait on the keychain.
+    pub fn open_shared(name: &str) -> Result<Self> {
+        if name.is_empty() || name.len() > 16 || !name.chars().all(|c| c.is_ascii_lowercase()) {
+            bail!("unexpected store name");
+        }
+        let dir = base_dir()?.join(format!("shared-{name}"));
+        let key = key_for(&format!("{KEYCHAIN_USER}-shared-{name}"), &dir)?;
+        Self::open_at(dir, &key)
+    }
+
     /// The same for work nobody is waiting on. It does not ask the keychain again once that
     /// has said no, as macOS would put up its question every time.
     pub fn open_quietly(account: &str) -> Result<Self> {
@@ -699,8 +711,14 @@ fn base_dir() -> Result<PathBuf> {
 }
 
 fn load_or_create_key(account: &str) -> Result<[u8; 32]> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &key_user(account)?)
-        .context("opening the system keychain")?;
+    key_for(&key_user(account)?, &default_dir(account)?)
+}
+
+/// The key kept in the keychain under `user`, made on first use. A new key cannot read
+/// what an old one wrote, so `dir` (what that key protects) is cleared when one is made.
+fn key_for(user: &str, dir: &Path) -> Result<[u8; 32]> {
+    let entry =
+        keyring::Entry::new(KEYCHAIN_SERVICE, user).context("opening the system keychain")?;
     if let Some(key) = key_in(entry.get_password())? {
         return Ok(key);
     }
@@ -714,9 +732,7 @@ fn load_or_create_key(account: &str) -> Result<[u8; 32]> {
         .set_password(&STANDARD.encode(key))
         .context("saving the mail store key to the keychain")?;
     // A new key cannot read anything written with the old one.
-    if let Ok(dir) = default_dir(account) {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    let _ = std::fs::remove_dir_all(dir);
     Ok(key)
 }
 
@@ -746,6 +762,14 @@ fn restrict(_path: &std::path::Path, _mode: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_store_has_a_plain_name() {
+        // Refused before the keychain is asked for anything.
+        for bad in ["", "Brands", "brands1", "../x", "a-b", &"b".repeat(17)] {
+            assert!(Store::open_shared(bad).is_err(), "{bad:?}");
+        }
+    }
 
     fn temp_store(key: u8) -> Store {
         let mut dir = std::env::temp_dir();
