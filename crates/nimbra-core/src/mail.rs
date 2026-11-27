@@ -35,6 +35,88 @@ pub struct Changes {
 }
 
 impl View {
+    /// Every account's inbox together.
+    pub const ALL_INBOXES: View = View::every(View::Inbox);
+
+    /// `base` in every account together. A mailbox that is already every account's stays
+    /// as it is.
+    pub const fn every(base: View) -> View {
+        match base {
+            View::Every(_) => base,
+            base => View::Every(base.number()),
+        }
+    }
+
+    /// The mailbox each account lists for this one: itself, or for every account's
+    /// mailbox the one it is made of.
+    pub fn base(self) -> View {
+        match self {
+            View::Every(number) => View::from_number(number),
+            view => view,
+        }
+    }
+
+    /// Whether it mixes every account's mail.
+    pub fn is_every(self) -> bool {
+        matches!(self, View::Every(_))
+    }
+
+    /// A stable number per mailbox: its record in the store (and the Mac's element ids).
+    pub const fn number(self) -> usize {
+        match self {
+            View::Every(base) => 10_000 + base,
+            View::Inbox => 0,
+            View::Primary => 1,
+            View::Updates => 2,
+            View::Promotions => 3,
+            View::Social => 4,
+            View::Starred => 5,
+            View::Snoozed => 6,
+            View::Reminders => 15,
+            View::Drafts => 7,
+            View::Sent => 8,
+            View::Done => 9,
+            View::Search => 10,
+            View::AllMail => 11,
+            View::Important => 12,
+            View::Spam => 13,
+            View::Trash => 14,
+            View::Label(index) => 100 + index,
+        }
+    }
+
+    /// The mailbox with this `number` (not every account's: that is never nested).
+    fn from_number(number: usize) -> View {
+        match number {
+            1 => View::Primary,
+            2 => View::Updates,
+            3 => View::Promotions,
+            4 => View::Social,
+            5 => View::Starred,
+            6 => View::Snoozed,
+            7 => View::Drafts,
+            8 => View::Sent,
+            9 => View::Done,
+            10 => View::Search,
+            11 => View::AllMail,
+            12 => View::Important,
+            13 => View::Spam,
+            14 => View::Trash,
+            15 => View::Reminders,
+            100..10_000 => View::Label(number - 100),
+            _ => View::Inbox,
+        }
+    }
+
+    /// Gmail's own mailboxes, which an account with its own servers (IMAP) does not have:
+    /// every account's of these lists only the Gmail accounts.
+    pub fn gmail_only(self) -> bool {
+        matches!(
+            self.base(),
+            View::Primary | View::Updates | View::Promotions | View::Social | View::Important
+        )
+    }
+
     /// Whether a thread with these labels belongs in this mailbox. `None` for mailboxes
     /// that are a search rather than a label (Done, Snoozed, search results), which are
     /// always fetched afresh.
@@ -42,7 +124,7 @@ impl View {
         let has = |l: &str| labels.iter().any(|x| x == l);
         Some(match self {
             // Mixes accounts: always listed afresh.
-            View::AllInboxes => return None,
+            View::Every(_) => return None,
             View::Inbox => has("INBOX"),
             View::Primary => has("INBOX") && has("CATEGORY_PERSONAL"),
             View::Updates => has("INBOX") && has("CATEGORY_UPDATES"),
@@ -835,8 +917,10 @@ pub(crate) fn is_message_id(value: &str) -> bool {
 /// The mailboxes the sidebar can show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum View {
-    /// Every signed-in account's inbox, merged (listed account by account as `Inbox`).
-    AllInboxes,
+    /// One mailbox of every signed-in account together, listed account by account as its
+    /// `base`. Made with `View::every`, it holds the base's `number`. All inboxes is
+    /// `View::ALL_INBOXES`, every account's Inbox.
+    Every(usize),
     Inbox,
     /// Gmail's inbox categories.
     Primary,

@@ -1318,6 +1318,29 @@ mod tests {
     }
 
     #[test]
+    fn every_accounts_trash_mixes_accounts_and_labels_have_none() {
+        let engine = engine();
+        let (first, one) = fake_account(&engine, "one@example.com");
+        let (second, two) = fake_account(&engine, "two@example.com");
+        one.add(nimbra_core::testing::Fake::thread("x", &["TRASH"], 1));
+        two.add(nimbra_core::testing::Fake::thread("y", &["TRASH"], 5));
+        two.add(nimbra_core::testing::Fake::thread("z", &["INBOX"], 9));
+        let all = engine.every_mailbox(Mailbox::Trash, 0).unwrap();
+        // Other tests' accounts may be listed too: only these two's threads are checked.
+        let rows: Vec<_> = all
+            .threads
+            .iter()
+            .filter(|t| ["x", "y", "z"].contains(&t.id.as_str()))
+            .map(|t| (t.id.clone(), t.account_id.clone().unwrap()))
+            .collect();
+        assert_eq!(rows, [("y".into(), second), ("x".into(), first)]);
+        assert!(matches!(
+            engine.every_mailbox(Mailbox::Label { id: "L1".into() }, 0),
+            Err(NimbraError::Invalid { .. })
+        ));
+    }
+
+    #[test]
     fn all_inboxes_mixes_accounts_newest_first() {
         let engine = engine();
         let (first, one) = fake_account(&engine, "one@example.com");

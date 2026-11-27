@@ -4,6 +4,13 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Breaking
+- In the crate, `View::AllInboxes` is now `View::ALL_INBOXES`, one of the new `View::Every` mailboxes (see Added). A `match` on `View` covers `View::Every(_)`.
+
+### Added
+- Every account's mailbox, not just the inbox: `Engine.everyMailbox(mailbox:perAccount:)` and `cachedEveryMailbox(mailbox:)` list one mailbox (Trash, Sent, Drafts, Primary…) of every account together, newest first, as `allInboxes` lists the inbox (which now calls them). Gmail's own mailboxes (the Split Inbox categories and Important) leave out the accounts with their own servers; a label is refused (labels are each account's own). `AllInboxesPage.unread` is each account's count of that mailbox: unread threads, or every draft for Drafts. Network / disk.
+- In the crate: `View::Every`, `View::every`, `View::base`, `View::gmail_only`, `View::number`; `listing::account_view`, `takes_part`, `count_of`, `mailbox_count`, and `labels_by_name` (every account's labels, one per name).
+
 ## [0.1.1] - 2026-11-27
 
 ### Breaking
