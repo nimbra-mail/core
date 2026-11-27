@@ -2586,9 +2586,28 @@ fn quote(text: &str) -> Result<String> {
     ))
 }
 
-/// IMAP SEARCH criteria from the words typed: from:, to:, subject:, is:unread, is:starred
-/// and plain words (in the text), all of which must match.
+/// IMAP SEARCH criteria from the words typed, all of which must match: from:, to:, cc:,
+/// bcc:, subject:, is:unread, is:read, is:starred, has:attachment, newer_than: and
+/// older_than: (as Gmail's: 7d, 2w, 3m, 1y), and plain words (in the text).
 fn search_criteria(query: &str) -> Result<String> {
+    search_criteria_on(query, chrono::Local::now().date_naive())
+}
+
+/// How far back `newer_than:` and `older_than:` reach: a count of days (d), weeks (w),
+/// months (m) or years (y) before `today`.
+fn days_back(value: &str, today: chrono::NaiveDate) -> Option<chrono::NaiveDate> {
+    let unit = value.chars().last()?.to_ascii_lowercase();
+    let count: u32 = value[..value.len() - 1].parse().ok()?;
+    match unit {
+        'd' => today.checked_sub_days(chrono::Days::new(count.into())),
+        'w' => today.checked_sub_days(chrono::Days::new(u64::from(count) * 7)),
+        'm' => today.checked_sub_months(chrono::Months::new(count)),
+        'y' => today.checked_sub_months(chrono::Months::new(count.checked_mul(12)?)),
+        _ => None,
+    }
+}
+
+fn search_criteria_on(query: &str, today: chrono::NaiveDate) -> Result<String> {
     let query = query.trim();
     if query.is_empty() || query.len() > 500 {
         bail!("Type something to search for.");
@@ -2601,6 +2620,21 @@ fn search_criteria(query: &str) -> Result<String> {
             "from" => format!("FROM {}", quote(value)?),
             "to" => format!("TO {}", quote(value)?),
             "cc" => format!("CC {}", quote(value)?),
+            "bcc" => format!("BCC {}", quote(value)?),
+            // IMAP has no criterion for it: a message with files is multipart/mixed.
+            "has" if value.eq_ignore_ascii_case("attachment") => {
+                "HEADER Content-Type \"multipart/mixed\"".to_string()
+            }
+            // Dates as IMAP writes them (1-Feb-2026); a date it cannot read is plain text.
+            "newer_than" | "older_than" if days_back(value, today).is_some() => {
+                let date = days_back(value, today).unwrap_or(today);
+                let since = key.eq_ignore_ascii_case("newer_than");
+                format!(
+                    "{} {}",
+                    if since { "SINCE" } else { "BEFORE" },
+                    date.format("%-d-%b-%Y")
+                )
+            }
             "subject" => format!("SUBJECT {}", quote(value)?),
             "is" if value.eq_ignore_ascii_case("unread") => "UNSEEN".to_string(),
             "is" if value.eq_ignore_ascii_case("read") => "SEEN".to_string(),
@@ -2882,6 +2916,33 @@ mod tests {
             "FROM \"ana\" TEXT \"invoice\" TEXT \"due\""
         );
         assert_eq!(search_criteria("is:unread").unwrap(), "UNSEEN");
+        // Gmail's search words, as IMAP has them.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
+        assert_eq!(
+            search_criteria_on("bcc:ana cc:ben", today).unwrap(),
+            "BCC \"ana\" CC \"ben\""
+        );
+        assert_eq!(
+            search_criteria_on("has:attachment", today).unwrap(),
+            "HEADER Content-Type \"multipart/mixed\""
+        );
+        assert_eq!(
+            search_criteria_on("newer_than:7d", today).unwrap(),
+            "SINCE 20-Nov-2026"
+        );
+        assert_eq!(
+            search_criteria_on("older_than:2w newer_than:1y", today).unwrap(),
+            "BEFORE 13-Nov-2026 SINCE 27-Nov-2025"
+        );
+        assert_eq!(
+            search_criteria_on("newer_than:3m", today).unwrap(),
+            "SINCE 27-Aug-2026"
+        );
+        // Not a date: searched as the words typed.
+        assert_eq!(
+            search_criteria_on("newer_than:soon", today).unwrap(),
+            "TEXT \"newer_than:soon\""
+        );
         // Line breaks only ever separate words: none reaches the command.
         let typed = search_criteria("x\r\nA1 DELETE INBOX").unwrap();
         assert!(!typed.contains(['\r', '\n']));
