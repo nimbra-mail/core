@@ -7,6 +7,7 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 ### Breaking
 - `TextSize` has a new variant, `ExtraLarge`: a `match` on it covers that too.
 - `Summary` has a new field, `brand_domain`: code that builds a `Summary` sets it too (`None` when unknown).
+- `Meta` has a new field, `rows` (the rows' format, `listing::ROWS`): code that builds a `Meta` field by field sets it too.
 - `Settings` has a new field, `interface_zoom`: code that builds a `Settings` field by field sets it too (or uses `..Settings::default()`).
 
 ### Added

@@ -745,6 +745,14 @@ impl Client {
     fn row(&self, id: &str, version: &str, recipient: bool) -> Result<(Summary, bool)> {
         const MOST_ROWS: usize = 5000;
         let key = (id.to_string(), recipient);
+        // Tagged with the rows' format: a row kept in an older one (before it knew its
+        // brand, say) is read again once, though its thread hasn't changed.
+        let version = if version.is_empty() {
+            String::new()
+        } else {
+            format!("r{}:{version}", crate::listing::ROWS)
+        };
+        let version = version.as_str();
         if !version.is_empty()
             && let Some((kept, row)) = self.rows.lock().unwrap().get(&key)
             && kept == version
