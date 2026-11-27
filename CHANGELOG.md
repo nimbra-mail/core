@@ -4,6 +4,8 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-27
+
 ### Breaking
 - `Earlier` has a new field, `html`: code that builds an `Earlier` field by field sets it too (`None` when the message has no HTML).
 
