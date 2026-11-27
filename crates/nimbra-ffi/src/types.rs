@@ -765,7 +765,11 @@ impl From<&listing::Row> for MailThread {
             .earlier
             .iter()
             .rev()
-            .map(|e| MailMessage::kept(&e.header, &e.sender, &e.snippet, &e.blocks))
+            .map(|e| {
+                let mut message = MailMessage::kept(&e.header, &e.sender, &e.snippet, &e.blocks);
+                message.html = e.html.clone();
+                message
+            })
             .collect();
         let sender = row.header.from.label().to_string();
         let mut latest = MailMessage::kept(&row.header, &sender, &row.snippet, &row.body);

@@ -204,7 +204,28 @@ pub fn answer(
         Some(header.reply_address().to_string())
     };
     let mut to = Vec::new();
-    if let Some(address) = address {
+    // My own message: answered to whom it went (To, and Cc for reply-all), as mail apps
+    // do, not back to me. Only a note to myself comes back to me.
+    let mine = !header.from.address.is_empty() && header.from.address.eq_ignore_ascii_case(me);
+    if mine {
+        let people = header
+            .to
+            .iter()
+            .chain(header.cc.iter().filter(|_| kind == Answer::ReplyAll));
+        for person in people {
+            let address = &person.address;
+            if !address.eq_ignore_ascii_case(me)
+                && !to
+                    .iter()
+                    .any(|known: &String| known.eq_ignore_ascii_case(address))
+            {
+                to.push(address.clone());
+            }
+        }
+    }
+    if !(mine && !to.is_empty())
+        && let Some(address) = address
+    {
         to.push(address);
         if kind == Answer::ReplyAll {
             let others = if header.from.address.is_empty() {
@@ -337,6 +358,52 @@ mod tests {
         );
         let reply = answer(Answer::Reply, &source, "me@example.com", "", false);
         assert_eq!(reply.to, ["ana@example.com"]);
+        // My own message (sent from me): answered to whom it went, not to me.
+        let sent = Header {
+            from: Person {
+                name: "Me".into(),
+                address: "me@example.com".into(),
+            },
+            ..header.clone()
+        };
+        let mine = Source {
+            subject: "Lunch",
+            sender: "Me",
+            header: &sent,
+            body: &body,
+            reply_to: None,
+            fallback_to: None,
+            fallback_all: &[],
+        };
+        let reply = answer(Answer::Reply, &mine, "ME@example.com", "", false);
+        assert_eq!(reply.to, ["ben@example.com"]);
+        let all = answer(Answer::ReplyAll, &mine, "me@example.com", "", false);
+        assert_eq!(
+            all.to,
+            ["ben@example.com", "ANA@example.com", "cy@example.com"]
+        );
+        // A note to myself only: the reply comes back to me.
+        let note = Header {
+            to: vec![Person {
+                name: String::new(),
+                address: "me@example.com".into(),
+            }],
+            cc: Vec::new(),
+            ..sent.clone()
+        };
+        let to_me = Source {
+            subject: "Lunch",
+            sender: "Me",
+            header: &note,
+            body: &body,
+            reply_to: None,
+            fallback_to: None,
+            fallback_all: &[],
+        };
+        assert_eq!(
+            answer(Answer::Reply, &to_me, "me@example.com", "", false).to,
+            ["me@example.com"]
+        );
         assert!(reply.quoted.is_none(), "replies are quoted only when asked");
         let again = Source {
             subject: "RE: Lunch",
