@@ -1173,6 +1173,7 @@ impl Client {
                 from: person(m.header("From")),
                 to: people(m.header("To")),
                 cc: people(m.header("Cc")),
+                bcc: people(m.header("Bcc")),
                 reply_to: people(m.header("Reply-To")).into_iter().next(),
                 attachments: m
                     .payload

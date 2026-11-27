@@ -99,6 +99,9 @@ pub struct Header {
     pub from: mail::Person,
     pub to: Vec<mail::Person>,
     pub cc: Vec<mail::Person>,
+    /// Who it was sent to unseen, when the mail says: only a sender's own copy does.
+    #[serde(default)]
+    pub bcc: Vec<mail::Person>,
     pub reply_to: Option<mail::Person>,
     pub date_ms: i64,
     pub attachments: Vec<mail::Attachment>,
@@ -113,6 +116,7 @@ impl Header {
             from: message.from.clone(),
             to: message.to.clone(),
             cc: message.cc.clone(),
+            bcc: message.bcc.clone(),
             reply_to: message.reply_to.clone(),
             date_ms: message.timestamp_ms,
             attachments: message.attachments.clone(),
@@ -1208,6 +1212,7 @@ mod tests {
             from: mail::Person::default(),
             to: Vec::new(),
             cc: Vec::new(),
+            bcc: Vec::new(),
             reply_to: None,
             attachments: Vec::new(),
             unsubscribe: None,
