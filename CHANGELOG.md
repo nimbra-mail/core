@@ -4,6 +4,21 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Breaking
+- Swift: `DraftStart` has new fields `cc` and `bcc`, `MailMessage` a new field `bcc`, `ThreadRow` a new field `brandDomain`, and `Preferences` new fields `newestFirst`, `subjectOwnLine` and `textSize`: code that builds them with their initializer (a sample engine, tests) passes them too (`[]`, `nil`, or `false`, `true` and `.default` for the preferences' defaults).
+- Swift: `DnsResolver` has a new requirement, `txt(name:)`: an app's resolver answers TXT records too (with `kDNSServiceType_TXT`, each record's character strings joined), or throws `DnsError.failed`, and then no brand logo is shown.
+
+### Added
+- Swift: `Engine.moveAccount(accountId:to:)` moves an account to another place in the list of accounts, as the Mac's Settings › Accounts does (`Settings::move_account`); the default account stays the default.
+- Swift: `Engine.accountPhoto(accountId:)` (network) asks for the account's profile photo, an `AccountPhoto` (`.image(bytes:)`, `.unchecked(bytes:)`, `.noPhoto`, `.notAllowed`), and keeps it; `Engine.keptAccountPhoto(accountId:)` gives the one kept, to show at once. In the crate, `accounts::keep_photo`, `accounts::kept_photo` and `accounts::PHOTO` keep it as the Mac does.
+- Swift: brand logos. `ThreadRow.brandDomain` says whose logo may stand for the sender, and `Engine.brandLogo(domain:)` (DNS and network on a miss) gives that domain's logo as SVG bytes (`bimi::logo`), kept once for every account in an app-wide store.
+- Swift: `Engine.clearKeptMail()` clears the mail kept on the device for every account, as the Mac's Settings › Privacy does; the mail on the server, the sign-ins and the settings stay. In the crate, `accounts::clear_kept_mail(store, client)`.
+- Swift: `Preferences.newestFirst`, `Preferences.subjectOwnLine` and `Preferences.textSize` (a new `TextSize` enum: `small`, `default`, `large`, `extraLarge`), read from and saved to the same settings as the Mac's, with their defaults for settings kept before them.
+- Swift: `MailMessage.bcc`: who the account's own message went to unseen.
+
+### Fixed
+- Swift: reply-all keeps Cc and Bcc. `Engine.startAnswer` dropped them, so a reply-all on iOS went to the sender and their To only: `DraftStart.cc` and `DraftStart.bcc` now carry who `composing::answer` keeps there.
+
 ## [0.1.7] - 2026-11-28
 
 ### Breaking

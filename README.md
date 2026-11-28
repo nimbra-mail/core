@@ -81,15 +81,15 @@ The Swift API, by area (each `Engine` method says in its doc whether it goes to 
 
 | Area | Calls |
 | --- | --- |
-| Setup | `Engine(config:dataDir:cacheDir:secrets:)`, `flush`, `useDnsResolver` (MX lookups through the system on iOS), `coreVersion` |
-| Accounts | `accounts`, `setDefaultAccount`, `begin`/`finishGoogleSignIn`, `begin`/`finishMicrosoftSignIn`, `cancelSignIn`, `knownServers`, `discoverServers`, `addImapAccount`, `updateImapPassword`, `removeAccount`, `isEmailAddress` |
+| Setup | `Engine(config:dataDir:cacheDir:secrets:)`, `flush`, `useDnsResolver` (MX and TXT lookups through the system on iOS), `coreVersion` |
+| Accounts | `accounts`, `setDefaultAccount`, `moveAccount`, `accountPhoto`, `keptAccountPhoto`, `begin`/`finishGoogleSignIn`, `begin`/`finishMicrosoftSignIn`, `cancelSignIn`, `knownServers`, `discoverServers`, `addImapAccount`, `updateImapPassword`, `removeAccount`, `isEmailAddress` |
 | Mailboxes | `mailboxes`, `cachedThreads`, `refreshMailbox`, `loadMore`, `cachedAllInboxes`, `allInboxes`, `cachedEveryMailbox`, `everyMailbox`, `search`, `labels`, `counts`, `cachedCounts` |
-| Reading | `readThread`, `cachedThread`, `downloadAttachment`, `fetchRemoteImage`, `parseMailto`, `unsubscribeAction` |
+| Reading | `readThread`, `cachedThread`, `brandLogo`, `downloadAttachment`, `fetchRemoteImage`, `parseMailto`, `unsubscribeAction` |
 | Actions | `apply` (queued when offline), `undoAction`, `moveToInbox`, `moveToLabel`, `relabel`, label CRUD, `deleteThread`, `blockSender`, `unblockSender`, `blockedSenders` |
 | Snooze | `snooze`, `snoozed`, `unsnooze`, `wakeDue`, `snoozeTimes`, `parseTime`, `dayTime` |
 | Writing | `startAnswer`, `messageHtml`, `splitDraftHtml`, `textToHtml`, `saveDraft`, `saveToDrafts`, `draftForThread`, `deleteDraft`, `queueSend` then `OutgoingSend.deliver`/`undo`, `unsent`, `catchUp`, `scheduleSend`, `scheduledSends`, `cancelScheduled`, `sendDue`, `sendLaterTimes`, `suggestContacts`, `learnContacts` |
 | Signatures | `signatures`, `addSignature`, `updateSignature`, `deleteSignature`, `setDefaultSignature` |
-| Preferences | `preferences`, `setPreferences` (the shared `Settings`) |
+| Preferences | `preferences`, `setPreferences` (the shared `Settings`), `clearKeptMail` |
 | Staying current | `checkForChanges` (what to notify about), `watch` (`ChangeWatch`), `checkIntervalSeconds`, `pendingWork` (the next deadline for a timer or background task), `badgeCount`, `markReadAfterMs` |
 
 ## Building for iOS
