@@ -738,11 +738,10 @@ impl Client {
                 } else {
                     format!("<{key}@nimbra.invalid>")
                 };
-                let timestamp_ms = if headers.timestamp_ms > 0 {
-                    headers.timestamp_ms
-                } else {
-                    fetch.internal_date().map_or(0, |d| d.timestamp_millis())
-                };
+                let timestamp_ms = crate::mail::shown_time(
+                    Some(headers.timestamp_ms),
+                    fetch.internal_date().map_or(0, |d| d.timestamp_millis()),
+                );
                 let root = headers
                     .references
                     .first()
@@ -1510,11 +1509,10 @@ impl Provider for Client {
                     let Some(headers) = fetch.header().and_then(crate::mime::headers) else {
                         continue;
                     };
-                    let timestamp_ms = if headers.timestamp_ms > 0 {
-                        headers.timestamp_ms
-                    } else {
-                        fetch.internal_date().map_or(0, |d| d.timestamp_millis())
-                    };
+                    let timestamp_ms = crate::mail::shown_time(
+                        Some(headers.timestamp_ms),
+                        fetch.internal_date().map_or(0, |d| d.timestamp_millis()),
+                    );
                     people.push(Met {
                         from: headers.from,
                         to: headers.to,
