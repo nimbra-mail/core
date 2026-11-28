@@ -8,7 +8,7 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 - `Settings` has two new fields, `newest_first` and `subject_own_line`: code that builds a `Settings` field by field sets them too (or uses `..Settings::default()`).
 
 ### Added
-- `Settings::newest_first`: a conversation shows its latest message first and the older ones under it. `Settings::subject_own_line`: a list row shows the subject and the start of the email on lines of their own. Both off by default, and for settings kept before them.
+- `Settings::newest_first`: a conversation shows its latest message first and the older ones under it. `Settings::subject_own_line`: a list row shows the subject and the start of the email on lines of their own. `newest_first` is off by default and `subject_own_line` on, also for settings kept before them.
 
 ### Fixed
 - Gmail messages are dated as Gmail shows them: by the time their sender wrote on them (the Date header, now asked for with each thread's and message's metadata), rather than when Gmail took them in, which for bulk mail can be most of an hour apart. When that header is missing, not a date, or over a day after the message came in, the time it came in counts, on IMAP as on Gmail (`mail::shown_time`). Rows kept before are listed again once with these times (`listing::ROWS`).

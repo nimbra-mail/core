@@ -56,7 +56,7 @@ pub struct Settings {
     /// to oldest, rather than oldest first and the latest last.
     pub newest_first: bool,
     /// A list row shows the subject and the start of the email on lines of their own,
-    /// rather than side by side.
+    /// rather than side by side. On unless it was turned off (settings kept before it too).
     pub subject_own_line: bool,
     /// The last few searches, newest first.
     pub recent_searches: Vec<String>,
@@ -197,7 +197,7 @@ impl Default for Settings {
             sidebar_width: 236.,
             list_width: 452.,
             newest_first: false,
-            subject_own_line: false,
+            subject_own_line: true,
             recent_searches: Vec::new(),
             mark_read: MarkRead::Open,
             check_every: 30,
@@ -606,17 +606,18 @@ mod tests {
     }
 
     #[test]
-    fn the_reading_choices_are_off_for_settings_kept_before_them() {
+    fn the_reading_choices_for_settings_kept_before_them() {
+        // Oldest first, and the subject on its own line.
         let old: Settings = serde_json::from_str(r#"{"list_width":500}"#).unwrap();
         assert!(!old.newest_first);
-        assert!(!old.subject_own_line);
+        assert!(old.subject_own_line);
         let set = Settings {
             newest_first: true,
-            subject_own_line: true,
+            subject_own_line: false,
             ..Settings::default()
         };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
-        assert!(back.newest_first && back.subject_own_line);
+        assert!(back.newest_first && !back.subject_own_line);
     }
 
     #[test]
