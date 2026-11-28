@@ -4,6 +4,8 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-28
+
 ### Breaking
 - `Settings` has two new fields, `newest_first` and `subject_own_line`: code that builds a `Settings` field by field sets them too (or uses `..Settings::default()`).
 

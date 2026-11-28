@@ -1,6 +1,6 @@
 [package]
 name = "nimbra-ffi"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Nimbra's mail engine for Swift: a UniFFI facade over nimbra-core."
 license = "MIT"
