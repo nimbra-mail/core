@@ -4,6 +4,9 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Fixed
+- Previews (Gmail's snippets and the ones read from IMAP) drop the characters that take no room, such as the zero-width and filler characters newsletters pad their preview with, and keep each run of spaces as one space, so a row no longer ends in a long blank run cut off with "…". Line breaks and tabs count as spaces, and emoji keep their joiners. `listing::ROWS` is 2, so each mailbox is listed afresh once and rows kept before get their cleaned previews.
+
 ## [0.1.6] - 2026-11-27
 
 ### Breaking
