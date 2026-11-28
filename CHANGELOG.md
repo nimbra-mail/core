@@ -4,6 +4,8 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-28
+
 ### Breaking
 - Swift: `DraftStart` has new fields `cc` and `bcc`, `MailMessage` a new field `bcc`, `ThreadRow` a new field `brandDomain`, and `Preferences` new fields `newestFirst`, `subjectOwnLine` and `textSize`: code that builds them with their initializer (a sample engine, tests) passes them too (`[]`, `nil`, or `false`, `true` and `.default` for the preferences' defaults).
 - Swift: `DnsResolver` has a new requirement, `txt(name:)`: an app's resolver answers TXT records too (with `kDNSServiceType_TXT`, each record's character strings joined), or throws `DnsError.failed`, and then no brand logo is shown.
