@@ -4,8 +4,20 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Breaking
+- `Discovery` has a new case, `google(servers:)`, for gmail.com, googlemail.com and any domain whose mail Google runs (they were `needsOAuth(provider: "Google")`). Continue with Google stays the way in; `servers` are Gmail's (`imap.gmail.com` 993 and `smtp.gmail.com` 465, TLS, the full address as the user name) for adding the account with `addImapAccount` and an app password. `needsOAuth` is now Microsoft's or another provider's only. In the crate, `discover::Found::Google(Servers)`.
+- `NimbraError` has a new case, `NeedsAppPassword(accountId:)`: as `SignedOut`, when Gmail refused the Google account's own password because, with 2-Step Verification on, it takes only an app password. A `switch` on `NimbraError` covers it.
+
+### Added
+- In the crate: `servers::gmail(email)`, `Servers::is_gmail()`, `Servers::normalize_password(typed)` (control characters around a password, such as a line break or tab, go; a Google app password loses the spaces Google shows it with, and no other provider's password loses any) and `mail::NeedsAppPassword`, next to `mail::SignedOut` from IMAP and `smtp::AuthFailed` from SMTP. `addImapAccount` and `updateImapPassword` normalize the password before checking and keeping it.
+
 ### Changed
 - IMAP search leaves out the words only Gmail has (`label:`, `in:`, `category:`, `filename:`, `larger:`, `is:important`, `has:userlabels` and the like) rather than searching for them as text, which found nothing. A search of nothing else finds nothing on IMAP, rather than every message, so the same query can be run on every account.
+- Gmail over IMAP (an app password) is searched with Gmail's own search words as typed (X-GM-RAW), so `label:`, `category:` and the rest keep working there; other IMAP servers leave them out as above.
+
+### Fixed
+- Two `addImapAccount` (or sign-in) calls for the same address at once no longer both keep it: the second is refused as already here and its saved sign-in forgotten.
+- Gmail over IMAP: Important (`\Important`) is no longer listed as a label, as All Mail and Starred are not, and a message sent through Gmail is not filed in Sent again (Gmail files it itself).
 
 ## [0.1.8] - 2026-11-28
 

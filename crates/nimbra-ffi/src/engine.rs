@@ -271,10 +271,6 @@ impl Engine {
                 return Err(error.into());
             }
         };
-        if self.has_email(&email) {
-            gmail::forget_refresh_token(&account);
-            return Err(NimbraError::invalid(format!("{email} is already here.")));
-        }
         self.keep_account(AccountRef {
             id: account,
             email,
@@ -342,7 +338,7 @@ impl Engine {
                 .ok_or_else(|| NimbraError::invalid("That account was removed meanwhile."))?;
             microsoft::check_same_account(&expected, &email)?;
         } else if self.has_email(&email) {
-            return Err(NimbraError::invalid(format!("{email} is already here.")));
+            return Err(already_here(&email));
         }
         let servers = microsoft::servers(&email);
         let tokens = Arc::new(tokens);
@@ -393,12 +389,13 @@ impl Engine {
             return Err(NimbraError::invalid("That is not an email address."));
         }
         if self.has_email(&email) {
-            return Err(NimbraError::invalid(format!("{email} is already here.")));
+            return Err(already_here(&email));
         }
+        let servers = servers::Servers::from(&servers);
+        let password = servers.normalize_password(&password);
         if password.is_empty() {
             return Err(NimbraError::invalid("The password is empty."));
         }
-        let servers = servers::Servers::from(&servers);
         servers
             .check()
             .map_err(|e| NimbraError::invalid(e.to_string()))?;
@@ -432,6 +429,7 @@ impl Engine {
                 ));
             }
         };
+        let password = servers.normalize_password(&password);
         if password.is_empty() {
             return Err(NimbraError::invalid("The password is empty."));
         }
@@ -1053,6 +1051,10 @@ impl Engine {
     }
 }
 
+fn already_here(email: &str) -> NimbraError {
+    NimbraError::invalid(format!("{email} is already here."))
+}
+
 pub(crate) fn kind_of(account: &AccountRef) -> AccountKind {
     match (&account.servers, account.oauth.as_deref()) {
         (None, _) => AccountKind::Gmail,
@@ -1125,11 +1127,27 @@ impl Engine {
         Ok(())
     }
 
+    /// Keeps a new account, unless its address is here already (two adds of the same
+    /// address can both pass `has_email` while their servers are asked): then the sign-in
+    /// just saved for it is forgotten.
     fn keep_account(&self, account: AccountRef) -> Result<Account> {
         let id = account.id.clone();
+        let mut duplicate = false;
         self.change_settings(|settings| {
+            duplicate = settings
+                .accounts
+                .iter()
+                .any(|a| a.email.eq_ignore_ascii_case(&account.email));
+            if duplicate {
+                return Err(already_here(&account.email));
+            }
             settings.accounts.push(account);
             Ok(())
+        })
+        .inspect_err(|_| {
+            if duplicate {
+                accounts::forget_secrets_and_mail(&id);
+            }
         })?;
         self.accounts()
             .into_iter()
@@ -1666,6 +1684,70 @@ mod tests {
             .unwrap();
         refused(engine.update_imap_password(id.clone(), String::new()));
         engine.remove_account(id).unwrap();
+    }
+
+    fn gmail_servers(email: &str) -> MailServers {
+        (&servers::gmail(email)).into()
+    }
+
+    #[test]
+    fn an_address_already_here_is_refused_before_any_server_is_asked() {
+        let engine = engine();
+        let (google, _fake) = fake_account(&engine, "twice@example.com");
+        for typed in ["twice@example.com", " Twice@Example.COM "] {
+            match engine.add_imap_account(
+                typed.into(),
+                gmail_servers("twice@example.com"),
+                "abcd efgh ijkl mnop".into(),
+            ) {
+                Err(NimbraError::Invalid { message }) => {
+                    assert!(message.contains("already here"), "{message}")
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+        engine.remove_account(google).unwrap();
+    }
+
+    #[test]
+    fn the_same_address_is_kept_once_however_many_adds_finish() {
+        let engine = engine();
+        let account = |id: String| AccountRef {
+            id,
+            email: "race@example.com".into(),
+            servers: Some(servers::gmail("race@example.com")),
+            oauth: None,
+        };
+        let first = engine
+            .keep_account(account(mail::new_account_id().unwrap()))
+            .unwrap();
+        let second = engine.keep_account(account(mail::new_account_id().unwrap()));
+        assert!(
+            matches!(second, Err(NimbraError::Invalid { .. })),
+            "{second:?}"
+        );
+        let kept = engine
+            .accounts()
+            .into_iter()
+            .filter(|a| a.email == "race@example.com")
+            .count();
+        assert_eq!(kept, 1);
+        engine.remove_account(first.id).unwrap();
+    }
+
+    #[test]
+    fn a_pasted_line_break_alone_is_an_empty_password() {
+        let engine = engine();
+        match engine.add_imap_account(
+            "blank@gmail.com".into(),
+            gmail_servers("blank@gmail.com"),
+            " \n".into(),
+        ) {
+            Err(NimbraError::Invalid { message }) => {
+                assert!(message.contains("empty"), "{message}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     /// Against the local test servers (docs/testing.md): `cargo test -p nimbra-ffi --

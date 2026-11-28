@@ -69,8 +69,13 @@ pub enum Discovery {
     Servers {
         servers: MailServers,
     },
-    /// The provider only lets mail apps in through its own sign-in: "Google", "Microsoft"
-    /// or another name.
+    /// A Google account (gmail.com, or a domain whose mail Google runs). Continue with
+    /// Google is the way in; `servers` are Gmail's, for adding it with an app password.
+    Google {
+        servers: MailServers,
+    },
+    /// The provider only lets mail apps in through its own sign-in: "Microsoft" or another
+    /// name.
     NeedsOAuth {
         provider: String,
     },
@@ -673,6 +678,9 @@ impl From<discover::Found> for Discovery {
     fn from(found: discover::Found) -> Self {
         match found {
             discover::Found::Servers(servers) => Discovery::Servers {
+                servers: (&servers).into(),
+            },
+            discover::Found::Google(servers) => Discovery::Google {
                 servers: (&servers).into(),
             },
             discover::Found::NeedsOAuth { provider } => Discovery::NeedsOAuth {

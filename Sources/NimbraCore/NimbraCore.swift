@@ -6725,8 +6725,14 @@ public enum Discovery: Equatable, Hashable {
     case servers(servers: MailServers
     )
     /**
-     * The provider only lets mail apps in through its own sign-in: "Google", "Microsoft"
-     * or another name.
+     * A Google account (gmail.com, or a domain whose mail Google runs). Continue with
+     * Google is the way in; `servers` are Gmail's, for adding it with an app password.
+     */
+    case google(servers: MailServers
+    )
+    /**
+     * The provider only lets mail apps in through its own sign-in: "Microsoft" or another
+     * name.
      */
     case needsOAuth(provider: String
     )
@@ -6758,10 +6764,13 @@ public struct FfiConverterTypeDiscovery: FfiConverterRustBuffer {
         case 1: return .servers(servers: try FfiConverterTypeMailServers.read(from: &buf)
         )
         
-        case 2: return .needsOAuth(provider: try FfiConverterString.read(from: &buf)
+        case 2: return .google(servers: try FfiConverterTypeMailServers.read(from: &buf)
         )
         
-        case 3: return .unknown
+        case 3: return .needsOAuth(provider: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .unknown
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -6776,13 +6785,18 @@ public struct FfiConverterTypeDiscovery: FfiConverterRustBuffer {
             FfiConverterTypeMailServers.write(servers, into: &buf)
             
         
-        case let .needsOAuth(provider):
+        case let .google(servers):
             writeInt(&buf, Int32(2))
+            FfiConverterTypeMailServers.write(servers, into: &buf)
+            
+        
+        case let .needsOAuth(provider):
+            writeInt(&buf, Int32(3))
             FfiConverterString.write(provider, into: &buf)
             
         
         case .unknown:
-            writeInt(&buf, Int32(3))
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -7319,6 +7333,12 @@ enum NimbraError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
     case SignedOut(accountId: String?
     )
     /**
+     * As `SignedOut`, and the password was the Google account's own: with 2-Step
+     * Verification on, Gmail takes only an app password (or Continue with Google).
+     */
+    case NeedsAppPassword(accountId: String?
+    )
+    /**
      * No connection to the server.
      */
     case Offline
@@ -7381,17 +7401,20 @@ public struct FfiConverterTypeNimbraError: FfiConverterRustBuffer {
         case 1: return .SignedOut(
             accountId: try FfiConverterOptionString.read(from: &buf)
             )
-        case 2: return .Offline
-        case 3: return .NotFound
-        case 4: return .HistoryExpired
-        case 5: return .NeedsFullAccess
-        case 6: return .Keychain(
+        case 2: return .NeedsAppPassword(
+            accountId: try FfiConverterOptionString.read(from: &buf)
+            )
+        case 3: return .Offline
+        case 4: return .NotFound
+        case 5: return .HistoryExpired
+        case 6: return .NeedsFullAccess
+        case 7: return .Keychain(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 7: return .Invalid(
+        case 8: return .Invalid(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 8: return .Failed(
+        case 9: return .Failed(
             message: try FfiConverterString.read(from: &buf)
             )
 
@@ -7411,34 +7434,39 @@ public struct FfiConverterTypeNimbraError: FfiConverterRustBuffer {
             FfiConverterOptionString.write(accountId, into: &buf)
             
         
-        case .Offline:
+        case let .NeedsAppPassword(accountId):
             writeInt(&buf, Int32(2))
+            FfiConverterOptionString.write(accountId, into: &buf)
+            
         
-        
-        case .NotFound:
+        case .Offline:
             writeInt(&buf, Int32(3))
         
         
-        case .HistoryExpired:
+        case .NotFound:
             writeInt(&buf, Int32(4))
         
         
-        case .NeedsFullAccess:
+        case .HistoryExpired:
             writeInt(&buf, Int32(5))
         
         
-        case let .Keychain(message):
+        case .NeedsFullAccess:
             writeInt(&buf, Int32(6))
-            FfiConverterString.write(message, into: &buf)
-            
         
-        case let .Invalid(message):
+        
+        case let .Keychain(message):
             writeInt(&buf, Int32(7))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .Failed(message):
+        case let .Invalid(message):
             writeInt(&buf, Int32(8))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .Failed(message):
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(message, into: &buf)
             
         }

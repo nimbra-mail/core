@@ -183,6 +183,32 @@ impl std::fmt::Display for SignedOut {
 
 impl std::error::Error for SignedOut {}
 
+/// Next to a refused sign-in (`SignedOut`, `smtp::AuthFailed`): the password was the
+/// Google account's own, and with 2-Step Verification on, Gmail's IMAP and SMTP servers
+/// take only an app password.
+#[derive(Debug)]
+pub struct NeedsAppPassword;
+
+impl std::fmt::Display for NeedsAppPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Google needs an app password here, not the account’s own password.")
+    }
+}
+
+impl std::error::Error for NeedsAppPassword {}
+
+/// Whether a server's refusal says it takes only an app password, as Gmail's does
+/// ("[ALERT] Application-specific password required", "534-5.7.9 Application-specific
+/// password required"). Only the start of the text is read.
+pub(crate) fn asks_for_app_password(said: &str) -> bool {
+    const PHRASE: &str = "application-specific password";
+    let start = said
+        .char_indices()
+        .nth(256)
+        .map_or(said, |(end, _)| &said[..end]);
+    start.to_ascii_lowercase().contains(PHRASE)
+}
+
 /// Gmail (or Google's sign-in) could not be reached at all: no network, most likely.
 #[derive(Debug)]
 pub struct Offline;
@@ -1316,6 +1342,17 @@ pub fn dmarc_domain(results: &str, from_address: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refusal_that_starts_by_asking_for_an_app_password_asks_for_one() {
+        assert!(asks_for_app_password(
+            "Application-specific password required: https://support.google.com/accounts/answer/185833 (Failure)"
+        ));
+        assert!(!asks_for_app_password("Invalid credentials (Failure)"));
+        assert!(!asks_for_app_password(""));
+        let late = format!("{} application-specific password", "x".repeat(300));
+        assert!(!asks_for_app_password(&late));
+    }
 
     #[test]
     fn a_message_shows_the_time_its_sender_wrote_unless_that_is_no_time() {
