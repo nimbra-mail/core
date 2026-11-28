@@ -4,6 +4,9 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+### Changed
+- IMAP search leaves out the words only Gmail has (`label:`, `in:`, `category:`, `filename:`, `larger:`, `is:important`, `has:userlabels` and the like) rather than searching for them as text, which found nothing. A search of nothing else finds nothing on IMAP, rather than every message, so the same query can be run on every account.
+
 ## [0.1.8] - 2026-11-28
 
 ### Breaking
