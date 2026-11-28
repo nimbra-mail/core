@@ -1008,6 +1008,7 @@ impl Client {
                 .query("metadataHeaders", "To")
                 .query("metadataHeaders", "Cc")
                 .query("metadataHeaders", "Subject")
+                .query("metadataHeaders", "Date")
                 .query("metadataHeaders", "Authentication-Results"),
             None,
         )?;
@@ -1132,7 +1133,8 @@ impl Client {
                                     .query("format", "metadata")
                                     .query("metadataHeaders", "From")
                                     .query("metadataHeaders", "To")
-                                    .query("metadataHeaders", "Cc"),
+                                    .query("metadataHeaders", "Cc")
+                                    .query("metadataHeaders", "Date"),
                                 None,
                             ),
                         );
@@ -2072,8 +2074,13 @@ impl RawMessage {
             .unwrap_or("")
     }
 
+    /// When the message is dated, as Gmail shows it (`mail::shown_time`): its Date header,
+    /// else when Gmail took it in.
     fn timestamp_ms(&self) -> i64 {
-        self.internal_date.parse().unwrap_or(0)
+        crate::mail::shown_time(
+            crate::mime::date_ms(self.header("Date")),
+            self.internal_date.parse().unwrap_or(0),
+        )
     }
 }
 
