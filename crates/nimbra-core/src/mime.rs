@@ -397,15 +397,11 @@ fn blocks_text(blocks: &[crate::rich::Block]) -> String {
 /// About 200 characters of text on one line, without invisible padding.
 fn preview(text: &str) -> String {
     let start: String = text.chars().take(MAX_BODY_CHARS).collect();
-    start
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::mail::one_line(&start)
         .chars()
-        .filter(|c| !c.is_control() && !['\u{200c}', '\u{200b}', '\u{feff}', '\u{34f}'].contains(c))
         .take(SNIPPET_CHARS)
         .collect::<String>()
-        .trim()
+        .trim_end()
         .to_string()
 }
 
