@@ -934,9 +934,16 @@ impl Client {
 
     /// Search with IMAP SEARCH: words in the text, and from:, to:, subject:, is:unread,
     /// is:starred as Gmail has them. Gmail's own words (`label:`, `category:`) are left out;
-    /// a search of nothing else finds nothing here.
+    /// a search of nothing else finds nothing here. Gmail's servers (an app password) are
+    /// given the words as typed, all of its search with them (`gmail_search`).
     fn search(&self, connection: &mut Connection, query: &str) -> Result<Vec<Summary>> {
-        let Some(criteria) = search_criteria(query)? else {
+        // Gmail's own servers take its search words as they are typed.
+        let criteria = if self.servers.is_gmail() {
+            Some(gmail_search(query)?)
+        } else {
+            search_criteria(query)?
+        };
+        let Some(criteria) = criteria else {
             return Ok(Vec::new());
         };
         let folders = self.view_folders(connection, View::Search, None)?;
@@ -2632,6 +2639,17 @@ fn days_back(value: &str, today: chrono::NaiveDate) -> Option<chrono::NaiveDate>
     }
 }
 
+/// A search on Gmail's own IMAP servers: the words as typed, Gmail's whole search syntax,
+/// through its X-GM-RAW criterion. Each run of spaces or line breaks is one space, so no
+/// line break reaches the command.
+fn gmail_search(query: &str) -> Result<String> {
+    let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    if query.is_empty() || query.len() > 500 {
+        bail!("Type something to search for.");
+    }
+    Ok(format!("X-GM-RAW {}", quote(&query)?))
+}
+
 /// Gmail's search words that IMAP has nothing for: its labels, categories and mailboxes,
 /// sizes, file names, and the `is:` and `has:` other than those IMAP can answer.
 fn gmail_only(key: &str, value: &str) -> bool {
@@ -3087,6 +3105,17 @@ mod tests {
         assert!(quote("a\r\nb").is_err());
         assert_eq!(quote("a\"b\\c").unwrap(), "\"a\\\"b\\\\c\"");
         assert!(search_criteria("   ").is_err());
+    }
+
+    #[test]
+    fn gmail_is_searched_as_typed() {
+        assert_eq!(
+            gmail_search("label:work  category:promotions \"big sale\"").unwrap(),
+            "X-GM-RAW \"label:work category:promotions \\\"big sale\\\"\""
+        );
+        let typed = gmail_search("x\r\nA1 DELETE INBOX").unwrap();
+        assert!(!typed.contains(['\r', '\n']));
+        assert!(gmail_search(" \n ").is_err());
     }
 
     #[test]

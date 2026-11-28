@@ -13,6 +13,7 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ### Changed
 - IMAP search leaves out the words only Gmail has (`label:`, `in:`, `category:`, `filename:`, `larger:`, `is:important`, `has:userlabels` and the like) rather than searching for them as text, which found nothing. A search of nothing else finds nothing on IMAP, rather than every message, so the same query can be run on every account.
+- Gmail over IMAP (an app password) is searched with Gmail's own search words as typed (X-GM-RAW), so `label:`, `category:` and the rest keep working there; other IMAP servers leave them out as above.
 
 ### Fixed
 - Two `addImapAccount` (or sign-in) calls for the same address at once no longer both keep it: the second is refused as already here and its saved sign-in forgotten.
