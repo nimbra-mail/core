@@ -401,9 +401,10 @@ pub struct Meta {
 }
 
 /// The rows' format: 1 added `Row::brand_domain`, 2 previews without the characters that
-/// take no room (`mail::one_line`), 3 Gmail's times as Gmail shows them (`mail::shown_time`). Rows kept in an older one only gain what is new when
+/// take no room (`mail::one_line`), 3 Gmail's times as Gmail shows them (`mail::shown_time`), 4 previews
+/// without padding words of joiners alone. Rows kept in an older one only gain what is new when
 /// their thread changes, so `Meta::current` lists each mailbox afresh once.
-pub const ROWS: u32 = 3;
+pub const ROWS: u32 = 4;
 
 impl Meta {
     /// As the current rows' format wants it: kept in an older one, without its sync points,
