@@ -4,6 +4,8 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-28
+
 ### Breaking
 - `Discovery` has a new case, `google(servers:)`, for gmail.com, googlemail.com and any domain whose mail Google runs (they were `needsOAuth(provider: "Google")`). Continue with Google stays the way in; `servers` are Gmail's (`imap.gmail.com` 993 and `smtp.gmail.com` 465, TLS, the full address as the user name) for adding the account with `addImapAccount` and an app password. `needsOAuth` is now Microsoft's or another provider's only. In the crate, `discover::Found::Google(Servers)`. Thanks, [slukedev](https://github.com/slukedev).
 - `NimbraError` has a new case, `NeedsAppPassword(accountId:)`: as `SignedOut`, when Gmail refused the Google account's own password because, with 2-Step Verification on, it takes only an app password. A `switch` on `NimbraError` covers it. Thanks, [slukedev](https://github.com/slukedev).

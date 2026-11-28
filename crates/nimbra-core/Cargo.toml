@@ -1,6 +1,6 @@
 [package]
 name = "nimbra-core"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "Nimbra's mail engine, without any UI: providers (Gmail, Microsoft, IMAP and SMTP), MIME, discovery, the encrypted store, sending, contacts, signatures and preferences."
 license = "MIT"
