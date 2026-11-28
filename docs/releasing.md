@@ -20,6 +20,11 @@ readers use the crate and the Swift package, so say what changed in the engine o
 changed record, a new required argument) goes under `### Breaking`, first, with what to change. Leave out refactors,
 CI and docs.
 
+Credit contributors. When a merged pull request's author is anyone other than the owner (`luangjokaj`), its line ends
+with a thanks linking their GitHub profile, by their login: `Thanks, [slukedev](https://github.com/slukedev).`
+`gh pr view <number> --json author` shows the author. The credit stays when the release turns Unreleased into a
+version.
+
 The release turns Unreleased into `## [<version>] - <date>`, with a fresh empty Unreleased above it, and uses that
 section as the release notes. With nothing under Unreleased, it drafts the section from the commits since the last tag
 (`feat` under Added, `fix` and `perf` under Fixed, a `!` or `BREAKING CHANGE:` under Breaking) and waits for you to
