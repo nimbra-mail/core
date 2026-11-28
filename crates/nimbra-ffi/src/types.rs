@@ -152,6 +152,10 @@ pub struct ThreadRow {
     pub participants: String,
     /// Its messages are on the device: `cached_thread` opens it at once, also offline.
     pub loaded: bool,
+    /// The domain whose brand logo may stand for the sender (`Engine::brand_logo`): the
+    /// latest message passed DMARC for it. `None` when unknown, and for a row kept before
+    /// 0.1.3 until its thread changes.
+    pub brand_domain: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -278,6 +282,9 @@ pub struct MailMessage {
     pub from: Person,
     pub to: Vec<Person>,
     pub cc: Vec<Person>,
+    /// Who it went to unseen: only ever on the account's own messages (Sent). Empty for a
+    /// message kept before 0.1.5.
+    pub bcc: Vec<Person>,
     pub reply_to: Option<Person>,
     /// The sender's name as shown, and their bare address for replying.
     pub sender: String,
@@ -389,6 +396,10 @@ pub enum AnswerKind {
 pub struct DraftStart {
     pub subject: String,
     pub to: Vec<String>,
+    /// For reply-all, who was on Cc goes on Cc again; on the account's own message, who
+    /// was on Bcc goes on Bcc. Empty for a reply and a forward.
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     /// The earlier message as text, folded under what is written; added when sent
     /// (`message_html`).
     pub quoted: Option<String>,
@@ -576,6 +587,38 @@ pub struct Preferences {
     pub badge: bool,
     /// New mail notifications play a sound.
     pub notification_sound: bool,
+    /// A conversation shows its latest message first and the older ones under it.
+    pub newest_first: bool,
+    /// A list row shows the subject and the start of the email on lines of their own,
+    /// rather than side by side.
+    pub subject_own_line: bool,
+    /// The size of mail text in the reader.
+    pub text_size: TextSize,
+}
+
+/// The size of mail text in the reader, from smallest to largest. The Mac draws them at
+/// 13.5, 15, 17 and 19 points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum TextSize {
+    Small,
+    Default,
+    Large,
+    ExtraLarge,
+}
+
+/// What the provider answered about an account's profile photo (`Engine::account_photo`).
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum AccountPhoto {
+    /// Theirs: the image's bytes (JPEG or PNG, as the provider serves it).
+    Image { bytes: Vec<u8> },
+    /// What Google gives every app, which may be a letter it drew rather than a photo: it
+    /// could not be told apart.
+    Unchecked { bytes: Vec<u8> },
+    /// The account has none that Nimbra can see (always so for IMAP and Microsoft).
+    NoPhoto,
+    /// The sign-in does not include the profile (signed in before Nimbra asked for it):
+    /// signing in again adds it.
+    NotAllowed,
 }
 
 // ------------------------------------------------------------------ conversions
@@ -728,6 +771,7 @@ impl From<&listing::Row> for ThreadRow {
             labels: row.labels.clone(),
             participants: row.participants.clone(),
             loaded: row.loaded,
+            brand_domain: row.brand_domain.clone(),
         }
     }
 }
@@ -738,6 +782,7 @@ impl MailMessage {
             from: (&header.from).into(),
             to: header.to.iter().map(Person::from).collect(),
             cc: header.cc.iter().map(Person::from).collect(),
+            bcc: header.bcc.iter().map(Person::from).collect(),
             reply_to: header.reply_to.as_ref().map(Person::from),
             sender: sender.to_string(),
             address: header.from.address.clone(),
@@ -879,6 +924,7 @@ impl From<&mail::Message> for MailMessage {
             from: (&message.from).into(),
             to: message.to.iter().map(Person::from).collect(),
             cc: message.cc.iter().map(Person::from).collect(),
+            bcc: message.bcc.iter().map(Person::from).collect(),
             reply_to: message.reply_to.as_ref().map(Person::from),
             sender: message.sender.clone(),
             address: message.address.clone(),
@@ -1072,6 +1118,78 @@ impl From<&scheduled::Scheduled> for ScheduledSend {
     }
 }
 
+impl From<&settings::Settings> for Preferences {
+    fn from(settings: &settings::Settings) -> Self {
+        Preferences {
+            notifications: settings.notifications,
+            original_view: settings.original_view,
+            load_images: settings.load_images,
+            dark_emails: settings.dark_emails,
+            mark_read: settings.mark_read.into(),
+            check_every_seconds: settings.check_every,
+            undo_send_seconds: settings.undo_send,
+            quote_replies: settings.quote_replies,
+            badge: settings.dock_badge,
+            notification_sound: settings.notify_sound,
+            newest_first: settings.newest_first,
+            subject_own_line: settings.subject_own_line,
+            text_size: settings.reader_text.into(),
+        }
+    }
+}
+
+impl Preferences {
+    /// Sets these in `settings`, within their bounds; the Mac's own settings stay as they are.
+    pub(crate) fn apply_to(&self, settings: &mut settings::Settings) {
+        settings.notifications = self.notifications;
+        settings.original_view = self.original_view;
+        settings.load_images = self.load_images;
+        settings.dark_emails = self.dark_emails;
+        settings.mark_read = self.mark_read.into();
+        settings.check_every = self.check_every_seconds.clamp(10, 24 * 60 * 60);
+        settings.undo_send = self.undo_send_seconds.min(60);
+        settings.quote_replies = self.quote_replies;
+        settings.dock_badge = self.badge;
+        settings.notify_sound = self.notification_sound;
+        settings.newest_first = self.newest_first;
+        settings.subject_own_line = self.subject_own_line;
+        settings.reader_text = self.text_size.into();
+    }
+}
+
+impl From<settings::TextSize> for TextSize {
+    fn from(size: settings::TextSize) -> Self {
+        match size {
+            settings::TextSize::Small => TextSize::Small,
+            settings::TextSize::Default => TextSize::Default,
+            settings::TextSize::Large => TextSize::Large,
+            settings::TextSize::ExtraLarge => TextSize::ExtraLarge,
+        }
+    }
+}
+
+impl From<TextSize> for settings::TextSize {
+    fn from(size: TextSize) -> Self {
+        match size {
+            TextSize::Small => settings::TextSize::Small,
+            TextSize::Default => settings::TextSize::Default,
+            TextSize::Large => settings::TextSize::Large,
+            TextSize::ExtraLarge => settings::TextSize::ExtraLarge,
+        }
+    }
+}
+
+impl From<mail::Photo> for AccountPhoto {
+    fn from(photo: mail::Photo) -> Self {
+        match photo {
+            mail::Photo::Image(bytes) => AccountPhoto::Image { bytes },
+            mail::Photo::Unchecked(bytes) => AccountPhoto::Unchecked { bytes },
+            mail::Photo::NoPhoto => AccountPhoto::NoPhoto,
+            mail::Photo::NotAllowed => AccountPhoto::NotAllowed,
+        }
+    }
+}
+
 impl From<settings::MarkRead> for MarkReadChoice {
     fn from(choice: settings::MarkRead) -> Self {
         match choice {
@@ -1089,5 +1207,61 @@ impl From<MarkReadChoice> for settings::MarkRead {
             MarkReadChoice::Delay => settings::MarkRead::Delay,
             MarkReadChoice::Never => settings::MarkRead::Never,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferences_kept_before_the_new_ones_read_as_their_defaults() {
+        let old: settings::Settings =
+            serde_json::from_str(r#"{"notifications": false, "undo_send": 10}"#).unwrap();
+        let preferences = Preferences::from(&old);
+        assert!(!preferences.notifications);
+        assert_eq!(preferences.undo_send_seconds, 10);
+        assert!(!preferences.newest_first);
+        assert!(preferences.subject_own_line);
+        assert_eq!(preferences.text_size, TextSize::Default);
+    }
+
+    #[test]
+    fn preferences_round_trip_through_the_settings_and_leave_the_macs_alone() {
+        let mut kept = settings::Settings {
+            list_width: 500.,
+            interface_zoom: 110,
+            ..settings::Settings::default()
+        };
+        for size in [
+            TextSize::Small,
+            TextSize::Default,
+            TextSize::Large,
+            TextSize::ExtraLarge,
+        ] {
+            let mut preferences = Preferences::from(&kept);
+            preferences.newest_first = !preferences.newest_first;
+            preferences.subject_own_line = !preferences.subject_own_line;
+            preferences.text_size = size;
+            preferences.mark_read = MarkReadChoice::Never;
+            preferences.apply_to(&mut kept);
+            assert_eq!(Preferences::from(&kept), preferences);
+            // Saved and read back, as the next launch reads them.
+            let saved: settings::Settings =
+                serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
+            assert_eq!(Preferences::from(&saved), preferences);
+        }
+        assert_eq!(kept.reader_text, settings::TextSize::ExtraLarge);
+        assert_eq!((kept.list_width, kept.interface_zoom), (500., 110));
+    }
+
+    #[test]
+    fn preferences_are_kept_within_their_bounds() {
+        let mut kept = settings::Settings::default();
+        let mut preferences = Preferences::from(&kept);
+        preferences.check_every_seconds = 1;
+        preferences.undo_send_seconds = 600;
+        preferences.apply_to(&mut kept);
+        assert_eq!((kept.check_every, kept.undo_send), (10, 60));
     }
 }

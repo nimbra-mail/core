@@ -67,6 +67,8 @@ pub struct Engine {
     pub(crate) sends: Mutex<u64>,
     /// Messages that wait for the connection, by account: sent by `catch_up`.
     pub(crate) waiting: Mutex<HashMap<String, Vec<Arc<sending::Job>>>>,
+    /// Brand logos, kept once for every account (`Store::open_shared`), opened on first use.
+    brands: Mutex<Option<Arc<Store>>>,
 }
 
 #[uniffi::export]
@@ -119,6 +121,7 @@ impl Engine {
             pending: Mutex::new(HashMap::new()),
             sends: Mutex::new(0),
             waiting: Mutex::new(HashMap::new()),
+            brands: Mutex::new(None),
         }))
     }
 
@@ -157,6 +160,36 @@ impl Engine {
             settings.default_account = Some(account_id);
             Ok(())
         })
+    }
+
+    /// Moves an account to another place in the list of accounts: `to` is its place after
+    /// the move (0 is first; past the end is last). The order is every list of accounts'
+    /// (All inboxes, From), as on the Mac; the default account stays the default. Disk.
+    pub fn move_account(&self, account_id: String, to: u32) -> Result<()> {
+        self.change_settings(|settings| {
+            if !settings.accounts.iter().any(|a| a.id == account_id) {
+                return Err(NimbraError::invalid("There is no such account."));
+            }
+            settings.move_account(&account_id, to as usize);
+            Ok(())
+        })
+    }
+
+    /// The account's profile photo as last fetched (`account_photo`), to show at once.
+    /// `None` until it has been fetched, or when the account has none. Disk.
+    pub fn kept_account_photo(&self, account_id: String) -> Result<Option<Vec<u8>>> {
+        let open = self.connect(&account_id)?;
+        Ok(accounts::kept_photo(&open.store))
+    }
+
+    /// Asks the provider for the account's profile photo, and keeps what it answered (an
+    /// image, or that there is none) for `kept_account_photo`. Only Gmail accounts have
+    /// one; the others answer `NoPhoto`. Network.
+    pub fn account_photo(&self, account_id: String) -> Result<AccountPhoto> {
+        let open = self.connect(&account_id)?;
+        let photo = open.client.profile_photo()?;
+        accounts::keep_photo(&open.store, &photo)?;
+        Ok(photo.into())
     }
 
     /// Starts a Google sign-in that comes back to `redirect_uri` (for an iOS client,
@@ -971,38 +1004,50 @@ impl Engine {
         })
     }
 
+    // -------------------------------------------------------------- brand logos
+
+    /// The brand logo of a domain (a row's `brand_domain`): an SVG of at most 32 KB, or
+    /// `None` when the domain has none to show (no enforced DMARC policy, no BIMI record,
+    /// or a logo that is not one). Kept once for every account, a found logo for a week
+    /// and that there is none for a day, so the brand's server learns that it was asked,
+    /// not when or how often its mail was read. Errors (offline, a resolver that does not
+    /// answer TXT) are not kept: ask again later. The SVG comes from the sender's server:
+    /// draw it as an image only, never in a web view. DNS and network on a miss (the TXT
+    /// lookups go to `DnsResolver::txt` when the app set one), else disk.
+    pub fn brand_logo(&self, domain: String) -> Result<Option<Vec<u8>>> {
+        let store = self.brands()?;
+        Ok(nimbra_core::bimi::logo(&store, &domain)?)
+    }
+
+    // -------------------------------------------------------------- privacy
+
+    /// Clears the mail kept on this device for every account, as the Mac's Settings ›
+    /// Privacy does for its account (`accounts::clear_kept_mail`): the lists, threads and
+    /// everything else each account's store holds, also the snoozes and reminders kept on
+    /// the device, changes and messages waiting for the connection, the blocked senders,
+    /// the addresses learnt for suggestions and the profile photo. The mail on the server,
+    /// the sign-ins, the settings and the brand logos stay; mailboxes are downloaded again
+    /// as they are opened. An account whose store cannot be opened (signed out) is left
+    /// out. Disk (and the Keychain for a store not opened yet).
+    pub fn clear_kept_mail(&self) {
+        for account in self.accounts() {
+            if let Ok(open) = self.connect(&account.id) {
+                Self::clear_kept(&open);
+            }
+        }
+    }
+
     // -------------------------------------------------------------- preferences
 
     /// The preferences, as set. Memory only.
     pub fn preferences(&self) -> Preferences {
-        let settings = locked(&self.settings);
-        Preferences {
-            notifications: settings.notifications,
-            original_view: settings.original_view,
-            load_images: settings.load_images,
-            dark_emails: settings.dark_emails,
-            mark_read: settings.mark_read.into(),
-            check_every_seconds: settings.check_every,
-            undo_send_seconds: settings.undo_send,
-            quote_replies: settings.quote_replies,
-            badge: settings.dock_badge,
-            notification_sound: settings.notify_sound,
-        }
+        Preferences::from(&*locked(&self.settings))
     }
 
     /// Changes the preferences and saves them. Disk.
     pub fn set_preferences(&self, preferences: Preferences) -> Result<()> {
         self.change_settings(|settings| {
-            settings.notifications = preferences.notifications;
-            settings.original_view = preferences.original_view;
-            settings.load_images = preferences.load_images;
-            settings.dark_emails = preferences.dark_emails;
-            settings.mark_read = preferences.mark_read.into();
-            settings.check_every = preferences.check_every_seconds.clamp(10, 24 * 60 * 60);
-            settings.undo_send = preferences.undo_send_seconds.min(60);
-            settings.quote_replies = preferences.quote_replies;
-            settings.dock_badge = preferences.badge;
-            settings.notify_sound = preferences.notification_sound;
+            preferences.apply_to(settings);
             Ok(())
         })
     }
@@ -1017,6 +1062,22 @@ pub(crate) fn kind_of(account: &AccountRef) -> AccountKind {
 }
 
 impl Engine {
+    /// Clears what one account keeps on the device (`clear_kept_mail`).
+    fn clear_kept(open: &Open) {
+        accounts::clear_kept_mail(&open.store, &*open.client);
+    }
+
+    /// The store brand logos are kept in, opened on first use. Disk and Keychain.
+    fn brands(&self) -> Result<Arc<Store>> {
+        let mut kept = locked(&self.brands);
+        if let Some(store) = kept.as_ref() {
+            return Ok(store.clone());
+        }
+        let store = Arc::new(Store::open_shared("brands")?);
+        *kept = Some(store.clone());
+        Ok(store)
+    }
+
     fn google(&self) -> Result<&gmail::Config> {
         self.google
             .as_ref()
@@ -1730,6 +1791,176 @@ mod tests {
         assert!(fake.labels_of("m4").contains(&"INBOX".to_string()));
         assert!(engine.blocked_senders(id.clone()).unwrap().is_empty());
         engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn reply_all_keeps_cc_and_on_my_own_message_bcc() {
+        use nimbra_core::testing::Fake;
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "cc@example.com");
+        fake.add(Fake::thread("theirs", &["INBOX"], 2));
+        fake.add(Fake::thread("mine", &["INBOX"], 1));
+        engine.refresh_mailbox(id.clone(), Mailbox::Inbox).unwrap();
+        let open = engine.connect(&id).unwrap();
+        let person = |address: &str| mail::Person {
+            name: String::new(),
+            address: address.into(),
+        };
+        // Someone else's message, with a Cc.
+        let mut theirs = mail::Provider::thread(&*fake, "theirs").unwrap();
+        theirs[0].cc = vec![person("carla@example.com")];
+        listing::keep_thread(&open.store, "theirs", theirs).unwrap();
+        // My own message: to Ana, Bcc to Ben.
+        let mut mine = mail::Provider::thread(&*fake, "mine").unwrap();
+        mine[0].from = person("cc@example.com");
+        mine[0].address = "cc@example.com".into();
+        mine[0].to = vec![person("ana@example.com")];
+        mine[0].bcc = vec![person("ben@example.com")];
+        listing::keep_thread(&open.store, "mine", mine).unwrap();
+
+        let all = engine
+            .start_answer(
+                id.clone(),
+                "theirs".into(),
+                AnswerKind::ReplyAll,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(all.to, ["theirs@example.com"]);
+        assert_eq!(all.cc, ["carla@example.com"]);
+        assert!(all.bcc.is_empty());
+        let one = engine
+            .start_answer(
+                id.clone(),
+                "theirs".into(),
+                AnswerKind::Reply,
+                String::new(),
+            )
+            .unwrap();
+        assert!(
+            one.cc.is_empty() && one.bcc.is_empty(),
+            "a reply is to the sender only"
+        );
+        let own = engine
+            .start_answer(
+                id.clone(),
+                "mine".into(),
+                AnswerKind::ReplyAll,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(own.to, ["ana@example.com"]);
+        assert_eq!(own.bcc, ["ben@example.com"]);
+        // The kept thread shows who it went to unseen.
+        let kept = engine
+            .cached_thread(id.clone(), "mine".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.messages[0].bcc[0].address, "ben@example.com");
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn accounts_move_and_the_default_stays() {
+        let engine = engine();
+        let (a, _) = fake_account(&engine, "order-a@example.com");
+        let (b, _) = fake_account(&engine, "order-b@example.com");
+        let (c, _) = fake_account(&engine, "order-c@example.com");
+        let default = engine
+            .accounts()
+            .into_iter()
+            .find(|x| x.is_default)
+            .map(|x| x.id);
+        // Other tests' accounts come and go meanwhile: only these three are checked.
+        let order = |engine: &Engine| -> Vec<String> {
+            engine
+                .accounts()
+                .into_iter()
+                .map(|x| x.id)
+                .filter(|x| [&a, &b, &c].contains(&x))
+                .collect()
+        };
+        assert_eq!(order(&engine), [a.clone(), b.clone(), c.clone()]);
+        engine.move_account(c.clone(), 0).unwrap();
+        assert_eq!(engine.accounts()[0].id, c);
+        assert_eq!(order(&engine), [c.clone(), a.clone(), b.clone()]);
+        engine.move_account(c.clone(), u32::MAX).unwrap();
+        assert_eq!(order(&engine), [a.clone(), b.clone(), c.clone()]);
+        assert_eq!(
+            engine
+                .accounts()
+                .into_iter()
+                .find(|x| x.is_default)
+                .map(|x| x.id),
+            default
+        );
+        assert!(matches!(
+            engine.move_account("nobody".into(), 0),
+            Err(NimbraError::Invalid { .. })
+        ));
+        for id in [a, b, c] {
+            engine.remove_account(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_photo_is_kept_as_answered_and_clearing_kept_mail_lists_afresh() {
+        use nimbra_core::testing::Fake;
+        let engine = engine();
+        let (id, fake) = fake_account(&engine, "photo@example.com");
+        let open = engine.connect(&id).unwrap();
+        open.store.save(accounts::PHOTO, &b"png".to_vec()).unwrap();
+        assert_eq!(
+            engine.kept_account_photo(id.clone()).unwrap().as_deref(),
+            Some(&b"png"[..])
+        );
+        // The fake, as IMAP, has none: the kept one goes.
+        assert_eq!(
+            engine.account_photo(id.clone()).unwrap(),
+            AccountPhoto::NoPhoto
+        );
+        assert_eq!(engine.kept_account_photo(id.clone()).unwrap(), None);
+
+        let mut branded = Fake::thread("brand", &["INBOX"], 1);
+        branded.brand_domain = Some("example.com".into());
+        fake.add(branded);
+        let page = engine.refresh_mailbox(id.clone(), Mailbox::Inbox).unwrap();
+        assert_eq!(page.threads[0].brand_domain.as_deref(), Some("example.com"));
+        assert!(
+            !engine
+                .cached_threads(id.clone(), Mailbox::Inbox)
+                .unwrap()
+                .is_empty()
+        );
+        Engine::clear_kept(&open);
+        assert!(store::flush_store(
+            &open.store,
+            std::time::Instant::now() + std::time::Duration::from_secs(5)
+        ));
+        assert!(
+            engine
+                .cached_threads(id.clone(), Mailbox::Inbox)
+                .unwrap()
+                .is_empty()
+        );
+        // Listed again from the server.
+        assert_eq!(
+            engine
+                .refresh_mailbox(id.clone(), Mailbox::Inbox)
+                .unwrap()
+                .threads
+                .len(),
+            1
+        );
+        engine.remove_account(id).unwrap();
+    }
+
+    #[test]
+    fn a_brand_logo_is_asked_for_a_domain_only() {
+        let engine = engine();
+        for bad in ["", "localhost", "a b.com", "example.com/logo"] {
+            assert!(engine.brand_logo(bad.into()).is_err(), "{bad:?}");
+        }
     }
 
     fn url_of(text: &str) -> url::Url {

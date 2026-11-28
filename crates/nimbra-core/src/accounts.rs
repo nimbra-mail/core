@@ -83,6 +83,40 @@ pub fn forget_secrets_and_mail(id: &str) {
     store::wipe(id);
 }
 
+/// The store record an account's profile photo is kept under, to show at once before it
+/// is asked for again.
+pub const PHOTO: &str = "profile-photo";
+
+/// Keeps what the provider answered about the account's photo in its store: the image
+/// (also one Google could not check), or nothing when it has none. A sign-in that does not
+/// include the profile changes nothing, so a photo kept before stays. Blocking (disk).
+pub fn keep_photo(store: &store::Store, photo: &mail::Photo) -> Result<()> {
+    match photo {
+        mail::Photo::Image(bytes) | mail::Photo::Unchecked(bytes) => store.save(PHOTO, bytes),
+        mail::Photo::NoPhoto => {
+            store.remove(PHOTO);
+            Ok(())
+        }
+        mail::Photo::NotAllowed => Ok(()),
+    }
+}
+
+/// The account's photo as last kept (`keep_photo`). Blocking (disk).
+pub fn kept_photo(store: &store::Store) -> Option<Vec<u8>> {
+    store.load(PHOTO)
+}
+
+/// Forgets the mail kept on the device for an account, as Settings › Privacy clears it:
+/// every record of its store (after what was handed to its writer before), and the rows
+/// its connection keeps in memory. The mail on the server, the sign-in and the store's key
+/// stay; what is kept is downloaded again as needed. What the store also held goes with
+/// it: the snoozes and reminders kept on the device, changes and messages waiting for the
+/// connection, the blocked senders, the addresses learnt for suggestions and the photo.
+pub fn clear_kept_mail(store: &Arc<store::Store>, client: &mail::Client) {
+    store.clear_soon();
+    client.forget_rows();
+}
+
 /// Takes an account out of the settings: its entry, its signatures, and its place as the
 /// default account.
 pub fn remove(settings: &mut Settings, id: &str) {
@@ -148,5 +182,36 @@ mod tests {
         );
         assert!(duplicate_of(&settings, "ana@example.com", "a1").is_some_and(|a| a.id == "new"));
         assert!(duplicate_of(&settings, "zed@example.com", "a1").is_none());
+    }
+
+    #[test]
+    fn a_photo_is_kept_until_the_account_has_none_and_a_refusal_changes_nothing() {
+        let store = store::Store::temp();
+        assert_eq!(kept_photo(&store), None);
+        keep_photo(&store, &mail::Photo::Image(b"png".to_vec())).unwrap();
+        assert_eq!(kept_photo(&store).as_deref(), Some(&b"png"[..]));
+        keep_photo(&store, &mail::Photo::NotAllowed).unwrap();
+        assert_eq!(kept_photo(&store).as_deref(), Some(&b"png"[..]));
+        keep_photo(&store, &mail::Photo::Unchecked(b"letter".to_vec())).unwrap();
+        assert_eq!(kept_photo(&store).as_deref(), Some(&b"letter"[..]));
+        keep_photo(&store, &mail::Photo::NoPhoto).unwrap();
+        assert_eq!(kept_photo(&store), None);
+    }
+
+    #[test]
+    fn clearing_kept_mail_empties_the_store_and_keeps_it_usable() {
+        let store = Arc::new(store::Store::temp());
+        store.save("view-inbox", &vec![1u32, 2]).unwrap();
+        store.save(PHOTO, &b"png".to_vec()).unwrap();
+        let fake = crate::testing::Fake::new("clear@example.com");
+        clear_kept_mail(&store, &*fake);
+        assert!(store::flush_store(
+            &store,
+            std::time::Instant::now() + std::time::Duration::from_secs(5)
+        ));
+        assert_eq!(store.load::<Vec<u32>>("view-inbox"), None);
+        assert_eq!(kept_photo(&store), None);
+        store.save("view-inbox", &vec![3u32]).unwrap();
+        assert_eq!(store.load::<Vec<u32>>("view-inbox"), Some(vec![3]));
     }
 }

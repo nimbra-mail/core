@@ -1,7 +1,8 @@
-//! Server discovery's MX lookups through the app (iOS: the sandbox has no
-//! `/etc/resolv.conf`): Swift answers them with the system's resolver
-//! (`DNSServiceQueryRecord`), so the question goes where any lookup on the device goes and
-//! never to a third party. The engine checks the answers (`nimbra_core::dns`).
+//! The engine's DNS lookups through the app (iOS: the sandbox has no `/etc/resolv.conf`):
+//! server discovery's MX records and brand logos' TXT records. Swift answers them with the
+//! system's resolver (`DNSServiceQueryRecord`), so the question goes where any lookup on
+//! the device goes and never to a third party. The engine checks the answers
+//! (`nimbra_core::dns`).
 
 use std::sync::Arc;
 
@@ -38,11 +39,17 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for DnsError {
     }
 }
 
-/// The app's resolver for MX records. `domain` is a domain name; answer its MX records
-/// (none when it has none), within a few seconds. Called from background threads.
+/// The app's resolver. Each answers within a few seconds, and is called from background
+/// threads.
 #[uniffi::export(with_foreign)]
 pub trait DnsResolver: Send + Sync {
+    /// `domain` is a domain name: its MX records, none when it has none.
     fn mx(&self, domain: String) -> std::result::Result<Vec<MxRecord>, DnsError>;
+    /// `name` is a domain name that may have `_` labels (`_dmarc.example.com`,
+    /// `default._bimi.example.com`): its TXT records, each one's character strings joined
+    /// with nothing between them, none when it has none (NXDOMAIN too). For brand logos
+    /// (`Engine::brand_logo`).
+    fn txt(&self, name: String) -> std::result::Result<Vec<String>, DnsError>;
 }
 
 struct App(Arc<dyn DnsResolver>);
@@ -59,10 +66,17 @@ impl nimbra_core::dns::Resolver for App {
             })
             .map_err(|error| anyhow::anyhow!("{error}"))
     }
+
+    fn txt(&self, name: &str) -> anyhow::Result<Vec<String>> {
+        self.0
+            .txt(name.to_string())
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
 }
 
-/// From now on, server discovery's MX lookups go to `resolver`. Once per process, before
-/// the first `discover_servers`; the Mac's resolver is used when this is never called.
+/// From now on, the engine's MX and TXT lookups go to `resolver`. Once per process, before
+/// the first `discover_servers` or `brand_logo`; the Mac's resolver is used when this is
+/// never called.
 /// Memory only.
 #[uniffi::export]
 pub fn use_dns_resolver(resolver: Arc<dyn DnsResolver>) -> Result<()> {
@@ -89,6 +103,16 @@ mod tests {
                 host: format!("mx.{domain}"),
             }])
         }
+
+        fn txt(&self, name: String) -> std::result::Result<Vec<String>, DnsError> {
+            match name.as_str() {
+                "_dmarc.example.com" => Ok(vec!["v=DMARC1; p=reject".into()]),
+                "_dmarc.example.org" => Err(DnsError::Failed {
+                    message: "timed out".into(),
+                }),
+                _ => Ok(Vec::new()),
+            }
+        }
     }
 
     #[test]
@@ -99,5 +123,11 @@ mod tests {
             [(10, "mx.example.com".to_string())]
         );
         assert!(app.mx("example.org").is_err());
+        assert_eq!(
+            app.txt("_dmarc.example.com").unwrap(),
+            ["v=DMARC1; p=reject"]
+        );
+        assert!(app.txt("_dmarc.example.net").unwrap().is_empty());
+        assert!(app.txt("_dmarc.example.org").is_err());
     }
 }
