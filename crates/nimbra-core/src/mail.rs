@@ -1098,17 +1098,79 @@ pub(crate) fn sender_name(from: &str) -> String {
     }
 }
 
+/// When a message shows as sent, as Gmail shows it: the time its sender wrote on it (the
+/// Date header), which for bulk mail can be most of an hour off from delivery; when it came
+/// in instead when that is missing, not a date, or over a day after it came in (a clock far
+/// off, or spam that wants to stay on top of the list). 0 for neither.
+pub(crate) fn shown_time(written_ms: Option<i64>, arrived_ms: i64) -> i64 {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    match written_ms.filter(|&written| written > 0) {
+        Some(written) if arrived_ms <= 0 || written <= arrived_ms.saturating_add(DAY_MS) => written,
+        _ => arrived_ms.max(0),
+    }
+}
+
 /// Gmail snippets are HTML-escaped.
 pub(crate) fn decode_entities(text: &str) -> String {
-    text.replace("&#39;", "’")
-        .replace("&quot;", "\"")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace(['\u{200c}', '\u{200b}', '\u{feff}', '\u{34f}'], "")
-        .trim()
-        .to_string()
+    one_line(
+        &text
+            .replace("&#39;", "’")
+            .replace("&quot;", "\"")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Text for one line, such as a preview: without the characters that take no room, and
+/// with each run of spaces (and line breaks) as one space. Newsletters pad their preview
+/// with those characters, after the words they mean to show, to keep the rest of the email
+/// out of it; kept, they would end the line in a long run of nothing.
+pub(crate) fn one_line(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !takes_no_room(c))
+        // A line break or tab is a space between words; other control characters too.
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        // A "word" of nothing but joiners and marks is padding too (a run of joiners with
+        // spaces between, say); an emoji keeps its own, as they sit in a visible word.
+        .filter(|word| !word.chars().all(only_joins))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Characters that only change the one before or join it to the next: not seen alone.
+fn only_joins(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200d}' // zero width joiner
+            | '\u{fe00}'..='\u{fe0f}' // variation selectors
+            | '\u{0300}'..='\u{036f}' // combining marks
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe20}'..='\u{fe2f}'
+            | '\u{e0100}'..='\u{e01ef}'
+    )
+}
+
+/// Characters that are not seen. Not the joiner and variation selectors emoji are made of.
+fn takes_no_room(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}' // soft hyphen
+            | '\u{034f}' // combining grapheme joiner
+            | '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}' // Hangul fillers
+            | '\u{17b4}' | '\u{17b5}' // Khmer vowels that show nothing
+            | '\u{180e}' // Mongolian vowel separator
+            | '\u{200b}' | '\u{200c}' | '\u{200e}' | '\u{200f}' // zero width, direction marks
+            | '\u{2060}'
+            ..='\u{2064}' // word joiner and invisible operators
+            | '\u{2800}' // blank Braille pattern
+            | '\u{feff}' // zero width no-break space
+    )
 }
 
 /// Splits a message into paragraphs and drops the quoted reply chain.
@@ -1290,6 +1352,53 @@ mod tests {
         assert!(!asks_for_app_password(""));
         let late = format!("{} application-specific password", "x".repeat(300));
         assert!(!asks_for_app_password(&late));
+    }
+
+    #[test]
+    fn a_message_shows_the_time_its_sender_wrote_unless_that_is_no_time() {
+        let arrived = 1_764_270_000_000;
+        // Bulk mail whose Date is most of an hour off from when it came in.
+        let written = arrived - 54 * 60 * 1000;
+        assert_eq!(shown_time(Some(written), arrived), written);
+        // A few minutes ahead (a sender's clock) still counts; days ahead does not.
+        assert_eq!(
+            shown_time(Some(arrived + 300_000), arrived),
+            arrived + 300_000
+        );
+        assert_eq!(shown_time(Some(arrived + 3 * 86_400_000), arrived), arrived);
+        assert_eq!(shown_time(None, arrived), arrived);
+        assert_eq!(shown_time(Some(0), arrived), arrived);
+        assert_eq!(shown_time(Some(written), 0), written);
+        assert_eq!(shown_time(None, 0), 0);
+    }
+
+    #[test]
+    fn a_preview_padded_with_invisible_characters_ends_with_its_words() {
+        // As a newsletter's preheader comes: the words, then padding that shows nothing.
+        let padded = format!(
+            "10 new leads {}",
+            "\u{34f} \u{200c} \u{a0} \u{ad} \u{2007} ".repeat(40)
+        );
+        assert_eq!(one_line(&padded), "10 new leads");
+        assert_eq!(
+            decode_entities(&format!("Hi &amp; welcome{}", " &nbsp;\u{200c}".repeat(30))),
+            "Hi & welcome"
+        );
+        assert_eq!(
+            one_line("\u{2800}\u{2800}Sale \u{2060}ends\u{feff} today"),
+            "Sale ends today"
+        );
+        // Joiners with spaces between, as some preheaders pad with them.
+        let joined = format!("10 new leads{}", " \u{200d}\u{a0}\u{fe0f}".repeat(40));
+        assert_eq!(one_line(&joined), "10 new leads");
+    }
+
+    #[test]
+    fn a_preview_keeps_its_words_apart_and_its_emoji_whole() {
+        assert_eq!(one_line("Hello\nWorld\t!\r\n"), "Hello World !");
+        // A family emoji is people joined by U+200D; a heart with U+FE0F is shown red.
+        let emoji = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{2764}\u{fe0f}";
+        assert_eq!(one_line(emoji), emoji);
     }
 
     #[test]

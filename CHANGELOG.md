@@ -11,9 +11,41 @@ Changes to the mail engine (the `nimbra-core` crate) and its Swift API (the `Nim
 ### Added
 - In the crate: `servers::gmail(email)`, `Servers::is_gmail()`, `Servers::normalize_password(typed)` (control characters around a password, such as a line break or tab, go; a Google app password loses the spaces Google shows it with, and no other provider's password loses any) and `mail::NeedsAppPassword`, next to `mail::SignedOut` from IMAP and `smtp::AuthFailed` from SMTP. `addImapAccount` and `updateImapPassword` normalize the password before checking and keeping it.
 
+### Changed
+- IMAP search leaves out the words only Gmail has (`label:`, `in:`, `category:`, `filename:`, `larger:`, `is:important`, `has:userlabels` and the like) rather than searching for them as text, which found nothing. A search of nothing else finds nothing on IMAP, rather than every message, so the same query can be run on every account.
+
 ### Fixed
 - Two `addImapAccount` (or sign-in) calls for the same address at once no longer both keep it: the second is refused as already here and its saved sign-in forgotten.
 - Gmail over IMAP: Important (`\Important`) is no longer listed as a label, as All Mail and Starred are not, and a message sent through Gmail is not filed in Sent again (Gmail files it itself).
+
+## [0.1.8] - 2026-11-28
+
+### Breaking
+- Swift: `DraftStart` has new fields `cc` and `bcc`, `MailMessage` a new field `bcc`, `ThreadRow` a new field `brandDomain`, and `Preferences` new fields `newestFirst`, `subjectOwnLine` and `textSize`: code that builds them with their initializer (a sample engine, tests) passes them too (`[]`, `nil`, or `false`, `true` and `.default` for the preferences' defaults).
+- Swift: `DnsResolver` has a new requirement, `txt(name:)`: an app's resolver answers TXT records too (with `kDNSServiceType_TXT`, each record's character strings joined), or throws `DnsError.failed`, and then no brand logo is shown.
+
+### Added
+- Swift: `Engine.moveAccount(accountId:to:)` moves an account to another place in the list of accounts, as the Mac's Settings › Accounts does (`Settings::move_account`); the default account stays the default.
+- Swift: `Engine.accountPhoto(accountId:)` (network) asks for the account's profile photo, an `AccountPhoto` (`.image(bytes:)`, `.unchecked(bytes:)`, `.noPhoto`, `.notAllowed`), and keeps it; `Engine.keptAccountPhoto(accountId:)` gives the one kept, to show at once. In the crate, `accounts::keep_photo`, `accounts::kept_photo` and `accounts::PHOTO` keep it as the Mac does.
+- Swift: brand logos. `ThreadRow.brandDomain` says whose logo may stand for the sender, and `Engine.brandLogo(domain:)` (DNS and network on a miss) gives that domain's logo as SVG bytes (`bimi::logo`), kept once for every account in an app-wide store.
+- Swift: `Engine.clearKeptMail()` clears the mail kept on the device for every account, as the Mac's Settings › Privacy does; the mail on the server, the sign-ins and the settings stay. In the crate, `accounts::clear_kept_mail(store, client)`.
+- Swift: `Preferences.newestFirst`, `Preferences.subjectOwnLine` and `Preferences.textSize` (a new `TextSize` enum: `small`, `default`, `large`, `extraLarge`), read from and saved to the same settings as the Mac's, with their defaults for settings kept before them.
+- Swift: `MailMessage.bcc`: who the account's own message went to unseen.
+
+### Fixed
+- Swift: reply-all keeps Cc and Bcc. `Engine.startAnswer` dropped them, so a reply-all on iOS went to the sender and their To only: `DraftStart.cc` and `DraftStart.bcc` now carry who `composing::answer` keeps there.
+
+## [0.1.7] - 2026-11-28
+
+### Breaking
+- `Settings` has two new fields, `newest_first` and `subject_own_line`: code that builds a `Settings` field by field sets them too (or uses `..Settings::default()`).
+
+### Added
+- `Settings::newest_first`: a conversation shows its latest message first and the older ones under it. `Settings::subject_own_line`: a list row shows the subject and the start of the email on lines of their own. `newest_first` is off by default and `subject_own_line` on, also for settings kept before them.
+
+### Fixed
+- Gmail messages are dated as Gmail shows them: by the time their sender wrote on them (the Date header, now asked for with each thread's and message's metadata), rather than when Gmail took them in, which for bulk mail can be most of an hour apart. When that header is missing, not a date, or over a day after the message came in, the time it came in counts, on IMAP as on Gmail (`mail::shown_time`). Rows kept before are listed again once with these times (`listing::ROWS`).
+- Previews (Gmail's snippets and the ones read from IMAP) drop the characters that take no room, such as the zero-width and filler characters newsletters pad their preview with, and keep each run of spaces as one space, so a row no longer ends in a long blank run cut off with "…". Line breaks and tabs count as spaces, a word of nothing but joiners or combining marks (padding of joiners with spaces between) goes too, and emoji keep their joiners. `listing::ROWS` is 4, so each mailbox is listed afresh once and rows kept before get their cleaned previews.
 
 ## [0.1.6] - 2026-11-27
 

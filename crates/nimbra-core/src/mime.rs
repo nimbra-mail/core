@@ -272,6 +272,14 @@ fn ids(value: Option<&HeaderValue>) -> Vec<String> {
         .collect()
 }
 
+/// A Date header's time (RFC 5322), in milliseconds.
+pub(crate) fn date_ms(value: &str) -> Option<i64> {
+    mail_parser::DateTime::parse_rfc822(value.trim())
+        .filter(|date| date.is_valid())
+        .map(|date| date.to_timestamp().saturating_mul(1000))
+        .filter(|&ms| ms > 0)
+}
+
 fn timestamp_ms(parsed: &Parsed) -> i64 {
     parsed
         .date()
@@ -397,15 +405,11 @@ fn blocks_text(blocks: &[crate::rich::Block]) -> String {
 /// About 200 characters of text on one line, without invisible padding.
 fn preview(text: &str) -> String {
     let start: String = text.chars().take(MAX_BODY_CHARS).collect();
-    start
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::mail::one_line(&start)
         .chars()
-        .filter(|c| !c.is_control() && !['\u{200c}', '\u{200b}', '\u{feff}', '\u{34f}'].contains(c))
         .take(SNIPPET_CHARS)
         .collect::<String>()
-        .trim()
+        .trim_end()
         .to_string()
 }
 
@@ -503,6 +507,22 @@ fn inline_images(html: &mut String, parsed: &Parsed) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn date_headers_are_read_as_senders_write_them() {
+        // 2026-11-28 00:43:12 UTC, however it is written.
+        let at = 1_795_826_592_000;
+        for value in [
+            "Sat, 28 Nov 2026 01:43:12 +0100",
+            " Sat, 28 Nov 2026 00:43:12 +0000 (UTC)",
+            "28 Nov 2026 02:43:12 +0200",
+            "Fri, 27 Nov 2026 19:43:12 -0500 (EST)",
+        ] {
+            assert_eq!(date_ms(value), Some(at), "{value}");
+        }
+        assert_eq!(date_ms(""), None);
+        assert_eq!(date_ms("not a date"), None);
+    }
 
     #[test]
     fn only_the_topmost_authentication_results_is_kept() {

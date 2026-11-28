@@ -714,11 +714,10 @@ impl Client {
                 } else {
                     format!("<{key}@nimbra.invalid>")
                 };
-                let timestamp_ms = if headers.timestamp_ms > 0 {
-                    headers.timestamp_ms
-                } else {
-                    fetch.internal_date().map_or(0, |d| d.timestamp_millis())
-                };
+                let timestamp_ms = crate::mail::shown_time(
+                    Some(headers.timestamp_ms),
+                    fetch.internal_date().map_or(0, |d| d.timestamp_millis()),
+                );
                 let root = headers
                     .references
                     .first()
@@ -934,9 +933,12 @@ impl Client {
     }
 
     /// Search with IMAP SEARCH: words in the text, and from:, to:, subject:, is:unread,
-    /// is:starred as Gmail has them.
+    /// is:starred as Gmail has them. Gmail's own words (`label:`, `category:`) are left out;
+    /// a search of nothing else finds nothing here.
     fn search(&self, connection: &mut Connection, query: &str) -> Result<Vec<Summary>> {
-        let criteria = search_criteria(query)?;
+        let Some(criteria) = search_criteria(query)? else {
+            return Ok(Vec::new());
+        };
         let folders = self.view_folders(connection, View::Search, None)?;
         let all = self.label_folders(connection)?;
         self.ensure_indexed(connection, &all)?;
@@ -1490,11 +1492,10 @@ impl Provider for Client {
                     let Some(headers) = fetch.header().and_then(crate::mime::headers) else {
                         continue;
                     };
-                    let timestamp_ms = if headers.timestamp_ms > 0 {
-                        headers.timestamp_ms
-                    } else {
-                        fetch.internal_date().map_or(0, |d| d.timestamp_millis())
-                    };
+                    let timestamp_ms = crate::mail::shown_time(
+                        Some(headers.timestamp_ms),
+                        fetch.internal_date().map_or(0, |d| d.timestamp_millis()),
+                    );
                     people.push(Met {
                         from: headers.from,
                         to: headers.to,
@@ -2611,8 +2612,9 @@ fn quote(text: &str) -> Result<String> {
 
 /// IMAP SEARCH criteria from the words typed, all of which must match: from:, to:, cc:,
 /// bcc:, subject:, is:unread, is:read, is:starred, has:attachment, newer_than: and
-/// older_than: (as Gmail's: 7d, 2w, 3m, 1y), and plain words (in the text).
-fn search_criteria(query: &str) -> Result<String> {
+/// older_than: (as Gmail's: 7d, 2w, 3m, 1y), and plain words (in the text). Words only
+/// Gmail has (`gmail_only`) are left out; `None` when nothing else was typed.
+fn search_criteria(query: &str) -> Result<Option<String>> {
     search_criteria_on(query, chrono::Local::now().date_naive())
 }
 
@@ -2630,7 +2632,21 @@ fn days_back(value: &str, today: chrono::NaiveDate) -> Option<chrono::NaiveDate>
     }
 }
 
-fn search_criteria_on(query: &str, today: chrono::NaiveDate) -> Result<String> {
+/// Gmail's search words that IMAP has nothing for: its labels, categories and mailboxes,
+/// sizes, file names, and the `is:` and `has:` other than those IMAP can answer.
+fn gmail_only(key: &str, value: &str) -> bool {
+    match key {
+        "in" | "label" | "category" | "filename" | "larger" | "smaller" | "size" | "after"
+        | "before" | "older" | "newer" | "deliveredto" | "list" | "rfc822msgid" | "around" => true,
+        "is" => !["unread", "read", "starred"]
+            .iter()
+            .any(|known| value.eq_ignore_ascii_case(known)),
+        "has" => !value.eq_ignore_ascii_case("attachment"),
+        _ => false,
+    }
+}
+
+fn search_criteria_on(query: &str, today: chrono::NaiveDate) -> Result<Option<String>> {
     let query = query.trim();
     if query.is_empty() || query.len() > 500 {
         bail!("Type something to search for.");
@@ -2639,7 +2655,11 @@ fn search_criteria_on(query: &str, today: chrono::NaiveDate) -> Result<String> {
     for word in query.split_whitespace() {
         let (key, value) = word.split_once(':').unwrap_or(("", word));
         let value = value.trim_matches('"');
-        let part = match key.to_ascii_lowercase().as_str() {
+        let key = key.to_ascii_lowercase();
+        if gmail_only(&key, value) {
+            continue;
+        }
+        let part = match key.as_str() {
             "from" => format!("FROM {}", quote(value)?),
             "to" => format!("TO {}", quote(value)?),
             "cc" => format!("CC {}", quote(value)?),
@@ -2666,7 +2686,7 @@ fn search_criteria_on(query: &str, today: chrono::NaiveDate) -> Result<String> {
         };
         parts.push(part);
     }
-    Ok(parts.join(" "))
+    Ok((!parts.is_empty()).then(|| parts.join(" ")))
 }
 
 /// The Message-ID header of a raw message.
@@ -3016,39 +3036,49 @@ mod tests {
     #[test]
     fn search_words_cannot_carry_a_command() {
         assert_eq!(
-            search_criteria("from:ana invoice \"due\"").unwrap(),
+            search_criteria("from:ana invoice \"due\"")
+                .unwrap()
+                .unwrap(),
             "FROM \"ana\" TEXT \"invoice\" TEXT \"due\""
         );
-        assert_eq!(search_criteria("is:unread").unwrap(), "UNSEEN");
+        assert_eq!(search_criteria("is:unread").unwrap().unwrap(), "UNSEEN");
         // Gmail's search words, as IMAP has them.
         let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
         assert_eq!(
-            search_criteria_on("bcc:ana cc:ben", today).unwrap(),
+            search_criteria_on("bcc:ana cc:ben", today)
+                .unwrap()
+                .unwrap(),
             "BCC \"ana\" CC \"ben\""
         );
         assert_eq!(
-            search_criteria_on("has:attachment", today).unwrap(),
+            search_criteria_on("has:attachment", today)
+                .unwrap()
+                .unwrap(),
             "HEADER Content-Type \"multipart/mixed\""
         );
         assert_eq!(
-            search_criteria_on("newer_than:7d", today).unwrap(),
+            search_criteria_on("newer_than:7d", today).unwrap().unwrap(),
             "SINCE 20-Nov-2026"
         );
         assert_eq!(
-            search_criteria_on("older_than:2w newer_than:1y", today).unwrap(),
+            search_criteria_on("older_than:2w newer_than:1y", today)
+                .unwrap()
+                .unwrap(),
             "BEFORE 13-Nov-2026 SINCE 27-Nov-2025"
         );
         assert_eq!(
-            search_criteria_on("newer_than:3m", today).unwrap(),
+            search_criteria_on("newer_than:3m", today).unwrap().unwrap(),
             "SINCE 27-Aug-2026"
         );
         // Not a date: searched as the words typed.
         assert_eq!(
-            search_criteria_on("newer_than:soon", today).unwrap(),
+            search_criteria_on("newer_than:soon", today)
+                .unwrap()
+                .unwrap(),
             "TEXT \"newer_than:soon\""
         );
         // Line breaks only ever separate words: none reaches the command.
-        let typed = search_criteria("x\r\nA1 DELETE INBOX").unwrap();
+        let typed = search_criteria("x\r\nA1 DELETE INBOX").unwrap().unwrap();
         assert!(!typed.contains(['\r', '\n']));
         assert_eq!(
             typed,
@@ -3057,6 +3087,37 @@ mod tests {
         assert!(quote("a\r\nb").is_err());
         assert_eq!(quote("a\"b\\c").unwrap(), "\"a\\\"b\\\\c\"");
         assert!(search_criteria("   ").is_err());
+    }
+
+    #[test]
+    fn gmail_only_words_are_left_out() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 28).unwrap();
+        let criteria = |q| search_criteria_on(q, today).unwrap();
+        assert_eq!(
+            criteria("label:work from:ana").as_deref(),
+            Some("FROM \"ana\"")
+        );
+        assert_eq!(
+            criteria("in:inbox Category:Promotions sale").as_deref(),
+            Some("TEXT \"sale\"")
+        );
+        assert_eq!(
+            criteria("is:important is:unread").as_deref(),
+            Some("UNSEEN")
+        );
+        assert_eq!(
+            criteria("has:userlabels has:attachment").as_deref(),
+            Some("HEADER Content-Type \"multipart/mixed\"")
+        );
+        // Nothing IMAP can search for: no criteria at all, rather than every message.
+        assert_eq!(criteria("category:promotions"), None);
+        assert_eq!(criteria("label:a larger:5M"), None);
+        // Other words with a colon are still words.
+        assert_eq!(criteria("re:").as_deref(), Some("TEXT \"re:\""));
+        assert_eq!(
+            criteria("https://example.com").as_deref(),
+            Some("TEXT \"https://example.com\"")
+        );
     }
 
     #[test]

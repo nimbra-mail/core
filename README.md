@@ -2,7 +2,7 @@
 
 Nimbra's mail engine, without any UI: Gmail, Microsoft and IMAP/SMTP accounts, MIME, server discovery, the
 encrypted on-device store, sending (undo send and send later), snooze and reminders, blocked senders, address
-suggestions, signatures and preferences. Both Nimbra apps run it: the macOS app ([desktop](https://github.com/nimbra-mail/desktop))
+suggestions, brand logos (BIMI), signatures and preferences. Both Nimbra apps run it: the macOS app ([desktop](https://github.com/nimbra-mail/desktop))
 as a Rust crate, and the iOS app ([ios](https://github.com/nimbra-mail/ios)) as a Swift package.
 
 Private by default: mail and sign-ins stay on the device. Secrets live only in the Keychain, the store is encrypted
@@ -12,7 +12,7 @@ with a key kept there, and nothing secret is logged or put into an error.
 
 | Path | What |
 | --- | --- |
-| `crates/nimbra-core` | The engine. `mail.rs` is the model and the `Provider` interface; `gmail.rs`, `microsoft.rs`, `imap_mail.rs`, `smtp.rs` and `tls.rs` the providers; `store.rs` the encrypted store and `listing.rs` the mailboxes kept in it (rows, change-feed sync, All inboxes, the Split Inbox, labels); `snooze.rs`, `outbox.rs`, `sending.rs`, `scheduled.rs` and `leaving.rs` snooze, the offline queue and sending; `composing.rs` the HTML sent and replies; `accounts.rs`, `notifying.rs`, `watching.rs` and `contacts.rs` accounts, notifications and the badge, live updates and address suggestions; `oauth.rs` a sign-in that comes back to an app's own redirect; `paths.rs` where an app other than the Mac's keeps its files. Its `lib.rs` lists them all. |
+| `crates/nimbra-core` | The engine. `mail.rs` is the model and the `Provider` interface; `gmail.rs`, `microsoft.rs`, `imap_mail.rs`, `smtp.rs` and `tls.rs` the providers; `store.rs` the encrypted store and `listing.rs` the mailboxes kept in it (rows, change-feed sync, All inboxes, the Split Inbox, labels); `snooze.rs`, `outbox.rs`, `sending.rs`, `scheduled.rs` and `leaving.rs` snooze, the offline queue and sending; `composing.rs` the HTML sent and replies; `bimi.rs` brand logos for senders that pass DMARC; `settings.rs` the preferences both apps share; `accounts.rs`, `notifying.rs`, `watching.rs` and `contacts.rs` accounts, notifications and the badge, live updates and address suggestions; `oauth.rs` a sign-in that comes back to an app's own redirect; `paths.rs` where an app other than the Mac's keeps its files. Its `lib.rs` lists them all. |
 | `crates/nimbra-ffi` | The engine for Swift, through [UniFFI](https://mozilla.github.io/uniffi-rs): one `Engine` object, a `SecretStore` the app implements, and a few free functions. |
 | `Package.swift`, `Sources/NimbraCore` | The Swift package iOS uses: the generated Swift API (kept in git, never edited by hand) over `NimbraFFI.xcframework`. |
 | `scripts/build-ios-core.sh` | Builds the XCFramework (iPhone and Apple silicon simulator) and generates the Swift API. |
@@ -41,7 +41,7 @@ committing there), and `status` says which one is in use.
 `Cargo.toml`:
 
 ```toml
-nimbra-core = { git = "https://github.com/nimbra-mail/core", tag = "v0.1.0" }
+nimbra-core = { git = "https://github.com/nimbra-mail/core", tag = "v0.1.7" }
 ```
 
 The app brings the modules in by name (`use nimbra_core::{mail, gmail, …}`), so its code reads `crate::mail` as
@@ -55,7 +55,7 @@ they have always been (`~/Library/Application Support/Nimbra`).
 packages:
   NimbraCore:
     url: https://github.com/nimbra-mail/core
-    exactVersion: 0.1.0
+    exactVersion: 0.1.7
 ```
 
 In Swift:
@@ -81,13 +81,15 @@ The Swift API, by area (each `Engine` method says in its doc whether it goes to 
 
 | Area | Calls |
 | --- | --- |
-| Setup | `Engine(config:dataDir:cacheDir:secrets:)`, `flush`, `useDnsResolver` (MX lookups through the system on iOS) |
-| Accounts | `accounts`, `setDefaultAccount`, `begin`/`finishGoogleSignIn`, `begin`/`finishMicrosoftSignIn`, `discoverServers`, `addImapAccount`, `updateImapPassword`, `removeAccount` |
-| Mailboxes | `mailboxes`, `cachedThreads`, `refreshMailbox`, `loadMore`, `cachedAllInboxes`, `allInboxes`, `search`, `labels`, `counts`, `cachedCounts` |
-| Reading | `readThread`, `cachedThread`, `downloadAttachment`, `fetchRemoteImage`, `parseMailto`, `unsubscribeAction` |
-| Actions | `apply` (queued when offline), `moveToInbox`, `moveToLabel`, `relabel`, label CRUD, `deleteThread`, `blockSender`, `unblockSender` |
+| Setup | `Engine(config:dataDir:cacheDir:secrets:)`, `flush`, `useDnsResolver` (MX and TXT lookups through the system on iOS), `coreVersion` |
+| Accounts | `accounts`, `setDefaultAccount`, `moveAccount`, `accountPhoto`, `keptAccountPhoto`, `begin`/`finishGoogleSignIn`, `begin`/`finishMicrosoftSignIn`, `cancelSignIn`, `knownServers`, `discoverServers`, `addImapAccount`, `updateImapPassword`, `removeAccount`, `isEmailAddress` |
+| Mailboxes | `mailboxes`, `cachedThreads`, `refreshMailbox`, `loadMore`, `cachedAllInboxes`, `allInboxes`, `cachedEveryMailbox`, `everyMailbox`, `search`, `labels`, `counts`, `cachedCounts` |
+| Reading | `readThread`, `cachedThread`, `brandLogo`, `downloadAttachment`, `fetchRemoteImage`, `parseMailto`, `unsubscribeAction` |
+| Actions | `apply` (queued when offline), `undoAction`, `moveToInbox`, `moveToLabel`, `relabel`, label CRUD, `deleteThread`, `blockSender`, `unblockSender`, `blockedSenders` |
 | Snooze | `snooze`, `snoozed`, `unsnooze`, `wakeDue`, `snoozeTimes`, `parseTime`, `dayTime` |
-| Writing | `startAnswer`, `messageHtml`, `splitDraftHtml`, `saveDraft`, `queueSend` then `OutgoingSend.deliver`/`undo`, `unsent`, `catchUp`, `scheduleSend`, `sendDue`, `sendLaterTimes`, `suggestContacts`, `learnContacts` |
+| Writing | `startAnswer`, `messageHtml`, `splitDraftHtml`, `textToHtml`, `saveDraft`, `saveToDrafts`, `draftForThread`, `deleteDraft`, `queueSend` then `OutgoingSend.deliver`/`undo`, `unsent`, `catchUp`, `scheduleSend`, `scheduledSends`, `cancelScheduled`, `sendDue`, `sendLaterTimes`, `suggestContacts`, `learnContacts` |
+| Signatures | `signatures`, `addSignature`, `updateSignature`, `deleteSignature`, `setDefaultSignature` |
+| Preferences | `preferences`, `setPreferences` (the shared `Settings`), `clearKeptMail` |
 | Staying current | `checkForChanges` (what to notify about), `watch` (`ChangeWatch`), `checkIntervalSeconds`, `pendingWork` (the next deadline for a timer or background task), `badgeCount`, `markReadAfterMs` |
 
 ## Building for iOS

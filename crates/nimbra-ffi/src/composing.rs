@@ -11,7 +11,8 @@ use crate::types::*;
 #[uniffi::export]
 impl Engine {
     /// What a reply, reply-all or forward of a thread's latest message starts with: its
-    /// subject, who it goes to (never the account itself, each once), the earlier message
+    /// subject, who it goes to (never the account itself, each once; reply-all keeps Cc
+    /// and, on the account's own message, Bcc where they were), the earlier message
     /// quoted (a reply only when Quote replies is on), the files a forward carries, and the
     /// account's default signature. `date_text` is that message's date as the app writes
     /// it (it goes into "On …, … wrote:"). From the device when the thread is kept with its
@@ -67,6 +68,8 @@ impl Engine {
         Ok(DraftStart {
             subject: answered.subject,
             to: answered.to,
+            cc: answered.cc,
+            bcc: answered.bcc,
             quoted: answered.quoted,
             kept: answered.kept.iter().map(AttachmentInfo::from).collect(),
             reply: answered.reply.map(|reply| ReplyRef {

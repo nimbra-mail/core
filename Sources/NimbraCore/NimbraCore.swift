@@ -840,17 +840,28 @@ public func FfiConverterTypeChangeWatch_lift(_ handle: UInt64) throws -> ChangeW
 
 
 /**
- * The app's resolver for MX records. `domain` is a domain name; answer its MX records
- * (none when it has none), within a few seconds. Called from background threads.
+ * The app's resolver. Each answers within a few seconds, and is called from background
+ * threads.
  */
 public protocol DnsResolver: AnyObject, Sendable {
     
+    /**
+     * `domain` is a domain name: its MX records, none when it has none.
+     */
     func mx(domain: String) throws  -> [MxRecord]
+    
+    /**
+     * `name` is a domain name that may have `_` labels (`_dmarc.example.com`,
+     * `default._bimi.example.com`): its TXT records, each one's character strings joined
+     * with nothing between them, none when it has none (NXDOMAIN too). For brand logos
+     * (`Engine::brand_logo`).
+     */
+    func txt(name: String) throws  -> [String]
     
 }
 /**
- * The app's resolver for MX records. `domain` is a domain name; answer its MX records
- * (none when it has none), within a few seconds. Called from background threads.
+ * The app's resolver. Each answers within a few seconds, and is called from background
+ * threads.
  */
 open class DnsResolverImpl: DnsResolver, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -905,12 +916,31 @@ open class DnsResolverImpl: DnsResolver, @unchecked Sendable {
     
 
     
+    /**
+     * `domain` is a domain name: its MX records, none when it has none.
+     */
 open func mx(domain: String)throws  -> [MxRecord]  {
     return try  FfiConverterSequenceTypeMxRecord.lift(try rustCallWithError(FfiConverterTypeDnsError_lift) {
         uniffiCallStatus in
     uniffi_nimbra_ffi_fn_method_dnsresolver_mx(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(domain),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * `name` is a domain name that may have `_` labels (`_dmarc.example.com`,
+     * `default._bimi.example.com`): its TXT records, each one's character strings joined
+     * with nothing between them, none when it has none (NXDOMAIN too). For brand logos
+     * (`Engine::brand_logo`).
+     */
+open func txt(name: String)throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeDnsError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_dnsresolver_txt(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),uniffiCallStatus
     )
 })
 }
@@ -963,6 +993,33 @@ fileprivate struct UniffiCallbackInterfaceDnsResolver {
 
             
             let writeReturn = { uniffiOutReturn.pointee = FfiConverterSequenceTypeMxRecord.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeDnsError_lower
+            )
+        },
+        txt: { (
+            uniffiHandle: UInt64,
+            name: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            nonisolated(unsafe) let name = name
+
+            let makeCall: @Sendable () throws -> [String] = {
+                () throws -> [String] in
+                guard let uniffiObj = try? FfiConverterTypeDnsResolver.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.txt(
+                     name: try FfiConverterString.lift(name)
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterSequenceString.lower($0) }
             uniffiTraitInterfaceCallWithError(
                 callStatus: uniffiCallStatus,
                 makeCall: makeCall,
@@ -1053,13 +1110,21 @@ public protocol EngineProtocol: AnyObject, Sendable {
     
     /**
      * What a reply, reply-all or forward of a thread's latest message starts with: its
-     * subject, who it goes to (never the account itself, each once), the earlier message
+     * subject, who it goes to (never the account itself, each once; reply-all keeps Cc
+     * and, on the account's own message, Bcc where they were), the earlier message
      * quoted (a reply only when Quote replies is on), the files a forward carries, and the
      * account's default signature. `date_text` is that message's date as the app writes
      * it (it goes into "On …, … wrote:"). From the device when the thread is kept with its
      * messages, else fetched (network) and kept.
      */
     func startAnswer(accountId: String, threadId: String, kind: AnswerKind, dateText: String) throws  -> DraftStart
+    
+    /**
+     * Asks the provider for the account's profile photo, and keeps what it answered (an
+     * image, or that there is none) for `kept_account_photo`. Only Gmail accounts have
+     * one; the others answer `NoPhoto`. Network.
+     */
+    func accountPhoto(accountId: String) throws  -> AccountPhoto
     
     /**
      * The accounts on this device, in their order. Memory only.
@@ -1118,6 +1183,18 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func blockedSenders(accountId: String) throws  -> [String]
     
     /**
+     * The brand logo of a domain (a row's `brand_domain`): an SVG of at most 32 KB, or
+     * `None` when the domain has none to show (no enforced DMARC policy, no BIMI record,
+     * or a logo that is not one). Kept once for every account, a found logo for a week
+     * and that there is none for a day, so the brand's server learns that it was asked,
+     * not when or how often its mail was read. Errors (offline, a resolver that does not
+     * answer TXT) are not kept: ask again later. The SVG comes from the sender's server:
+     * draw it as an image only, never in a web view. DNS and network on a miss (the TXT
+     * lookups go to `DnsResolver::txt` when the app set one), else disk.
+     */
+    func brandLogo(domain: String) throws  -> Data?
+    
+    /**
      * Forgets a sign-in that was started and will not be finished (the user closed the
      * browser). Memory only.
      */
@@ -1130,6 +1207,18 @@ public protocol EngineProtocol: AnyObject, Sendable {
      * what blocked senders left in the inbox meanwhile is put away. Network.
      */
     func checkForChanges(accountId: String, cursor: String?) throws  -> SyncResult
+    
+    /**
+     * Clears the mail kept on this device for every account, as the Mac's Settings ›
+     * Privacy does for its account (`accounts::clear_kept_mail`): the lists, threads and
+     * everything else each account's store holds, also the snoozes and reminders kept on
+     * the device, changes and messages waiting for the connection, the blocked senders,
+     * the addresses learnt for suggestions and the profile photo. The mail on the server,
+     * the sign-ins, the settings and the brand logos stay; mailboxes are downloaded again
+     * as they are opened. An account whose store cannot be opened (signed out) is left
+     * out. Disk (and the Keychain for a store not opened yet).
+     */
+    func clearKeptMail() 
     
     /**
      * Unread and total threads for these labels ("INBOX", "STARRED", label ids). Network.
@@ -1203,6 +1292,12 @@ public protocol EngineProtocol: AnyObject, Sendable {
     func flush()  -> Bool
     
     /**
+     * The account's profile photo as last fetched (`account_photo`), to show at once.
+     * `None` until it has been fetched, or when the account has none. Disk.
+     */
+    func keptAccountPhoto(accountId: String) throws  -> Data?
+    
+    /**
      * The account's own labels (IMAP: its folders). Network.
      */
     func labels(accountId: String) throws  -> [Label]
@@ -1220,6 +1315,13 @@ public protocol EngineProtocol: AnyObject, Sendable {
      * only when the user says so (`None`). Memory only.
      */
     func markReadAfterMs()  -> UInt32?
+    
+    /**
+     * Moves an account to another place in the list of accounts: `to` is its place after
+     * the move (0 is first; past the end is last). The order is every list of accounts'
+     * (All inboxes, From), as on the Mac; the default account stays the default. Disk.
+     */
+    func moveAccount(accountId: String, to: UInt32) throws 
     
     /**
      * Move to Inbox from `from`: out of Spam (not spam) or Trash (restored), else out of
@@ -1577,7 +1679,8 @@ public convenience init(config: EngineConfig, dataDir: String, cacheDir: String,
     
     /**
      * What a reply, reply-all or forward of a thread's latest message starts with: its
-     * subject, who it goes to (never the account itself, each once), the earlier message
+     * subject, who it goes to (never the account itself, each once; reply-all keeps Cc
+     * and, on the account's own message, Bcc where they were), the earlier message
      * quoted (a reply only when Quote replies is on), the files a forward carries, and the
      * account's default signature. `date_text` is that message's date as the app writes
      * it (it goes into "On …, … wrote:"). From the device when the thread is kept with its
@@ -1592,6 +1695,21 @@ open func startAnswer(accountId: String, threadId: String, kind: AnswerKind, dat
         FfiConverterString.lower(threadId),
         FfiConverterTypeAnswerKind_lower(kind),
         FfiConverterString.lower(dateText),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Asks the provider for the account's profile photo, and keeps what it answered (an
+     * image, or that there is none) for `kept_account_photo`. Only Gmail accounts have
+     * one; the others answer `NoPhoto`. Network.
+     */
+open func accountPhoto(accountId: String)throws  -> AccountPhoto  {
+    return try  FfiConverterTypeAccountPhoto_lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_account_photo(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
     )
 })
 }
@@ -1733,6 +1851,26 @@ open func blockedSenders(accountId: String)throws  -> [String]  {
 }
     
     /**
+     * The brand logo of a domain (a row's `brand_domain`): an SVG of at most 32 KB, or
+     * `None` when the domain has none to show (no enforced DMARC policy, no BIMI record,
+     * or a logo that is not one). Kept once for every account, a found logo for a week
+     * and that there is none for a day, so the brand's server learns that it was asked,
+     * not when or how often its mail was read. Errors (offline, a resolver that does not
+     * answer TXT) are not kept: ask again later. The SVG comes from the sender's server:
+     * draw it as an image only, never in a web view. DNS and network on a miss (the TXT
+     * lookups go to `DnsResolver::txt` when the app set one), else disk.
+     */
+open func brandLogo(domain: String)throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_brand_logo(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(domain),uniffiCallStatus
+    )
+})
+}
+    
+    /**
      * Forgets a sign-in that was started and will not be finished (the user closed the
      * browser). Memory only.
      */
@@ -1760,6 +1898,24 @@ open func checkForChanges(accountId: String, cursor: String?)throws  -> SyncResu
         FfiConverterOptionString.lower(cursor),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Clears the mail kept on this device for every account, as the Mac's Settings ›
+     * Privacy does for its account (`accounts::clear_kept_mail`): the lists, threads and
+     * everything else each account's store holds, also the snoozes and reminders kept on
+     * the device, changes and messages waiting for the connection, the blocked senders,
+     * the addresses learnt for suggestions and the profile photo. The mail on the server,
+     * the sign-ins, the settings and the brand logos stay; mailboxes are downloaded again
+     * as they are opened. An account whose store cannot be opened (signed out) is left
+     * out. Disk (and the Keychain for a store not opened yet).
+     */
+open func clearKeptMail()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_clear_kept_mail(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -1935,6 +2091,20 @@ open func flush() -> Bool  {
 }
     
     /**
+     * The account's profile photo as last fetched (`account_photo`), to show at once.
+     * `None` until it has been fetched, or when the account has none. Disk.
+     */
+open func keptAccountPhoto(accountId: String)throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_kept_account_photo(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
      * The account's own labels (IMAP: its folders). Network.
      */
 open func labels(accountId: String)throws  -> [Label]  {
@@ -1974,6 +2144,21 @@ open func markReadAfterMs() -> UInt32?  {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Moves an account to another place in the list of accounts: `to` is its place after
+     * the move (0 is first; past the end is last). The order is every list of accounts'
+     * (All inboxes, From), as on the Mac; the default account stays the default. Disk.
+     */
+open func moveAccount(accountId: String, to: UInt32)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
+        uniffiCallStatus in
+    uniffi_nimbra_ffi_fn_method_engine_move_account(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(accountId),
+        FfiConverterUInt32.lower(to),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -3715,6 +3900,12 @@ public struct DraftStart: Equatable, Hashable {
     public var subject: String
     public var to: [String]
     /**
+     * For reply-all, who was on Cc goes on Cc again; on the account's own message, who
+     * was on Bcc goes on Bcc. Empty for a reply and a forward.
+     */
+    public var cc: [String]
+    public var bcc: [String]
+    /**
      * The earlier message as text, folded under what is written; added when sent
      * (`message_html`).
      */
@@ -3733,6 +3924,10 @@ public struct DraftStart: Equatable, Hashable {
     // declare one manually.
     public init(subject: String, to: [String], 
         /**
+         * For reply-all, who was on Cc goes on Cc again; on the account's own message, who
+         * was on Bcc goes on Bcc. Empty for a reply and a forward.
+         */cc: [String], bcc: [String], 
+        /**
          * The earlier message as text, folded under what is written; added when sent
          * (`message_html`).
          */quoted: String?, 
@@ -3744,6 +3939,8 @@ public struct DraftStart: Equatable, Hashable {
          */signature: SignatureInfo?) {
         self.subject = subject
         self.to = to
+        self.cc = cc
+        self.bcc = bcc
         self.quoted = quoted
         self.kept = kept
         self.reply = reply
@@ -3768,6 +3965,8 @@ public struct FfiConverterTypeDraftStart: FfiConverterRustBuffer {
             try DraftStart(
                 subject: FfiConverterString.read(from: &buf), 
                 to: FfiConverterSequenceString.read(from: &buf), 
+                cc: FfiConverterSequenceString.read(from: &buf), 
+                bcc: FfiConverterSequenceString.read(from: &buf), 
                 quoted: FfiConverterOptionString.read(from: &buf), 
                 kept: FfiConverterSequenceTypeAttachmentInfo.read(from: &buf), 
                 reply: FfiConverterOptionTypeReplyRef.read(from: &buf), 
@@ -3778,6 +3977,8 @@ public struct FfiConverterTypeDraftStart: FfiConverterRustBuffer {
     public static func write(_ value: DraftStart, into buf: inout [UInt8]) {
         FfiConverterString.write(value.subject, into: &buf)
         FfiConverterSequenceString.write(value.to, into: &buf)
+        FfiConverterSequenceString.write(value.cc, into: &buf)
+        FfiConverterSequenceString.write(value.bcc, into: &buf)
         FfiConverterOptionString.write(value.quoted, into: &buf)
         FfiConverterSequenceTypeAttachmentInfo.write(value.kept, into: &buf)
         FfiConverterOptionTypeReplyRef.write(value.reply, into: &buf)
@@ -3979,6 +4180,11 @@ public struct MailMessage: Equatable, Hashable {
     public var from: Person
     public var to: [Person]
     public var cc: [Person]
+    /**
+     * Who it went to unseen: only ever on the account's own messages (Sent). Empty for a
+     * message kept before 0.1.5.
+     */
+    public var bcc: [Person]
     public var replyTo: Person?
     /**
      * The sender's name as shown, and their bare address for replying.
@@ -4012,7 +4218,11 @@ public struct MailMessage: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(from: Person, to: [Person], cc: [Person], replyTo: Person?, 
+    public init(from: Person, to: [Person], cc: [Person], 
+        /**
+         * Who it went to unseen: only ever on the account's own messages (Sent). Empty for a
+         * message kept before 0.1.5.
+         */bcc: [Person], replyTo: Person?, 
         /**
          * The sender's name as shown, and their bare address for replying.
          */sender: String, address: String, 
@@ -4034,6 +4244,7 @@ public struct MailMessage: Equatable, Hashable {
         self.from = from
         self.to = to
         self.cc = cc
+        self.bcc = bcc
         self.replyTo = replyTo
         self.sender = sender
         self.address = address
@@ -4067,6 +4278,7 @@ public struct FfiConverterTypeMailMessage: FfiConverterRustBuffer {
                 from: FfiConverterTypePerson.read(from: &buf), 
                 to: FfiConverterSequenceTypePerson.read(from: &buf), 
                 cc: FfiConverterSequenceTypePerson.read(from: &buf), 
+                bcc: FfiConverterSequenceTypePerson.read(from: &buf), 
                 replyTo: FfiConverterOptionTypePerson.read(from: &buf), 
                 sender: FfiConverterString.read(from: &buf), 
                 address: FfiConverterString.read(from: &buf), 
@@ -4086,6 +4298,7 @@ public struct FfiConverterTypeMailMessage: FfiConverterRustBuffer {
         FfiConverterTypePerson.write(value.from, into: &buf)
         FfiConverterSequenceTypePerson.write(value.to, into: &buf)
         FfiConverterSequenceTypePerson.write(value.cc, into: &buf)
+        FfiConverterSequenceTypePerson.write(value.bcc, into: &buf)
         FfiConverterOptionTypePerson.write(value.replyTo, into: &buf)
         FfiConverterString.write(value.sender, into: &buf)
         FfiConverterString.write(value.address, into: &buf)
@@ -4876,6 +5089,19 @@ public struct Preferences: Equatable, Hashable {
      * New mail notifications play a sound.
      */
     public var notificationSound: Bool
+    /**
+     * A conversation shows its latest message first and the older ones under it.
+     */
+    public var newestFirst: Bool
+    /**
+     * A list row shows the subject and the start of the email on lines of their own,
+     * rather than side by side.
+     */
+    public var subjectOwnLine: Bool
+    /**
+     * The size of mail text in the reader.
+     */
+    public var textSize: TextSize
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -4903,7 +5129,17 @@ public struct Preferences: Equatable, Hashable {
          */badge: Bool, 
         /**
          * New mail notifications play a sound.
-         */notificationSound: Bool) {
+         */notificationSound: Bool, 
+        /**
+         * A conversation shows its latest message first and the older ones under it.
+         */newestFirst: Bool, 
+        /**
+         * A list row shows the subject and the start of the email on lines of their own,
+         * rather than side by side.
+         */subjectOwnLine: Bool, 
+        /**
+         * The size of mail text in the reader.
+         */textSize: TextSize) {
         self.notifications = notifications
         self.originalView = originalView
         self.loadImages = loadImages
@@ -4914,6 +5150,9 @@ public struct Preferences: Equatable, Hashable {
         self.quoteReplies = quoteReplies
         self.badge = badge
         self.notificationSound = notificationSound
+        self.newestFirst = newestFirst
+        self.subjectOwnLine = subjectOwnLine
+        self.textSize = textSize
     }
 
     
@@ -4941,7 +5180,10 @@ public struct FfiConverterTypePreferences: FfiConverterRustBuffer {
                 undoSendSeconds: FfiConverterUInt32.read(from: &buf), 
                 quoteReplies: FfiConverterBool.read(from: &buf), 
                 badge: FfiConverterBool.read(from: &buf), 
-                notificationSound: FfiConverterBool.read(from: &buf)
+                notificationSound: FfiConverterBool.read(from: &buf), 
+                newestFirst: FfiConverterBool.read(from: &buf), 
+                subjectOwnLine: FfiConverterBool.read(from: &buf), 
+                textSize: FfiConverterTypeTextSize.read(from: &buf)
         )
     }
 
@@ -4956,6 +5198,9 @@ public struct FfiConverterTypePreferences: FfiConverterRustBuffer {
         FfiConverterBool.write(value.quoteReplies, into: &buf)
         FfiConverterBool.write(value.badge, into: &buf)
         FfiConverterBool.write(value.notificationSound, into: &buf)
+        FfiConverterBool.write(value.newestFirst, into: &buf)
+        FfiConverterBool.write(value.subjectOwnLine, into: &buf)
+        FfiConverterTypeTextSize.write(value.textSize, into: &buf)
     }
 }
 
@@ -5800,6 +6045,12 @@ public struct ThreadRow: Equatable, Hashable {
      * Its messages are on the device: `cached_thread` opens it at once, also offline.
      */
     public var loaded: Bool
+    /**
+     * The domain whose brand logo may stand for the sender (`Engine::brand_logo`): the
+     * latest message passed DMARC for it. `None` when unknown, and for a row kept before
+     * 0.1.3 until its thread changes.
+     */
+    public var brandDomain: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -5824,7 +6075,12 @@ public struct ThreadRow: Equatable, Hashable {
          */participants: String, 
         /**
          * Its messages are on the device: `cached_thread` opens it at once, also offline.
-         */loaded: Bool) {
+         */loaded: Bool, 
+        /**
+         * The domain whose brand logo may stand for the sender (`Engine::brand_logo`): the
+         * latest message passed DMARC for it. `None` when unknown, and for a row kept before
+         * 0.1.3 until its thread changes.
+         */brandDomain: String?) {
         self.id = id
         self.accountId = accountId
         self.sender = sender
@@ -5838,6 +6094,7 @@ public struct ThreadRow: Equatable, Hashable {
         self.labels = labels
         self.participants = participants
         self.loaded = loaded
+        self.brandDomain = brandDomain
     }
 
     
@@ -5868,7 +6125,8 @@ public struct FfiConverterTypeThreadRow: FfiConverterRustBuffer {
                 starred: FfiConverterBool.read(from: &buf), 
                 labels: FfiConverterSequenceString.read(from: &buf), 
                 participants: FfiConverterString.read(from: &buf), 
-                loaded: FfiConverterBool.read(from: &buf)
+                loaded: FfiConverterBool.read(from: &buf), 
+                brandDomain: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -5886,6 +6144,7 @@ public struct FfiConverterTypeThreadRow: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.labels, into: &buf)
         FfiConverterString.write(value.participants, into: &buf)
         FfiConverterBool.write(value.loaded, into: &buf)
+        FfiConverterOptionString.write(value.brandDomain, into: &buf)
     }
 }
 
@@ -6097,6 +6356,109 @@ public func FfiConverterTypeAccountKind_lift(_ buf: RustBuffer) throws -> Accoun
 #endif
 @Sendable public func FfiConverterTypeAccountKind_lower(_ value: AccountKind) -> RustBuffer {
     return FfiConverterTypeAccountKind.lower(value)
+}
+
+
+
+/**
+ * What the provider answered about an account's profile photo (`Engine::account_photo`).
+ */
+
+public enum AccountPhoto: Equatable, Hashable {
+    
+    /**
+     * Theirs: the image's bytes (JPEG or PNG, as the provider serves it).
+     */
+    case image(bytes: Data
+    )
+    /**
+     * What Google gives every app, which may be a letter it drew rather than a photo: it
+     * could not be told apart.
+     */
+    case unchecked(bytes: Data
+    )
+    /**
+     * The account has none that Nimbra can see (always so for IMAP and Microsoft).
+     */
+    case noPhoto
+    /**
+     * The sign-in does not include the profile (signed in before Nimbra asked for it):
+     * signing in again adds it.
+     */
+    case notAllowed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AccountPhoto: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAccountPhoto: FfiConverterRustBuffer {
+    typealias SwiftType = AccountPhoto
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountPhoto {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .image(bytes: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 2: return .unchecked(bytes: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 3: return .noPhoto
+        
+        case 4: return .notAllowed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AccountPhoto, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .image(bytes):
+            writeInt(&buf, Int32(1))
+            FfiConverterData.write(bytes, into: &buf)
+            
+        
+        case let .unchecked(bytes):
+            writeInt(&buf, Int32(2))
+            FfiConverterData.write(bytes, into: &buf)
+            
+        
+        case .noPhoto:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .notAllowed:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountPhoto_lift(_ buf: RustBuffer) throws -> AccountPhoto {
+    return try FfiConverterTypeAccountPhoto.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeAccountPhoto_lower(_ value: AccountPhoto) -> RustBuffer {
+    return FfiConverterTypeAccountPhoto.lower(value)
 }
 
 
@@ -7785,6 +8147,90 @@ public func FfiConverterTypeSplitCategory_lift(_ buf: RustBuffer) throws -> Spli
 
 
 
+/**
+ * The size of mail text in the reader, from smallest to largest. The Mac draws them at
+ * 13.5, 15, 17 and 19 points.
+ */
+
+public enum TextSize: Equatable, Hashable {
+    
+    case small
+    case `default`
+    case large
+    case extraLarge
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TextSize: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTextSize: FfiConverterRustBuffer {
+    typealias SwiftType = TextSize
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TextSize {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .small
+        
+        case 2: return .`default`
+        
+        case 3: return .large
+        
+        case 4: return .extraLarge
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TextSize, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .small:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .`default`:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .large:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .extraLarge:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTextSize_lift(_ buf: RustBuffer) throws -> TextSize {
+    return try FfiConverterTypeTextSize.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+@Sendable public func FfiConverterTypeTextSize_lower(_ value: TextSize) -> RustBuffer {
+    return FfiConverterTypeTextSize.lower(value)
+}
+
+
+
 
 public enum ThreadAction: Equatable, Hashable {
     
@@ -8139,6 +8585,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -9054,8 +9524,9 @@ public func textToHtml(text: String) -> String  {
 })
 }
 /**
- * From now on, server discovery's MX lookups go to `resolver`. Once per process, before
- * the first `discover_servers`; the Mac's resolver is used when this is never called.
+ * From now on, the engine's MX and TXT lookups go to `resolver`. Once per process, before
+ * the first `discover_servers` or `brand_logo`; the Mac's resolver is used when this is
+ * never called.
  * Memory only.
  */
 public func useDnsResolver(resolver: DnsResolver)throws   {try rustCallWithError(FfiConverterTypeNimbraError_lift) {
@@ -9163,7 +9634,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_func_text_to_html() != 625) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_func_use_dns_resolver() != 11421) {
+    if (uniffi_nimbra_ffi_checksum_func_use_dns_resolver() != 43950) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_func_fetch_remote_image() != 62596) {
@@ -9178,10 +9649,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_func_send_later_times() != 41834) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_dnsresolver_mx() != 59546) {
+    if (uniffi_nimbra_ffi_checksum_method_dnsresolver_mx() != 15024) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_nimbra_ffi_checksum_method_engine_start_answer() != 5046) {
+    if (uniffi_nimbra_ffi_checksum_method_dnsresolver_txt() != 24438) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_start_answer() != 10278) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_account_photo() != 45343) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_accounts() != 52599) {
@@ -9211,10 +9688,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_blocked_senders() != 59366) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nimbra_ffi_checksum_method_engine_brand_logo() != 47499) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nimbra_ffi_checksum_method_engine_cancel_sign_in() != 46164) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_check_for_changes() != 59707) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_clear_kept_mail() != 23543) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_counts() != 59907) {
@@ -9253,6 +9736,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nimbra_ffi_checksum_method_engine_flush() != 63158) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nimbra_ffi_checksum_method_engine_kept_account_photo() != 6430) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nimbra_ffi_checksum_method_engine_labels() != 15581) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9260,6 +9746,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_mark_read_after_ms() != 11725) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nimbra_ffi_checksum_method_engine_move_account() != 28008) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nimbra_ffi_checksum_method_engine_move_to_inbox() != 33154) {
