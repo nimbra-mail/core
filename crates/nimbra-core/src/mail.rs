@@ -1108,8 +1108,26 @@ pub(crate) fn one_line(text: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect::<String>()
         .split_whitespace()
+        // A "word" of nothing but joiners and marks is padding too (a run of joiners with
+        // spaces between, say); an emoji keeps its own, as they sit in a visible word.
+        .filter(|word| !word.chars().all(only_joins))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Characters that only change the one before or join it to the next: not seen alone.
+fn only_joins(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200d}' // zero width joiner
+            | '\u{fe00}'..='\u{fe0f}' // variation selectors
+            | '\u{0300}'..='\u{036f}' // combining marks
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe20}'..='\u{fe2f}'
+            | '\u{e0100}'..='\u{e01ef}'
+    )
 }
 
 /// Characters that are not seen. Not the joiner and variation selectors emoji are made of.
@@ -1333,6 +1351,9 @@ mod tests {
             one_line("\u{2800}\u{2800}Sale \u{2060}ends\u{feff} today"),
             "Sale ends today"
         );
+        // Joiners with spaces between, as some preheaders pad with them.
+        let joined = format!("10 new leads{}", " \u{200d}\u{a0}\u{fe0f}".repeat(40));
+        assert_eq!(one_line(&joined), "10 new leads");
     }
 
     #[test]
